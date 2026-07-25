@@ -1,14 +1,24 @@
 /* Download button lives inside the player's right-controls, matching yt style */
 .nova-download-btn {
   position: relative;
-  width: 40px; height: 100%;
-  color: #ff4e45;
+  width: 44px; height: 100%;
+  color: #35d477;
   vertical-align: top;
   opacity: .9;
+  overflow: visible;
 }
 .nova-download-btn:hover { opacity: 1; }
-/* Center the download glyph vertically and horizontally in the control. */
-.nova-download-btn svg { width: 24px; height: 24px; display: block; margin: 6px auto 0; }
+/* Smooth vector outline with the double-arrow group centered in the player control. */
+.nova-download-btn svg {
+  position: absolute;
+  width: 44px;
+  height: 32px;
+  top: 50%;
+  left: 50%;
+  display: block;
+  transform: translate(-50%, -50%);
+  shape-rendering: geometricPrecision;
+}
 .nova-ext { color: #9aa0a6; font-size: 12px; margin-left: 4px; }
 
 .nova-menu {
@@ -73,18 +83,20 @@
   box-sizing: border-box;
   position: relative;
 }
-.nova-menu-radio.sel .nova-dot { border-color: #ff4e45; }
+.nova-menu-radio.sel .nova-dot { border-color: #35d477; }
 .nova-menu-radio.sel .nova-dot::after {
   content: ''; position: absolute;
   inset: 2.5px; border-radius: 50%;
-  background: #ff4e45;
+  background: #35d477;
 }
 .nova-radio-txt { display: flex; flex-direction: column; }
 .nova-radio-txt b { color: #fff; font-size: 13.5px; font-weight: 600; }
 .nova-radio-txt i { color: #9aa0a6; font-size: 11.5px; font-style: normal; margin-top: 2px; line-height: 1.3; }
-.nova-menu-radio.sel .nova-radio-txt b { color: #ff6b63; }
+.nova-menu-radio.sel .nova-radio-txt b { color: #78e9a5; }
 
 #nova-toast {
+  --nova-progress-color: #35d477;
+  --nova-progress-text: #78e9a5;
   position: fixed;
   right: 20px; bottom: 20px;
   z-index: 2147483647;
@@ -110,6 +122,40 @@
 }
 #nova-toast .nova-toast-bar i {
   display: block; height: 100%; width: 0%;
-  background: #ff4e45;
-  transition: width .2s;
+  background: var(--nova-progress-color);
+  transition: width .16s linear;
 }
+#nova-toast .nova-toast-bar[hidden] { display: none; }
+#nova-toast .nova-toast-stages { display: none; }
+#nova-toast .nova-toast-stages.show {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+#nova-toast .nova-stage-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 3px;
+  color: #ddd;
+  font-size: 11.5px;
+}
+#nova-toast .nova-stage-value { color: #9aa0a6; }
+#nova-toast .nova-stage-bar {
+  height: 5px;
+  overflow: hidden;
+  border-radius: 4px;
+  background: rgba(255,255,255,.12);
+}
+#nova-toast .nova-stage-bar i {
+  display: block;
+  width: 0;
+  height: 100%;
+  background: var(--nova-progress-color);
+  transition: width .16s linear;
+}
+#nova-toast .nova-stage.queued { opacity: .55; }
+#nova-toast .nova-stage.done .nova-stage-bar i,
+#nova-toast .nova-stage.error .nova-stage-bar i { background: var(--nova-progress-color); }
+#nova-toast .nova-stage.done .nova-stage-value,
+#nova-toast .nova-stage.error .nova-stage-value { color: var(--nova-progress-text); }

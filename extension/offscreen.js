@@ -39,7 +39,8 @@ function emitProcessingProgress(value) {
   if (progress < 1 && progress - activeJob.lastProgress < 0.001 && now - activeJob.lastProgressAt < 250) return;
   activeJob.lastProgress = progress;
   activeJob.lastProgressAt = now;
-  sendProgress(progress, processingStatus(activeJob), progress * 100);
+  const pipelineProgress = 0.1 + (progress * 0.85);
+  sendProgress(pipelineProgress, processingStatus(activeJob), pipelineProgress * 100);
 }
 
 function progressFromLog(message) {
@@ -68,6 +69,8 @@ function createFFmpegInstance() {
   instance.on('log', ({ message }) => {
     ffmpegLogs.push(message);
     if (ffmpegLogs.length > FFMPEG_LOG_LIMIT) ffmpegLogs.shift();
+    const integrityError = ffmpegIntegrityError([message]);
+    if (activeJob && integrityError && !activeJob.integrityError) activeJob.integrityError = integrityError;
     progressFromLog(message);
   });
   return instance;
@@ -197,6 +200,7 @@ function assertContainerHeader(bytes, mime, track) {
 function beginJob(message) {
   if (activeJob?.phase === 'receiving' && Date.now() - activeJob.lastActivity > STALE_JOB_MS) {
     activeJob.video.length = 0;
+    activeJob.videoPrefix.length = 0;
     activeJob.audio.length = 0;
     activeJob = undefined;
   }
@@ -209,14 +213,18 @@ function beginJob(message) {
     phase: 'receiving',
     lastActivity: Date.now(),
     video: [],
+    videoPrefix: [],
     audio: [],
     videoMime: message.videoMime || '',
+    videoPrefixMime: message.videoPrefixMime || '',
+    videoPrefixBoundary: Math.max(0, Number(message.videoPrefixBoundary) || 0),
     audioMime: message.audioMime || '',
     filename: message.filename || 'video.mp4',
     transcode: Boolean(message.transcode),
     format: message.format || 'mp4',
     scaleHeight: Number(message.scaleHeight) || 0,
     duration: Number(message.duration) > 0 ? Number(message.duration) : 0,
+    audioCaptureRate: Math.min(4, Math.max(1, Number(message.audioCaptureRate) || 1)),
     lastProgress: 0,
     lastProgressAt: 0,
   };
@@ -228,10 +236,12 @@ function appendChunk(message) {
   if (!activeJob || activeJob.phase !== 'receiving' || message.jobId !== activeJob.id) {
     return { ok: false, error: 'задание загрузки не найдено' };
   }
-  if (message.track !== 'video' && message.track !== 'audio') {
+  if (message.track !== 'video' && message.track !== 'video-prefix'
+    && message.track !== 'audio') {
     return { ok: false, error: 'неизвестный тип дорожки' };
   }
-  activeJob[message.track].push(decodeBase64(message.b64));
+  const target = message.track === 'video-prefix' ? 'videoPrefix' : message.track;
+  activeJob[target].push(decodeBase64(message.b64));
   activeJob.lastActivity = Date.now();
   return { ok: true };
 }
@@ -239,23 +249,69 @@ function appendChunk(message) {
 function abortJob(message) {
   if (activeJob?.id === message.jobId && activeJob.phase === 'receiving') {
     activeJob.video.length = 0;
+    activeJob.videoPrefix.length = 0;
     activeJob.audio.length = 0;
     activeJob = undefined;
   }
   return { ok: true };
 }
 
-function buildRuns(job, videoName, audioName) {
+function buildRuns(job, videoName, audioName, videoPrefixName) {
   const progressOutput = ['-progress', 'pipe:1', '-nostats'];
   const audioInput = ['-i', audioName];
   if (job.format === 'mp3') {
+    const tempoFilters = [];
+    let remainingRate = job.audioCaptureRate || 1;
+    while (remainingRate > 2.0001) {
+      tempoFilters.push('atempo=0.5');
+      remainingRate /= 2;
+    }
+    if (remainingRate > 1.0001) tempoFilters.push(`atempo=${(1 / remainingRate).toFixed(8)}`);
+    // Rebuild timestamps from the decoded sample count. This removes WebM
+    // timeline gaps/offsets that can otherwise make an MP3 appear ~10s longer
+    // even when the output-level -t limit is present. This must run before
+    // atrim: trimming the original discontinuous timeline can discard valid
+    // samples from the end of the recording.
+    tempoFilters.push('asetpts=N/SR/TB');
+    if (job.duration > 0) tempoFilters.push(`atrim=duration=${job.duration.toFixed(3)}`);
+    const restoreDuration = ['-filter:a', tempoFilters.join(',')];
+    const exactDuration = job.duration > 0 ? ['-t', job.duration.toFixed(3)] : [];
     return [{
       out: 'out.mp3', type: 'audio/mpeg', extension: '.mp3',
-      args: [...progressOutput, ...audioInput, '-vn', '-c:a', 'libmp3lame', '-b:a', '192k', '-threads', '0', 'out.mp3'],
+      args: [...progressOutput, ...audioInput, '-vn', ...restoreDuration,
+        ...exactDuration, '-c:a', 'libmp3lame', '-b:a', '192k', '-threads', '0', 'out.mp3'],
     }];
   }
 
   const videoInput = ['-i', videoName];
+  if (videoPrefixName && job.videoPrefixBoundary > 0) {
+    const boundary = job.videoPrefixBoundary.toFixed(3);
+    const scale = job.scaleHeight ? `scale=-2:${job.scaleHeight},` : '';
+    const audioFilter = job.duration > 0
+      ? `asetpts=PTS-STARTPTS,atrim=duration=${job.duration.toFixed(3)}`
+      : 'asetpts=PTS-STARTPTS';
+    const filter = [
+      `[0:v:0]trim=duration=${boundary},${scale}setsar=1,setpts=PTS-STARTPTS[prefix]`,
+      `[1:v:0]${scale}setsar=1,setpts=PTS-STARTPTS+${boundary}/TB[tail]`,
+      '[prefix][tail]concat=n=2:v=1:a=0,settb=AVTB[video]',
+      `[2:a:0]${audioFilter}[audio]`,
+    ].join(';');
+    const exactDuration = job.duration > 0 ? ['-t', job.duration.toFixed(3)] : [];
+    return [{
+      out: 'out.mp4', type: 'video/mp4', extension: '.mp4',
+      args: [
+        ...progressOutput,
+        '-i', videoPrefixName,
+        ...videoInput,
+        ...audioInput,
+        '-filter_complex', filter,
+        '-map', '[video]', '-map', '[audio]',
+        '-c:v', 'libx264', '-preset', 'superfast', '-crf', '18', '-pix_fmt', 'yuv420p',
+        '-threads', '0', '-c:a', 'aac', '-b:a', '160k',
+        ...exactDuration, '-shortest', '-movflags', '+faststart', 'out.mp4',
+      ],
+    }];
+  }
   if (job.transcode) {
     const scale = job.scaleHeight ? ['-vf', `scale=-2:${job.scaleHeight}`] : [];
     return [{
@@ -264,7 +320,7 @@ function buildRuns(job, videoName, audioName) {
         ...progressOutput, ...videoInput, ...audioInput, '-map', '0:v:0', '-map', '1:a:0',
         '-c:v', 'libx264', '-preset', 'superfast', '-crf', '22', '-pix_fmt', 'yuv420p',
         '-threads', '0', ...scale, '-c:a', 'aac', '-b:a', '160k',
-        '-movflags', '+faststart', 'out.mp4',
+        '-shortest', '-movflags', '+faststart', 'out.mp4',
       ],
     }];
   }
@@ -273,13 +329,37 @@ function buildRuns(job, videoName, audioName) {
     {
       out: 'out.mp4', type: 'video/mp4', extension: '.mp4',
       args: [...progressOutput, ...videoInput, ...audioInput, '-map', '0:v:0', '-map', '1:a:0',
-        '-c', 'copy', '-strict', '-2', '-movflags', '+faststart', 'out.mp4'],
+        '-c', 'copy', '-strict', '-2', '-shortest', '-movflags', '+faststart', 'out.mp4'],
     },
     {
       out: 'out.webm', type: 'video/webm', extension: '.webm',
-      args: [...progressOutput, ...videoInput, ...audioInput, '-map', '0:v:0', '-map', '1:a:0', '-c', 'copy', 'out.webm'],
+      args: [...progressOutput, ...videoInput, ...audioInput, '-map', '0:v:0', '-map', '1:a:0',
+        '-c', 'copy', '-shortest', 'out.webm'],
     },
   ];
+}
+
+function ffmpegIntegrityError(logs) {
+  // Fragmented MP4 with B-frames can legitimately make FFmpeg repair a
+  // non-monotonic DTS warning. Reject only explicit corrupt/invalid input;
+  // ordinary timestamp correction is not sufficient evidence of a bad file.
+  const message = logs.find((line) => /packet corrupt|corrupt decoded frame|invalid data found when processing input|crc mismatch/i.test(line));
+  return message ? `ffmpeg обнаружил повреждённую временную шкалу: ${message}` : '';
+}
+
+// libmp3lame at 192 kbit/s writes a constant 24 000 bytes per second, so the
+// encoded size is an accurate duration probe. A short MP3 means the assembled
+// track lost a chunk (usually its opening segments) before encoding: fail
+// loudly instead of handing the user a silently truncated file.
+const MP3_BYTES_PER_SECOND = 192_000 / 8;
+
+function mp3LengthMismatch(job, bytes) {
+  if (job.format !== 'mp3' || !(job.duration > 10) || !bytes?.length) return '';
+  const encodedSeconds = bytes.length / MP3_BYTES_PER_SECOND;
+  const tolerance = Math.max(3, job.duration * 0.01);
+  if (Math.abs(encodedSeconds - job.duration) <= tolerance) return '';
+  return `MP3 получился ${encodedSeconds.toFixed(1)} сек вместо ${job.duration.toFixed(1)} сек`
+    + ' — часть аудиодорожки не была захвачена';
 }
 
 async function finalizeJob(message) {
@@ -293,10 +373,10 @@ async function finalizeJob(message) {
   let instance;
 
   try {
-    sendProgress(0.05, 'Инициализация движка кодирования…');
+    sendProgress(0.02, 'Инициализация движка кодирования…');
     instance = await getFFmpeg();
 
-    sendProgress(0.15, 'Запись буферов дорожек…');
+    sendProgress(0.06, 'Подготовка буферов дорожек…');
     const inputs = [];
     const audioName = `audio.${extensionFor(job.audioMime)}`;
     const audioBytes = concatParts(job.audio);
@@ -306,6 +386,7 @@ async function finalizeJob(message) {
     files.add(audioName);
 
     let videoName;
+    let videoPrefixName;
     if (job.format !== 'mp3') {
       videoName = `video.${extensionFor(job.videoMime)}`;
       const videoBytes = concatParts(job.video);
@@ -313,32 +394,47 @@ async function finalizeJob(message) {
       assertContainerHeader(videoBytes, job.videoMime, 'video');
       inputs.push({ name: videoName, bytes: videoBytes });
       files.add(videoName);
+      if (job.videoPrefixBoundary > 0) {
+        const videoPrefixBytes = concatParts(job.videoPrefix);
+        if (!videoPrefixBytes.length) throw new Error('пустые данные префикса видео');
+        videoPrefixName = `video-prefix.${extensionFor(job.videoPrefixMime)}`;
+        assertContainerHeader(videoPrefixBytes, job.videoPrefixMime, 'video-prefix');
+        inputs.push({ name: videoPrefixName, bytes: videoPrefixBytes });
+        files.add(videoPrefixName);
+      }
     }
     await writeInputFiles(instance, inputs);
 
     let output;
     let selectedRun;
     let lastError = '';
-    for (const run of buildRuns(job, videoName, audioName)) {
+    for (const run of buildRuns(job, videoName, audioName, videoPrefixName)) {
       ffmpegLogs.length = 0;
+      job.integrityError = '';
       job.lastProgress = 0;
       job.lastProgressAt = Date.now();
       sendProgress(0, processingStatus(job), 0);
       files.add(run.out);
       const exitCode = await execWithProgressWatchdog(instance, run.args, job, SINGLE_THREAD_STALL_MS);
-      if (exitCode === 0) {
+      const integrityError = job.integrityError || ffmpegIntegrityError(ffmpegLogs);
+      let lengthError = '';
+      if (exitCode === 0 && !integrityError) {
         const candidate = await instance.readFile(run.out).catch(() => null);
         if (candidate?.length) {
-          output = candidate;
-          selectedRun = run;
-          break;
+          lengthError = mp3LengthMismatch(job, candidate);
+          if (!lengthError) {
+            output = candidate;
+            selectedRun = run;
+            break;
+          }
         }
       }
-      lastError = `ffmpeg код ${exitCode}: ${ffmpegLogs.slice(-6).join(' | ')}`;
+      lastError = integrityError || lengthError
+        || `ffmpeg код ${exitCode}: ${ffmpegLogs.slice(-6).join(' | ')}`;
     }
 
     if (!selectedRun) throw new Error(lastError || 'ffmpeg не собрал файл');
-    sendProgress(1, 'Подготовка файла к сохранению…', 100);
+    sendProgress(0.97, 'Подготовка файла к сохранению…', 97);
 
     const filename = job.filename.replace(/\.(mp4|webm|mp3)$/i, '') + selectedRun.extension;
     const url = URL.createObjectURL(new Blob([output], { type: selectedRun.type }));
@@ -347,6 +443,7 @@ async function finalizeJob(message) {
       const response = await chrome.runtime.sendMessage({ t: 'nova-save', url, filename });
       if (!response?.ok) throw new Error(response?.error || 'не удалось сохранить файл');
       downloadAccepted = true;
+      sendProgress(1, 'Файл передан браузеру…', 100);
     } finally {
       // chrome.downloads reads the object URL asynchronously after accepting it.
       if (downloadAccepted) setTimeout(() => URL.revokeObjectURL(url), 60_000);
@@ -371,6 +468,7 @@ async function finalizeJob(message) {
       }
     }
     job.video.length = 0;
+    job.videoPrefix.length = 0;
     job.audio.length = 0;
     if (activeJob === job) activeJob = undefined;
   }
@@ -393,6 +491,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.t === 'nova-begin') {
     sendResponse(beginJob(message));
     return false;
+  }
+  if (message.t === 'nova-warmup') {
+    getFFmpeg()
+      .then(() => sendResponse({ ok: true, mode: ffmpegMode }))
+      .catch((error) => sendResponse({ ok: false, error: String(error?.stack || error) }));
+    return true;
   }
   if (message.t === 'nova-chunk') {
     try { sendResponse(appendChunk(message)); }

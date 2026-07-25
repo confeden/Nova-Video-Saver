@@ -6,6 +6,9 @@ const LOG_LIMIT = 200;
 const LOG_ENTRY_LIMIT = 4_000;
 const ERROR_DETAIL_LIMIT = 50_000;
 const ERROR_LOG_FILENAME = 'NYD-debug.txt';
+const RELOAD_DOWNLOAD_PREFIX = 'nova_reload_download:';
+const RELOAD_GUARD_PREFIX = 'nova_reload_guard:';
+const RELOAD_GUARD_TTL_MS = 5 * 60_000;
 const HANDLED_MESSAGES = new Set([
   'nova-log',
   'nova-error',
@@ -14,10 +17,15 @@ const HANDLED_MESSAGES = new Set([
   'nova-fetch-caption',
   'nova-register-job',
   'nova-progress',
+  'nova-set-reload-download',
+  'nova-get-reload-download',
+  'nova-clear-reload-download',
+  'nova-clear-reload-guard',
 ]);
 
 let offscreenCreation;
 let logWrite = Promise.resolve();
+let reloadGuardWrite = Promise.resolve();
 
 function serialize(value) {
   if (typeof value === 'string') return value;
@@ -81,8 +89,10 @@ async function downloadErrorLog(message, sender) {
   const report = [
     'Nova Youtube Downloader error report',
     `Time: ${new Date().toISOString()}`,
+    `Version: ${chrome.runtime.getManifest().version}`,
     `Context: ${message.context || 'unknown'}`,
     `Page: ${sender?.tab?.url || 'extension'}`,
+    `Browser: ${navigator.userAgent}`,
     '',
     truncate(message.error || 'Unknown error', ERROR_DETAIL_LIMIT),
     message.details ? `\nDetails:\n${truncate(message.details, ERROR_DETAIL_LIMIT)}` : '',
@@ -97,6 +107,14 @@ async function downloadErrorLog(message, sender) {
 }
 
 async function handleMessage(message, sender) {
+  const reloadDownloadKey = () => {
+    if (!Number.isInteger(sender?.tab?.id)) throw new Error('download tab is unavailable');
+    return `${RELOAD_DOWNLOAD_PREFIX}${sender.tab.id}`;
+  };
+  const reloadGuardKey = () => {
+    if (!Number.isInteger(sender?.tab?.id)) throw new Error('download tab is unavailable');
+    return `${RELOAD_GUARD_PREFIX}${sender.tab.id}`;
+  };
   switch (message.t) {
     case 'nova-log':
       await appendLog({
@@ -132,6 +150,81 @@ async function handleMessage(message, sender) {
     case 'nova-register-job':
       if (!Number.isInteger(sender?.tab?.id)) throw new Error('download tab is unavailable');
       return { ok: true, tabId: sender.tab.id };
+
+    case 'nova-set-reload-download': {
+      const pending = message.pending;
+      if (!pending || (pending.format !== 'mp4' && pending.format !== 'mp3')
+        || !/^[A-Za-z0-9_-]{6,}$/.test(String(pending.videoId || ''))
+        || (pending.format === 'mp4' && !Number.isFinite(Number(pending.height)))
+        || !Number.isFinite(Number(pending.createdAt))
+        || typeof pending.token !== 'string'
+        || typeof pending.playerState?.paused !== 'boolean'
+        || !Number.isFinite(Number(pending.playerState?.time))
+        || typeof pending.playerState?.muted !== 'boolean') {
+        throw new Error('invalid reload download request');
+      }
+      const pendingKey = reloadDownloadKey();
+      const guardKey = reloadGuardKey();
+      reloadGuardWrite = reloadGuardWrite
+        .catch(() => {})
+        .then(async () => {
+          const now = Date.now();
+          const stored = await chrome.storage.session.get(guardKey);
+          const guard = stored[guardKey];
+          const sameActiveJob = guard
+            && guard.videoId === String(pending.videoId)
+            && guard.format === pending.format
+            && now - Number(guard.updatedAt) <= RELOAD_GUARD_TTL_MS;
+          const reloadCount = sameActiveJob ? Number(guard.reloadCount) + 1 : 1;
+          if (reloadCount > 2) {
+            return {
+              ok: false,
+              reloadBlocked: true,
+              error: 'повторная загрузка краёв уже выполнялась дважды; циклическое обновление остановлено',
+            };
+          }
+          await chrome.storage.session.set({
+            [guardKey]: {
+              videoId: String(pending.videoId),
+              format: pending.format,
+              reloadCount,
+              updatedAt: now,
+            },
+            [pendingKey]: {
+              videoId: String(pending.videoId),
+              title: String(pending.title || '').slice(0, 300),
+              duration: Math.max(0, Number(pending.duration) || 0),
+              format: pending.format,
+              height: pending.format === 'mp3' ? null : Number(pending.height),
+              createdAt: Number(pending.createdAt),
+              token: pending.token.slice(0, 100),
+              reloadAttempted: true,
+              reloadCount,
+              playerState: {
+                paused: pending.playerState.paused,
+                time: Math.max(0, Number(pending.playerState.time)),
+                muted: pending.playerState.muted,
+              },
+            },
+          });
+          return { ok: true, reloadCount };
+        });
+      return reloadGuardWrite;
+    }
+
+    case 'nova-get-reload-download': {
+      const key = reloadDownloadKey();
+      const stored = await chrome.storage.session.get(key);
+      return { ok: true, pending: stored[key] || null };
+    }
+
+    case 'nova-clear-reload-download':
+      await chrome.storage.session.remove(reloadDownloadKey());
+      return { ok: true };
+
+    case 'nova-clear-reload-guard':
+      await chrome.storage.session.remove([reloadDownloadKey(), reloadGuardKey()]);
+      return { ok: true };
 
     case 'nova-progress': {
       if (sender?.url !== chrome.runtime.getURL('offscreen.html')) {

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Nova Youtube Downloader",
-  "version": "1.0",
+  "version": "1.1",
   "description": "Скачивание видео/аудио/субтитров в удобном формате и разрешении без внешних сервисов",
   "permissions": ["downloads", "offscreen", "storage"],
   "host_permissions": ["https://www.youtube.com/*"],
