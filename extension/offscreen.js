@@ -306,7 +306,7 @@ function buildRuns(job, videoName, audioName, videoPrefixName) {
         ...audioInput,
         '-filter_complex', filter,
         '-map', '[video]', '-map', '[audio]',
-        '-c:v', 'libx264', '-preset', 'superfast', '-crf', '18', '-pix_fmt', 'yuv420p',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20', '-pix_fmt', 'yuv420p',
         '-threads', '0', '-c:a', 'aac', '-b:a', '160k',
         ...exactDuration, '-shortest', '-movflags', '+faststart', 'out.mp4',
       ],
@@ -314,12 +314,20 @@ function buildRuns(job, videoName, audioName, videoPrefixName) {
   }
   if (job.transcode) {
     const scale = job.scaleHeight ? ['-vf', `scale=-2:${job.scaleHeight}`] : [];
+    // Single-threaded wasm x264 runs far below realtime, so re-encode only the
+    // tracks that actually need it: an H.264 source is stream-copied and AAC
+    // audio is stream-copied. 'ultrafast' keeps unavoidable re-encodes usable.
+    const videoIsH264 = /avc[13]|h264/i.test(job.videoMime || '');
+    const audioIsAac = /mp4a|aac/i.test(job.audioMime || '');
+    const videoArgs = (videoIsH264 && !job.scaleHeight)
+      ? ['-c:v', 'copy']
+      : ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-pix_fmt', 'yuv420p', ...scale];
+    const audioArgs = audioIsAac ? ['-c:a', 'copy'] : ['-c:a', 'aac', '-b:a', '160k'];
     return [{
       out: 'out.mp4', type: 'video/mp4', extension: '.mp4',
       args: [
         ...progressOutput, ...videoInput, ...audioInput, '-map', '0:v:0', '-map', '1:a:0',
-        '-c:v', 'libx264', '-preset', 'superfast', '-crf', '22', '-pix_fmt', 'yuv420p',
-        '-threads', '0', ...scale, '-c:a', 'aac', '-b:a', '160k',
+        ...videoArgs, '-threads', '0', ...audioArgs,
         '-shortest', '-movflags', '+faststart', 'out.mp4',
       ],
     }];

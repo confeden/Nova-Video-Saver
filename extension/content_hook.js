@@ -827,12 +827,14 @@
         throw error;
       }
     }
-    if (kind === 'audio' && expectedDurationSeconds > 10) {
+    if (expectedDurationSeconds > 10) {
       // Container duration alone cannot prove completeness: FFmpeg preserves the
-      // timestamps on both sides of a missing YouTube segment and silently
-      // turns the hole into silence. Opus normally keeps a stable packet cadence,
-      // while valid VP9/AV1 variable-frame-rate tracks may hold one frame for
-      // several seconds. Video block cadence therefore cannot prove loss.
+      // timestamps on both sides of a missing YouTube segment, so the hole is
+      // muxed as silence on audio and as a frozen picture on video, held for
+      // exactly as long as the lost fragment. Both tracks are therefore checked
+      // for interior continuity; only the tolerance differs, because a valid
+      // variable-frame-rate video track may hold one frame a little longer than
+      // Opus ever stretches its packet cadence.
       const blockTimecodes = [];
       for (let index = 0; index < clusters.length; index++) {
         const cluster = clusters[index];
@@ -849,10 +851,9 @@
         .sort((left, right) => left - right);
       const typicalBlockDelta = blockDeltas.length
         ? blockDeltas[Math.floor(blockDeltas.length / 2)] : 0;
-      const interiorGapToleranceMs = Math.max(
-        500,
-        Math.min(2_500, (typicalBlockDelta || 20) * 20),
-      );
+      const interiorGapToleranceMs = kind === 'video'
+        ? Math.max(300, Math.min(1_500, (typicalBlockDelta || 17) * 15))
+        : Math.max(500, Math.min(2_500, (typicalBlockDelta || 20) * 20));
       let largestGapMs = 0;
       let gapStartMs = 0;
       let gapEndMs = 0;
@@ -864,7 +865,7 @@
           gapEndMs = uniqueTimecodes[index];
         }
       }
-      log('assembly', 'webm audio continuity; blocks=', uniqueTimecodes.length,
+      log('assembly', `webm ${kind} continuity; blocks=`, uniqueTimecodes.length,
         'typicalDeltaMs=', typicalBlockDelta, 'largestGapMs=', largestGapMs,
         'toleranceMs=', interiorGapToleranceMs);
       if (options.strictEdges && uniqueTimecodes.length) {
@@ -1205,7 +1206,90 @@
   const QUALITY_BY_HEIGHT = { 2160: 'hd2160', 1440: 'hd1440', 1080: 'hd1080', 720: 'hd720', 480: 'large', 360: 'medium', 240: 'small', 144: 'tiny' };
   const HEIGHT_BY_QUALITY = Object.fromEntries(Object.entries(QUALITY_BY_HEIGHT).map(([height, quality]) => [quality, Number(height)]));
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  // ---- playback hold -------------------------------------------------------
+  // A capture pass is a sequence of paused seeks: SABR answers those with plain
+  // range requests. Ordinary playback fights that — the player prefetches on its
+  // own schedule, overrides the seek target and keeps advancing currentTime — so
+  // downloads used to come out clean only when the user had already pressed
+  // pause. Nova now pins the element to paused for the whole download and lifts
+  // the pin only for the playback it starts on purpose (SABR primers and the
+  // MediaRecorder fallbacks), then restores the user's play state at the end.
+  let deliberatePlaybackDepth = 0;
+
+  async function withDeliberatePlayback(run) {
+    deliberatePlaybackDepth += 1;
+    try {
+      return await run();
+    } finally {
+      deliberatePlaybackDepth = Math.max(0, deliberatePlaybackDepth - 1);
+    }
+  }
+
+  // Pause the way the user's own pause button does. HTMLMediaElement.pause()
+  // alone stops the element while YouTube's player object still believes it is
+  // playing; its SABR scheduler then keeps retrying playback instead of
+  // answering the paused seeks the capture pass is built on, and the download
+  // stalls behind a spinner. Going through pauseVideo() keeps both state
+  // machines agreed, which is exactly the condition under which capture has
+  // always worked.
+  function pauseForCapture(media) {
+    let viaPlayer = false;
+    try {
+      const activePlayer = player();
+      if (activePlayer?.pauseVideo) {
+        activePlayer.pauseVideo();
+        viaPlayer = true;
+      }
+    } catch (e) {}
+    try { if (media && !media.paused) media.pause(); } catch (e) {}
+    return viaPlayer;
+  }
+
+  function holdPlaybackPaused(media) {
+    let released = !media;
+    let enforcements = 0;
+    let pendingEnforce = 0;
+    // A guard, not a fight. If YouTube insists on resuming this many times the
+    // page is clearly driving playback for its own reasons; keep the capture
+    // loop's own gentle pause and stop re-entering the contest.
+    const enforcementLimit = 24;
+    const enforce = () => {
+      if (released || deliberatePlaybackDepth > 0) return;
+      if (enforcements >= enforcementLimit || pendingEnforce) return;
+      // Never pause synchronously inside the play event: that turns an autoplay
+      // attempt into a play/pause storm and wedges the media pipeline.
+      pendingEnforce = setTimeout(() => {
+        pendingEnforce = 0;
+        if (released || deliberatePlaybackDepth > 0) return;
+        if (media.paused) return;
+        enforcements += 1;
+        pauseForCapture(media);
+        if (enforcements >= enforcementLimit) {
+          log('capture', 'playback hold reached its enforcement limit; leaving pacing to the capture loop');
+        }
+      }, 60);
+    };
+    if (media) {
+      media.addEventListener('play', enforce, true);
+      pauseForCapture(media);
+    }
+    return {
+      media,
+      enforce,
+      release() {
+        if (released) return;
+        released = true;
+        if (pendingEnforce) { clearTimeout(pendingEnforce); pendingEnforce = 0; }
+        try { media.removeEventListener('play', enforce, true); } catch (e) {}
+      },
+    };
+  }
+
   async function playWithTimeout(media, timeoutMs = 10_000) {
+    // Every deliberate playback start goes through here, so the hold above can
+    // tell "Nova asked for this" apart from autoplay or a user resume.
+    deliberatePlaybackDepth += 1;
     let timer;
     const playback = media.play();
     // Promise.race observes rejection too, but keep an explicit handler on the
@@ -1225,6 +1309,7 @@
       ]);
     } finally {
       clearTimeout(timer);
+      deliberatePlaybackDepth = Math.max(0, deliberatePlaybackDepth - 1);
     }
   }
   let defaultQualityAppliedVideoId = null;
@@ -2248,7 +2333,9 @@
         audio: { bytes: audioBytes, mime: recordedAudioMime, captureRate: 1 },
         actualHeight,
         duration: targetEnd,
-        forceTranscode: true,
+        // Both tracks are already WebM (VP9/VP8 + Opus): a stream-copy remux
+        // rebuilds cues/duration in seconds. Forcing libx264 here made a
+        // single-threaded wasm re-encode of a 1440p recording run for hours.
       };
     } finally {
       try { if (videoRecorder && videoRecorder.state !== 'inactive') videoRecorder.stop(); } catch (e) {}
@@ -2404,6 +2491,21 @@
     // short missing prefix, preserving the already downloaded tail.
     let freshPrefixPreflightDone = true;
     const prev = { paused: v.paused, rate: v.playbackRate, time: v.currentTime, muted: v.muted };
+    // Hold the element paused for this pass. The download command normally owns
+    // the hold (so assembly-time refills are protected too); create a local one
+    // only when this function is entered on its own.
+    const ownsPlaybackHold = store.playbackHold?.media !== v;
+    if (ownsPlaybackHold) {
+      store.playbackHold?.release();
+      store.playbackHold = holdPlaybackPaused(v);
+    }
+    const playbackHold = store.playbackHold;
+    const releasePlaybackHold = () => {
+      if (!ownsPlaybackHold) return;
+      playbackHold.release();
+      store.playbackHold = null;
+    };
+    playbackHold.enforce();
     const seekTo = (sec) => { try { const p = player(); if (p && p.seekTo) { p.seekTo(sec, true); return; } } catch (e) {} try { v.currentTime = sec; } catch (e) {} };
     const restoreMediaState = () => {
       try { v.playbackRate = prev.rate; } catch (e) {}
@@ -2605,6 +2707,7 @@
       && reachedCaptureEnd(initialBufferedEnd)) {
       reportCaptureProgress(capEnd);
       store.capturing = false;
+      releasePlaybackHold();
       restoreMediaState();
       log('capture', 'complete from existing buffer; end=', initialBufferedEnd, 'target=', capEnd,
         'tolerance=', endTolerance);
@@ -2621,7 +2724,19 @@
     let lastAdvanceAt = Date.now();
     let lastMediaAt = Date.now();
     let observedAppendAt = Math.max(store.lastAppendAt.audio || 0, needVideo ? (store.lastAppendAt.video || 0) : 0);
-    let initialRequestPrimed = false;
+    // The primer is what makes SABR answer immediately instead of leaving a
+    // paused seek in its queue. It used to run exactly once: when that single
+    // attempt produced nothing, the pass sat on paused seeks until the 60 s
+    // stall guard fired. Previously an autoplaying player accidentally kept
+    // re-priming; now that playback is pinned, Nova re-primes on purpose.
+    let primerCount = 0;
+    let lastPrimeAt = 0;
+    const maxPrimers = 6;
+    // Rescue mode: if SABR stops answering paused seeks entirely, fall back to
+    // ordinary muted playback. The player then prefetches ahead on its own and
+    // the appendBuffer hook keeps capturing the same original segments, so this
+    // stays lossless — unlike the rendered 1x MediaRecorder fallback.
+    let playbackDriven = false;
     try { v.muted = true; } catch (e) {}
 
     try {
@@ -2632,7 +2747,7 @@
         await sleep(350);
         if (store.captureError) throw store.captureError;
         if (vidId() !== capId) throw new Error('видео переключилось');
-        try { if (!v.paused) v.pause(); } catch (e) {}
+        if (!v.paused && !playbackDriven) pauseForCapture(v);
         let now = Date.now();
         if (store.trackRevision.audio !== initialAudioRevision
           || (needVideo && store.trackRevision.video !== initialVideoRevision)) {
@@ -2665,11 +2780,15 @@
         }
         reportCaptureProgress(tracksReady ? Math.max(cursor, edge) : cursor);
         if (tracksReady && reachedCaptureEnd(edge)) break;
-        if (!tracksReady && !initialRequestPrimed && now - lastMediaAt >= 250) {
+        const needsPrimer = !playbackDriven && primerCount < maxPrimers && (!tracksReady
+          ? (primerCount === 0 ? now - lastMediaAt >= 250 : now - lastPrimeAt >= 6_000)
+          : (now - lastMediaAt >= 8_000 && now - lastPrimeAt >= 8_000));
+        if (needsPrimer) {
           // A paused seek can sit in SABR's queue for many seconds before the
           // first append. Brief muted playback asks for it immediately and is
           // stopped as soon as either required track appends.
-          initialRequestPrimed = true;
+          primerCount += 1;
+          lastPrimeAt = now;
           const appendBeforePrime = observedAppendAt;
           seekTo(Math.min(cursor + 0.05, capEnd - 0.1));
           try { await playWithTimeout(v, 750); } catch (e) {}
@@ -2677,22 +2796,44 @@
           while (Date.now() < primeDeadline) {
             const requiredTracksReady = capturedTrackHasMedia('audio')
               && (!needVideo || capturedTrackHasMedia('video'));
-            if (requiredTracksReady) break;
+            // A re-primer runs with both tracks already present, so readiness
+            // alone would end the playback window before SABR emitted anything.
+            // Hold it open until this primer actually produced an append.
+            const appendedDuringPrime = Math.max(store.lastAppendAt.audio || 0,
+              needVideo ? (store.lastAppendAt.video || 0) : 0) > appendBeforePrime;
+            if (requiredTracksReady && appendedDuringPrime) break;
             await sleep(75);
           }
-          try { v.pause(); } catch (e) {}
+          pauseForCapture(v);
           const latestAppend = Math.max(store.lastAppendAt.audio || 0,
             needVideo ? (store.lastAppendAt.video || 0) : 0);
           if (latestAppend > observedAppendAt) {
             observedAppendAt = latestAppend;
             lastMediaAt = Date.now();
           }
-          log('capture', 'initial MSE request primer; appendObserved=', latestAppend > appendBeforePrime,
+          log('capture', 'MSE request primer', primerCount, 'of', maxPrimers,
+            '; appendObserved=', latestAppend > appendBeforePrime,
+            'tracksReady=', tracksReady,
             'audioParts=', store.tracks.audio?.parts?.length || 0,
             'videoParts=', store.tracks.video?.parts?.length || 0);
           continue;
         }
-        if (!tracksReady) {
+        if (playbackDriven) {
+          if (edge > cursor + 0.3) {
+            cursor = edge;
+            lastAdvanceAt = now;
+          }
+          if (v.paused && !v.ended) {
+            try { await playWithTimeout(v, 2_000); } catch (e) {}
+          }
+          // Skip through already captured ranges so playback time is spent only
+          // where segments are still missing; YouTube keeps prefetching ahead.
+          const skipTarget = Math.min(edge - 1, capEnd - 0.1);
+          if (Number.isFinite(skipTarget) && skipTarget > (Number(v.currentTime) || 0) + 6) {
+            seekTo(skipTarget);
+          }
+        }
+        else if (!tracksReady) {
           // v1.0 only advances cursor after buffered data actually grows.
           // Repeating the same small seek prevents requests from racing ahead
           // while YouTube is still creating the first audio/video fragments.
@@ -2706,7 +2847,22 @@
         else if (cursor < capEnd - 0.5) seekTo(Math.min(cursor + 0.5, capEnd - 0.1));
         else break;
 
-        if (now - Math.max(lastAdvanceAt, lastMediaAt) >= 60_000) {
+        const stalledForMs = now - Math.max(lastAdvanceAt, lastMediaAt);
+        if (!playbackDriven && stalledForMs >= 20_000) {
+          // SABR sometimes stops serving the paused-seek pattern altogether.
+          // Real muted playback is indistinguishable from normal viewing, so it
+          // reliably restarts segment delivery while capture continues.
+          playbackDriven = true;
+          deliberatePlaybackDepth += 1;
+          log('capture', 'paused seeks idle for 20s; escalating to muted playback-driven capture; cursor=',
+            Number(cursor.toFixed(2)), 'target=', Number(capEnd.toFixed(2)));
+          seekTo(Math.max(0, Math.min(cursor, capEnd - 1)));
+          try { await playWithTimeout(v, 2_000); } catch (e) {}
+          lastAdvanceAt = Date.now();
+          lastMediaAt = Date.now();
+          continue;
+        }
+        if (stalledForMs >= 60_000) {
           const ranges = [];
           for (let i = 0; i < v.buffered.length; i++) {
             ranges.push([Number(v.buffered.start(i).toFixed(3)), Number(v.buffered.end(i).toFixed(3))]);
@@ -2735,8 +2891,13 @@
         }
       }
     } finally {
+      if (playbackDriven) {
+        deliberatePlaybackDepth = Math.max(0, deliberatePlaybackDepth - 1);
+        try { v.pause(); } catch (e) {}
+      }
       // Restore the user's exact position and play state immediately.
       store.capturing = false;
+      releasePlaybackHold();
       restoreMediaState();
     }
     if (!capturedTrackHasMedia('audio')) throw new Error('не удалось захватить аудио; обновите вкладку и повторите загрузку');
@@ -3297,14 +3458,14 @@
     const targetHeight = Number(track?.height) || Number(options?.requestedHeight) || null;
     log('assembly', 'MSE video prefix unavailable; recording only missing prefix',
       'firstMs=', firstTimecode, 'prefixEnd=', prefixEnd, 'height=', targetHeight);
-    const rendered = await captureRenderedVideo({
+    const rendered = await withDeliberatePlayback(() => captureRenderedVideo({
       targetQ: options?.targetQ || QUALITY_BY_HEIGHT[targetHeight] || 'hd720',
       end: prefixEnd,
       height: targetHeight,
     }, (pct) => onProgress?.(
       Math.min(0.999, 0.9 + (Math.max(0, Math.min(1, pct)) * 0.099)),
       'rendered-prefix',
-    ));
+    )));
     const renderedVideo = rendered?.video;
     if (!renderedVideo?.bytes?.length || !/webm/i.test(renderedVideo.mime || '')) {
       throw new Error('резервная запись не создала WebM-префикс видеодорожки');
@@ -3441,11 +3602,13 @@
       let lastMediaAt = Date.now();
       let observedAppendAt = 0;
       let acceptedRevision = null;
+      let playbackDriven = false;
+      try {
       while (true) {
         await sleep(350);
         if (store.captureError) throw store.captureError;
         if (vidId() !== capId) throw new Error('видео переключилось');
-        try { if (!v.paused) v.pause(); } catch (e) {}
+        try { if (!v.paused && !playbackDriven) v.pause(); } catch (e) {}
 
         const now = Date.now();
         const appendAt = store.lastAppendAt[kind] || 0;
@@ -3470,7 +3633,19 @@
           break;
         }
 
-        if (edge > cursor + 0.3) {
+        if (playbackDriven) {
+          if (edge > cursor + 0.3) {
+            cursor = edge;
+            lastAdvanceAt = now;
+          }
+          if (v.paused && !v.ended) {
+            try { await playWithTimeout(v, 2_000); } catch (e) {}
+          }
+          const skipTarget = Math.min(edge - 1, capEnd - 0.1);
+          if (Number.isFinite(skipTarget) && skipTarget > (Number(v.currentTime) || 0) + 6) {
+            seekTo(skipTarget);
+          }
+        } else if (edge > cursor + 0.3) {
           cursor = edge;
           lastAdvanceAt = now;
           seekTo(Math.min(cursor, capEnd - 0.1));
@@ -3478,7 +3653,21 @@
           seekTo(Math.min(cursor + 0.5, capEnd - 0.1));
         }
 
-        if (now - Math.max(lastAdvanceAt, lastMediaAt) >= 60_000) {
+        const stalledForMs = now - Math.max(lastAdvanceAt, lastMediaAt);
+        if (!playbackDriven && stalledForMs >= 20_000) {
+          // Same rescue as the fast pass: real muted playback restarts SABR
+          // delivery when the paused-seek pattern is being ignored.
+          playbackDriven = true;
+          deliberatePlaybackDepth += 1;
+          log('capture', 'sequential paused seeks idle for 20s; escalating to muted playback-driven capture; kind=',
+            kind, 'cursor=', Number(cursor.toFixed(2)));
+          seekTo(Math.max(0, Math.min(cursor, capEnd - 1)));
+          try { await playWithTimeout(v, 2_000); } catch (e) {}
+          lastAdvanceAt = Date.now();
+          lastMediaAt = Date.now();
+          continue;
+        }
+        if (stalledForMs >= 60_000) {
           const ranges = [];
           try {
             for (let index = 0; index < v.buffered.length; index++) {
@@ -3501,6 +3690,12 @@
           const error = new Error(`${kind === 'audio' ? 'аудио' : 'видео'}поток не получал новых сегментов более 60 секунд`);
           error.details = details;
           throw error;
+        }
+      }
+      } finally {
+        if (playbackDriven) {
+          deliberatePlaybackDepth = Math.max(0, deliberatePlaybackDepth - 1);
+          try { v.pause(); } catch (e) {}
         }
       }
 
@@ -4525,6 +4720,17 @@
         const targetQ = isMp3 ? 'medium' : (QUALITY_BY_HEIGHT[height] || 'hd720');
         const previousQuality = qualitySnapshot();
         if (isMp3) store.mp3Isolation = null;
+        // Own the playback hold for the entire command, not just the capture
+        // pass: assembly-time refills seek the player too, and a video that
+        // resumes between the passes makes YouTube prefetch instead of serving
+        // the bounded ranges those refills ask for.
+        const mediaAtStart = video();
+        const videoIdAtStart = vidId();
+        const wasPlayingAtStart = !!(mediaAtStart && !mediaAtStart.paused);
+        store.playbackHold?.release();
+        store.playbackHold = holdPlaybackPaused(mediaAtStart);
+        log('download', 'playback pinned for capture; wasPlaying=', wasPlayingAtStart,
+          'paused=', !!mediaAtStart?.paused, 'format=', format);
         try {
           let cap;
           let result;
@@ -4615,7 +4821,10 @@
               const attemptsByGap = new Map();
               let validationError = initialError;
               let lastRepairError = null;
-              const maxTotalAttempts = 8;
+              // One lost fragment is one repair. A pass that dropped several
+              // fragments needs a matching budget, otherwise the first few holes
+              // consume every attempt and the rest ship as frozen frames.
+              const maxTotalAttempts = 16;
               const maxAttemptsPerGap = 3;
 
               for (let totalAttempt = 0; totalAttempt < maxTotalAttempts; totalAttempt++) {
@@ -4744,13 +4953,17 @@
 
               const error = lastRepairError || validationError
                 || new Error('локальная докачка WebM не восстановила дорожку');
-              error.novaFatal = true;
-              error.details = {
+              const exhaustedDetails = {
                 ...(validationError?.details || {}),
                 reloadRequired: false,
                 reason: 'local-webm-repair-exhausted',
                 repairAttempts: Object.fromEntries(attemptsByGap),
               };
+              // A video-only interior hole is still recoverable by the sequential
+              // and rendered capture paths, so it must not end the download here.
+              error.novaFatal = !(exhaustedDetails.kind === 'video'
+                && exhaustedDetails.missingInterior === true);
+              error.details = exhaustedDetails;
               throw error;
             };
             const assembleCapturedMse = async (onRecoveryProgress) => {
@@ -4818,13 +5031,15 @@
               log('capture', 'fallback to rendered video:', reason?.message || reason);
               reply({ progress: 0.001, phase: 'rendered-video' });
               try {
-                await preparePlayerForRenderedCapture(vidId(), targetQ);
+                await withDeliberatePlayback(() => preparePlayerForRenderedCapture(vidId(), targetQ));
               } catch (prepareError) {
                 if (prepareError?.novaFatal) throw prepareError;
                 log('rendered-video', 'player preparation unavailable:', prepareError?.message || prepareError);
               }
-              const rendered = await captureRenderedVideo({ targetQ, end, height },
-                (pct, state) => reply({ progress: pct, phase: 'rendered-video', paused: state === 'paused' }));
+              const rendered = await withDeliberatePlayback(() => captureRenderedVideo(
+                { targetQ, end, height },
+                (pct, state) => reply({ progress: pct, phase: 'rendered-video', paused: state === 'paused' }),
+              ));
               cap = { actualHeight: rendered.actualHeight, duration: rendered.duration };
               result = rendered;
             };
@@ -4846,9 +5061,12 @@
               if (!result && isMp3) {
                 log('capture', 'fallback to rendered audio after MSE:', captureError?.message || captureError);
                 reply({ progress: 0.001, phase: 'rendered-audio' });
-                const renderedAudio = await captureRenderedAudio(end, (pct, state) => reply({
-                  progress: pct, phase: 'rendered-audio', paused: state === 'paused',
-                }));
+                const renderedAudio = await withDeliberatePlayback(() => captureRenderedAudio(
+                  end,
+                  (pct, state) => reply({
+                    progress: pct, phase: 'rendered-audio', paused: state === 'paused',
+                  }),
+                ));
                 cap = { duration: renderedAudio.duration || Number(video()?.duration) || 0 };
                 result = { audio: renderedAudio };
               } else if (!result) {
@@ -4930,6 +5148,12 @@
           reply(payload, transfers);
         } finally {
           store.capturing = true;
+          store.playbackHold?.release();
+          store.playbackHold = null;
+          // Give the user back exactly the play state they had.
+          if (wasPlayingAtStart && vidId() === videoIdAtStart) {
+            try { video()?.play()?.catch?.(() => {}); } catch (e) {}
+          }
           await restoreQuality(previousQuality);
         }
       } else if (cmd === 'subtitles') {
