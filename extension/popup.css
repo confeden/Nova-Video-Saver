@@ -1,0 +1,110 @@
+body {
+  width: 280px;
+  margin: 0;
+  padding: 14px;
+  background: #181a1c;
+  color: #f1f1f1;
+  font: 13px/1.45 "Segoe UI", Roboto, Arial, sans-serif;
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.titles {
+  display: flex;
+  flex-direction: column;
+}
+
+.titles b {
+  font-size: 14px;
+}
+
+.titles span {
+  color: #9aa0a6;
+  font-size: 12px;
+}
+
+.status {
+  margin: 12px 0 0;
+  padding: 9px 11px;
+  border-radius: 8px;
+  background: #222528;
+  color: #c9cdd1;
+}
+
+.status.update {
+  background: rgba(53, 212, 119, 0.12);
+  color: #35d477;
+  border: 1px solid rgba(53, 212, 119, 0.45);
+}
+
+.status.error {
+  color: #ff8a80;
+}
+
+.release-link {
+  display: block;
+  margin-top: 10px;
+  padding: 9px 11px;
+  border-radius: 8px;
+  background: #35d477;
+  color: #08361d;
+  font-weight: 600;
+  text-align: center;
+  text-decoration: none;
+}
+
+.release-link:hover {
+  background: #4ade87;
+}
+
+.footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 12px;
+}
+
+.footer button {
+  padding: 6px 10px;
+  border: 1px solid #3c4043;
+  border-radius: 7px;
+  background: #222528;
+  color: #f1f1f1;
+  cursor: pointer;
+}
+
+.footer button:hover {
+  background: #2b2f33;
+}
+
+.footer a {
+  color: #8ab4f8;
+  text-decoration: none;
+}
+
+.export-log {
+  display: block;
+  width: 100%;
+  margin-top: 10px;
+  padding: 7px 10px;
+  border: 1px solid #3c4043;
+  border-radius: 7px;
+  background: transparent;
+  color: #9aa0a6;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.export-log:hover {
+  background: #222528;
+  color: #c9cdd1;
+}
+
+.export-log:disabled {
+  opacity: 0.6;
+  cursor: default;
+}

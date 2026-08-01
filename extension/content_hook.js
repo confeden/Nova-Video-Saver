@@ -61,7 +61,77 @@
     ['264', 1440], ['271', 1440], ['308', 1440], ['336', 1440], ['400', 1440],
     ['266', 2160], ['272', 2160], ['313', 2160], ['315', 2160], ['337', 2160], ['401', 2160],
   ]);
+  const MUSIC_HOST = location.hostname === 'music.youtube.com';
+  // Paused seeks starve faster on Music before SABR reacts; escalate to the
+  // playback-driven rescue much sooner there.
+  const CAPTURE_IDLE_ESCALATION_MS = MUSIC_HOST ? 6_000 : 20_000;
+
+  if (MUSIC_HOST) {
+    // ytmusic's beforeunload prompt ("changes you made may not be saved")
+    // blocks every automated reload/navigation of the download queue behind
+    // a dialog the user has to click through. Drop those handlers.
+    const originalAddEventListener = window.addEventListener.bind(window);
+    window.addEventListener = function (type, ...rest) {
+      if (type === 'beforeunload') return undefined;
+      return originalAddEventListener(type, ...rest);
+    };
+    try {
+      Object.defineProperty(window, 'onbeforeunload', {
+        configurable: true,
+        get() { return null; },
+        set() {},
+      });
+    } catch (e) {}
+    // Capture seeks may touch the very end of a track; ytmusic answers a
+    // fired 'ended' by jumping to the next queue item mid-download. While a
+    // download is active, clamp programmatic seeks just short of the end.
+    try {
+      const timeDescriptor = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'currentTime');
+      Object.defineProperty(HTMLMediaElement.prototype, 'currentTime', {
+        configurable: true,
+        enumerable: timeDescriptor.enumerable,
+        get: timeDescriptor.get,
+        set(value) {
+          let target = Number(value);
+          if (store.musicSeekClamp) {
+            const mediaDuration = Number(this.duration);
+            // 1.2s shy of the end: ytmusic treats positions closer than that
+            // as "track finished" and advances the queue even while paused.
+            if (Number.isFinite(mediaDuration) && mediaDuration > 3
+              && Number.isFinite(target) && target > mediaDuration - 1.2) {
+              target = Math.max(0, mediaDuration - 1.2);
+            }
+          }
+          return timeDescriptor.set.call(this, target);
+        },
+      });
+    } catch (e) {}
+  }
+
+  // Worker script URLs must be TrustedScriptURL wherever Trusted Types are
+  // enforced (music.youtube.com does). Without a policy the MSE worker bridge
+  // below silently fell back to an unwrapped worker and captured nothing.
+  let novaScriptUrlPolicy = null;
+  try {
+    novaScriptUrlPolicy = window.trustedTypes?.createPolicy?.(
+      `nova-worker-${Math.random().toString(36).slice(2)}`,
+      { createScriptURL: (input) => input },
+    ) || null;
+  } catch (e) {}
+  const asWorkerScriptUrl = (rawUrl) => {
+    if (!novaScriptUrlPolicy) return rawUrl;
+    try { return novaScriptUrlPolicy.createScriptURL(rawUrl); } catch (e) { return rawUrl; }
+  };
+
   const store = {
+    // MSE running inside a dedicated worker is observed through the worker
+    // bridge; these transports cannot be manipulated like page SourceBuffers,
+    // so range removal is requested by message instead.
+    workerTransports: { audio: new Set(), video: new Set() },
+    workerRemoveAcks: 0,
+    // Init segments survive resetCapture: a worker-side SourceBuffer often
+    // keeps serving a new track without re-appending its decoder init.
+    initFallback: Object.create(null),
     videoId: null,
     capturing: false,
     tracks: Object.create(null),
@@ -76,7 +146,17 @@
     mediaEpochStart: performance.now(),
     completedAudioCache: null,
     mp3Isolation: null,
+    liveSession: null,
+    cancelRequested: false,
   };
+
+  function throwIfDownloadCancelled() {
+    if (!store.cancelRequested) return;
+    const error = new Error('загрузка отменена пользователем');
+    error.novaFatal = true;
+    error.details = { cancelled: true };
+    throw error;
+  }
 
   function vidId() {
     try {
@@ -280,6 +360,7 @@
   hookMediaSourceConstructor(window.ManagedMediaSource, 'ManagedMediaSource');
   function observeMediaAppend(transport, data) {
     try {
+      if (store.liveSession) forwardLiveAppend(transport, data);
       const kind = transport.__novaKind;
       if (kind === 'video' || kind === 'audio') {
         const currentVideoId = vidId();
@@ -292,7 +373,7 @@
           store.completedAudioCache = null;
           store.mp3Isolation = null;
           resetCapture();
-          store.capturing = true;
+          if (!store.liveSession) store.capturing = true;
           log('capture', 'video change detected from media append; vid=', currentVideoId);
         }
         // Re-register buffers after resetCapture or a YouTube SPA transition.
@@ -309,6 +390,7 @@
               initKey: fragmentFingerprint(dormantBytes),
             };
             transport.__novaInitVideoId = currentVideoId;
+            store.initFallback[kind] = transport.__novaLastInit;
           }
         }
       }
@@ -327,6 +409,7 @@
             transport.__novaLastInit = initRecord;
             transport.__novaInitVideoId = currentVideoId;
             store._lastInit[kind] = initRecord;
+            store.initFallback[kind] = initRecord;
             if (store.tracks[kind] && previousInit?.initKey !== initKey) {
               // Keep the complete previous representation until the first media
               // fragment for the new one arrives; an init-only file is unusable.
@@ -350,6 +433,17 @@
               };
               transport.__novaInitVideoId = currentVideoId;
               if (reusedAcrossNavigation) log('capture', 'reused active MSE init; kind=', kind, 'vid=', currentVideoId);
+            }
+            if (!store._lastInit[kind] && store.initFallback[kind]) {
+              // Worker-side buffers are recreated per stream, losing their own
+              // init reference; the remembered one belongs to the same decoder
+              // configuration as long as the MIME type matches.
+              const fallback = store.initFallback[kind];
+              if (!mime || !fallback.mime || mime === fallback.mime) {
+                store._lastInit[kind] = fallback;
+                log('capture', 'reused remembered init segment; kind=', kind,
+                  'worker=', Boolean(transport.__novaWorker), 'mime=', mime || fallback.mime || '');
+              }
             }
             const pendingInit = store._pendingInit[kind];
             const partKey = fragmentFingerprint(u8);
@@ -510,6 +604,7 @@
             wrappedAppend.__novaWorkerWrapped = true;
             proto.appendBuffer = wrappedAppend;
           };
+          const novaBuffers = new Map();
           const hookMediaSource = (Ctor) => {
             const proto = Ctor && Ctor.prototype;
             if (!proto || typeof proto.addSourceBuffer !== 'function' || proto.addSourceBuffer.__novaWorkerWrapped) return;
@@ -520,11 +615,36 @@
               sourceBuffer.__novaKind = /audio/i.test(sourceBuffer.__novaMime)
                 ? 'audio' : (/video/i.test(sourceBuffer.__novaMime) ? 'video' : null);
               sourceBuffer.__novaStreamId = nextStreamId++;
+              novaBuffers.set(sourceBuffer.__novaStreamId, sourceBuffer);
               return sourceBuffer;
             };
             wrappedAddSourceBuffer.__novaWorkerWrapped = true;
             proto.addSourceBuffer = wrappedAddSourceBuffer;
           };
+          // Buffered-range removal requested by the page: the capture pass
+          // relies on it to make SABR re-serve ranges the player already has.
+          // Registered before the real worker script, so stopImmediatePropagation
+          // keeps these internal messages away from YouTube's own handlers.
+          self.addEventListener('message', (event) => {
+            const message = event.data;
+            if (!message || message.__novaWorkerRemove !== true) return;
+            event.stopImmediatePropagation();
+            const sourceBuffer = novaBuffers.get(message.streamId);
+            let removed = false;
+            try {
+              if (sourceBuffer && !sourceBuffer.updating) {
+                for (let index = sourceBuffer.buffered.length - 1; index >= 0; index--) {
+                  const start = Math.max(sourceBuffer.buffered.start(index), Math.max(0, message.start));
+                  const end = Math.min(sourceBuffer.buffered.end(index), message.end);
+                  if (start >= end || end <= 0) continue;
+                  sourceBuffer.remove(start, end);
+                  removed = true;
+                  break; // one remove() per updating cycle
+                }
+              }
+            } catch (e) {}
+            novaPostMessage({ __novaWorkerRemoved: true, streamId: message.streamId, removed });
+          });
           hookAppend(self.SourceBuffer && self.SourceBuffer.prototype);
           hookAppend(self.ManagedSourceBuffer && self.ManagedSourceBuffer.prototype);
           hookMediaSource(self.MediaSource);
@@ -550,10 +670,14 @@
         bootstrapUrl = URL.createObjectURL(new Blob([bootstrap], {
           type: isModule ? 'text/javascript' : 'application/javascript',
         }));
-        worker = new OrigWorker(bootstrapUrl, options);
+        worker = new OrigWorker(asWorkerScriptUrl(bootstrapUrl), options);
       } catch (error) {
         if (originalWorkerUrl) wrappedWorkerBlobUrls.delete(originalWorkerUrl);
         if (bootstrapUrl) try { URL.revokeObjectURL(bootstrapUrl); } catch (e) {}
+        // Falling back means media handled by this worker stays invisible to
+        // the capture; it must be visible in diagnostics, not silent.
+        log('capture', 'worker MSE bridge not installed; using native worker:',
+          String(error?.message || error));
         return new OrigWorker(scriptURL, options);
       }
 
@@ -570,6 +694,11 @@
           log('capture', 'worker MSE bridge ready; module=', options?.type === 'module');
           return;
         }
+        if (message?.__novaWorkerRemoved) {
+          event.stopImmediatePropagation();
+          if (message.removed) store.workerRemoveAcks += 1;
+          return;
+        }
         if (!message?.__novaMseSegment || !message.bytes) return;
         event.stopImmediatePropagation();
         const key = `${message.kind}:${message.streamId}`;
@@ -579,8 +708,17 @@
             __novaWorker: true,
             __novaKind: message.kind,
             __novaMime: String(message.mime || ''),
+            __novaStreamId: message.streamId,
+            __novaRequestRemove(start, end) {
+              worker.postMessage({
+                __novaWorkerRemove: true, streamId: message.streamId, start, end,
+              });
+            },
           };
           transports.set(key, transport);
+          if (message.kind === 'audio' || message.kind === 'video') {
+            store.workerTransports[message.kind].add(transport);
+          }
           log('capture', 'worker MSE stream detected; kind=', message.kind,
             'mime=', message.mime || '');
         }
@@ -1051,58 +1189,144 @@
     return null;
   }
 
-  function normalizeMp4Fragments(bytes, kind) {
-    const moofs = [];
-    for (let offset = 0; offset + 8 <= bytes.length;) {
+  // Box walk over a captured fMP4 stream. Segments arrive in many appends and
+  // can leave gaps or junk between fragments, so a strict sequential walk used
+  // to stop at the first bad size — everything after it stayed unindexed and
+  // was silently carried inside the last fragment, where no sample table
+  // describes it (players then showed a few frames per second). Resyncing on
+  // the next 'moof' keeps the whole stream addressable.
+  function scanMp4Fragments(bytes) {
+    const boxSizeAt = (offset) => {
+      if (offset + 8 > bytes.length) return 0;
       let size = readU32(bytes, offset);
-      const type = String.fromCharCode(bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7]);
-      if (size === 1 || !size || offset + size > bytes.length) break;
-      if (type === 'moof') moofs.push({ offset, size, originalIndex: moofs.length });
+      if (size === 1) {
+        if (offset + 16 > bytes.length) return 0;
+        const high = readU32(bytes, offset + 8);
+        const low = readU32(bytes, offset + 12);
+        if (high !== 0) return 0; // > 4 GB is never a captured fragment
+        size = low;
+      }
+      if (size < 8 || offset + size > bytes.length) return 0;
+      return size;
+    };
+    const typeAt = (offset) => String.fromCharCode(
+      bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7]);
+    const findNextMoof = (from) => {
+      for (let offset = from; offset + 8 <= bytes.length; offset++) {
+        if (bytes[offset + 4] === 0x6d && bytes[offset + 5] === 0x6f
+          && bytes[offset + 6] === 0x6f && bytes[offset + 7] === 0x66 && boxSizeAt(offset)) {
+          return offset;
+        }
+      }
+      return -1;
+    };
+    const fragments = [];
+    let skippedBytes = 0;
+    let offset = 0;
+    while (offset + 8 <= bytes.length) {
+      const size = boxSizeAt(offset);
+      if (!size) {
+        const next = findNextMoof(offset + 1);
+        if (next < 0) {
+          skippedBytes += bytes.length - offset;
+          break;
+        }
+        skippedBytes += next - offset;
+        offset = next;
+        continue;
+      }
+      if (typeAt(offset) === 'moof') {
+        // A fragment is moof + the payload box that follows it; taking exactly
+        // those two keeps every rebuilt fragment self-contained.
+        let end = offset + size;
+        const payloadSize = boxSizeAt(end);
+        if (payloadSize && typeAt(end) === 'mdat') end += payloadSize;
+        fragments.push({ offset, size, end, originalIndex: fragments.length });
+        offset = end;
+        continue;
+      }
       offset += size;
     }
-    for (let index = 0; index < moofs.length; index++) {
-      const fragmentEnd = index + 1 < moofs.length ? moofs[index + 1].offset : bytes.length;
-      moofs[index].decodeTime = mp4FragmentDecodeTime(bytes, moofs[index].offset,
-        Math.min(fragmentEnd, moofs[index].offset + moofs[index].size));
+    return { fragments, skippedBytes };
+  }
+
+  function normalizeMp4Fragments(bytes, kind) {
+    const scan = scanMp4Fragments(bytes);
+    const moofs = scan.fragments;
+    if (scan.skippedBytes) {
+      log('assembly', `mp4 ${kind}; resynced past`, scan.skippedBytes, 'unindexed bytes');
+    }
+    for (const fragment of moofs) {
+      fragment.decodeTime = mp4FragmentDecodeTime(bytes, fragment.offset,
+        fragment.offset + fragment.size);
     }
     if (moofs.length < 2 || moofs.some((fragment) => !Number.isFinite(fragment.decodeTime))) {
       return { bytes, container: 'mp4', fragments: moofs.length, reordered: false };
     }
     const sorted = [...moofs].sort((left, right) => left.decodeTime - right.decodeTime
       || left.originalIndex - right.originalIndex);
-    const deltas = sorted.slice(1).map((fragment, index) => fragment.decodeTime - sorted[index].decodeTime)
+    // A prefix refill can re-append fragments the capture already holds (same
+    // decode time, possibly different bytes). Keep the first occurrence only:
+    // duplicated fragments produce a repeated timeline that players reject.
+    // Among fragments sharing a decode time keep the largest payload: a refill
+    // can deliver a complete copy of a fragment the capture only half received.
+    const deduped = sorted.filter((fragment, index) => {
+      if (index > 0 && fragment.decodeTime === sorted[index - 1].decodeTime) return false;
+      let best = fragment;
+      for (let next = index + 1; next < sorted.length
+        && sorted[next].decodeTime === fragment.decodeTime; next++) {
+        if (sorted[next].end - sorted[next].offset > best.end - best.offset) best = sorted[next];
+      }
+      if (best !== fragment) {
+        fragment.offset = best.offset;
+        fragment.size = best.size;
+        fragment.end = best.end;
+      }
+      return true;
+    });
+    const duplicatesDropped = sorted.length - deduped.length;
+    const deltas = deduped.slice(1).map((fragment, index) => fragment.decodeTime - deduped[index].decodeTime)
       .filter((delta) => delta > 0);
     const normalDelta = deltas.length ? Math.min(...deltas) : 0;
-    if (normalDelta && sorted[0].decodeTime > normalDelta * 1.5) {
+    if (normalDelta && deduped[0].decodeTime > normalDelta * 1.5) {
       const error = new Error(`дорожка ${kind} не содержит начало MP4`);
       error.details = {
-        kind, container: 'mp4', firstDecodeTime: sorted[0].decodeTime,
+        kind, container: 'mp4', firstDecodeTime: deduped[0].decodeTime,
         normalDelta, fragments: moofs.length,
       };
       throw error;
     }
-    const reordered = sorted.some((fragment, index) => fragment !== moofs[index]);
-    log('assembly', `mp4 ${kind}; fragments=`, moofs.length, 'first=', sorted[0].decodeTime,
-      'last=', sorted[sorted.length - 1].decodeTime, 'reordered=', reordered);
-    if (!reordered) return { bytes, container: 'mp4', fragments: moofs.length, reordered: false };
+    const indexedBytes = moofs.reduce((total, fragment) => total + (fragment.end - fragment.offset), 0)
+      + (moofs.length ? moofs[0].offset : 0);
+    // Rebuild whenever anything was dropped, reordered, or left unindexed:
+    // trailing junk inside the final fragment is exactly what turned a full
+    // capture into a few frames per second.
+    const changed = duplicatesDropped > 0
+      || scan.skippedBytes > 0
+      || indexedBytes !== bytes.length
+      || deduped.some((fragment, index) => fragment !== moofs[index]);
+    log('assembly', `mp4 ${kind}; fragments=`, moofs.length, 'unique=', deduped.length,
+      'first=', deduped[0].decodeTime, 'last=', deduped[deduped.length - 1].decodeTime,
+      'duplicatesDropped=', duplicatesDropped, 'indexedBytes=', indexedBytes,
+      'totalBytes=', bytes.length, 'rebuilt=', changed);
+    if (!changed) return { bytes, container: 'mp4', fragments: moofs.length, reordered: false };
     if (bytes.length > 400_000_000) {
       const error = new Error(`дорожка ${kind} слишком велика для безопасной перестановки MP4-фрагментов`);
       error.novaFatal = true;
       throw error;
     }
-    const output = new Uint8Array(bytes.length);
     const prefixEnd = moofs[0].offset;
+    const fragmentSlices = deduped.map((fragment) => bytes.subarray(fragment.offset, fragment.end));
+    const output = new Uint8Array(prefixEnd
+      + fragmentSlices.reduce((total, slice) => total + slice.length, 0));
     output.set(bytes.subarray(0, prefixEnd), 0);
     let writeOffset = prefixEnd;
-    for (const fragment of sorted) {
-      const sourceIndex = fragment.originalIndex;
-      const sourceEnd = sourceIndex + 1 < moofs.length ? moofs[sourceIndex + 1].offset : bytes.length;
-      const bytesForFragment = bytes.subarray(fragment.offset, sourceEnd);
-      output.set(bytesForFragment, writeOffset);
-      writeOffset += bytesForFragment.length;
+    for (const slice of fragmentSlices) {
+      output.set(slice, writeOffset);
+      writeOffset += slice.length;
     }
     if (writeOffset !== output.length) throw new Error(`ошибка перестановки MP4-фрагментов ${kind}`);
-    return { bytes: output, container: 'mp4', fragments: moofs.length, reordered: true };
+    return { bytes: output, container: 'mp4', fragments: deduped.length, reordered: true };
   }
 
   function normalizeCapturedTrack(bytes, mime, kind, expectedDurationSeconds = 0, options = {}) {
@@ -1196,6 +1420,9 @@
       );
       out[kind] = { bytes: normalized.bytes, mime: t.mime, height: t.height || null };
       if (t.forceTranscode) out.forceTranscode = true;
+      log('assembly', 'track assembled; kind=', kind, 'container=', normalized.container,
+        'parts=', parts.length, 'droppedBeforeInit=', Math.max(0, initIndex),
+        'rawBytes=', n, 'finalBytes=', normalized.bytes.length);
     }
     return out;
   }
@@ -1466,6 +1693,12 @@
 
   async function resetTrackBufferForCapture(kind, currentVideoOnly = true) {
     let cleared = false;
+    // Worker-hosted buffers answer only to messages; ask them first.
+    if (store.workerTransports[kind]?.size) {
+      const media = video();
+      const span = (Number(media?.duration) || 0) + 5 || 86_400;
+      cleared = await removeWorkerTrackRange(kind, 0, span);
+    }
     for (const sb of liveSourceBuffers(kind, currentVideoOnly)) {
       try {
         await waitForUpdateEnd(sb);
@@ -1485,8 +1718,25 @@
     return cleared;
   }
 
+  // Worker-side SourceBuffers can only be told to drop a range by message;
+  // the acknowledgement tells us whether anything was actually removed.
+  async function removeWorkerTrackRange(kind, startSeconds, endSeconds) {
+    const transports = [...(store.workerTransports[kind] || [])];
+    if (!transports.length) return false;
+    const acksBefore = store.workerRemoveAcks;
+    for (const transport of transports) {
+      try { transport.__novaRequestRemove?.(Math.max(0, startSeconds), endSeconds); } catch (e) {}
+    }
+    const deadline = Date.now() + 1_500;
+    while (Date.now() < deadline) {
+      await sleep(100);
+      if (store.workerRemoveAcks > acksBefore) return true;
+    }
+    return false;
+  }
+
   async function removeTrackRangeForCapture(kind, startSeconds, endSeconds, currentVideoOnly = true) {
-    let removed = false;
+    let removed = await removeWorkerTrackRange(kind, startSeconds, endSeconds);
     for (const sourceBuffer of liveSourceBuffers(kind, currentVideoOnly)) {
       try {
         await waitForUpdateEnd(sourceBuffer);
@@ -1507,6 +1757,96 @@
 
   async function removeTrackPrefixForCapture(kind, endSeconds, currentVideoOnly = true) {
     return removeTrackRangeForCapture(kind, 0, endSeconds, currentVideoOnly);
+  }
+
+  // A Music track opened by the queue has never played, so ytmusic has not
+  // built its MSE session yet: there are no SourceBuffers to observe and SABR
+  // answers no paused seek. A short muted play from the start creates the
+  // session (and its opening segments) without ever nearing the track end,
+  // which is what makes ytmusic jump to the next item.
+  // On Music the audio representation follows the selected video tier: a low
+  // tier is served Opus 250 (~70 kbit/s) while 720p and above get 251
+  // (~150 kbit/s). Asking for a high tier before the URLs are observed is what
+  // makes "Оригинал" actually mean the best available audio.
+  function requestBestMusicAudioTier() {
+    if (!MUSIC_HOST) return;
+    try {
+      const heights = availableHeights().sort((a, b) => a - b);
+      const target = heights.find((height) => height >= 720) || heights[heights.length - 1];
+      const quality = QUALITY_BY_HEIGHT[target];
+      if (!quality) return;
+      if (currentQuality() >= 720) return;
+      setQualityRaw(quality);
+      log('capture', 'requested high tier for best Music audio; height=', target);
+    } catch (e) {}
+  }
+
+  // The URL of the better representation only becomes known once the player
+  // has actually requested it, so wait for one after raising the tier.
+  const MUSIC_GOOD_AUDIO_KBPS = 100;
+
+  async function ensureBestMusicAudioObserved(durationSeconds) {
+    if (!MUSIC_HOST || !(durationSeconds > 0)) return;
+    const kbpsOf = (format) => {
+      const length = Number(format?.contentLength) || 0;
+      return length ? (length * 8) / durationSeconds / 1000 : 0;
+    };
+    // URLs published in the player response always answer 403 on Music, so a
+    // usable candidate must be one the player itself has requested.
+    const usable = (format) => Boolean(format)
+      && format._novaSource !== 'player-response'
+      && kbpsOf(format) >= MUSIC_GOOD_AUDIO_KBPS;
+    if (usable(selectDirectAudioFormat())) return;
+    await primeMusicMediaSession(video(), durationSeconds, { force: true });
+    const deadline = Date.now() + 6_000;
+    while (Date.now() < deadline) {
+      const candidate = selectDirectAudioFormat();
+      if (usable(candidate)) {
+        log('direct-audio', 'best Music audio observed; itag=', candidate.itag || '?',
+          'kbps=', Math.round(kbpsOf(candidate)));
+        return;
+      }
+      await sleep(300);
+    }
+    const fallbackCandidate = selectDirectAudioFormat();
+    log('direct-audio', 'no observed high-bitrate audio; continuing with',
+      fallbackCandidate?._novaSource || 'none', Math.round(kbpsOf(fallbackCandidate)), 'kbps');
+  }
+
+  async function primeMusicMediaSession(media, capEnd, options = {}) {
+    if (!MUSIC_HOST || !media) return false;
+    const duration = Number(media.duration) || capEnd || 0;
+    if (duration > 0 && duration < 8) return false;
+    const hadBuffers = liveSourceBuffers('audio', false).length
+      || store.workerTransports.audio.size;
+    if (hadBuffers && !options.force) return false;
+    const appendsBefore = store.lastAppendAt.audio || 0;
+    log('capture', 'priming music media session with a short muted play');
+    return withDeliberatePlayback(async () => {
+      try { media.muted = true; } catch (e) {}
+      try { media.currentTime = 0; } catch (e) {}
+      try { await playWithTimeout(media, 3_000); } catch (e) {}
+      const deadline = Date.now() + 4_000;
+      let primed = false;
+      while (Date.now() < deadline) {
+        await sleep(200);
+        throwIfDownloadCancelled();
+        if ((store.lastAppendAt.audio || 0) > appendsBefore
+          || liveSourceBuffers('audio', false).length
+          || store.workerTransports.audio.size) {
+          primed = true;
+          // Give the freshly created session a moment to append its init and
+          // first media segments before the paused-seek pass takes over.
+          await sleep(600);
+          break;
+        }
+      }
+      pauseForCapture(media);
+      log('capture', 'music media session primed=', primed,
+        'audioBuffers=', liveSourceBuffers('audio', false).length,
+        'workerAudio=', store.workerTransports.audio.size);
+      return primed;
+    });
   }
 
   function adoptAttachedInitForCapture(kind, buffers, currentVideoId) {
@@ -1571,9 +1911,13 @@
   }
 
   function observedDirectAudioFormat() {
+    // Best quality first (a track can be observed in several representations
+    // as the player switches bitrate); URLs that stop serving data are retired
+    // by the downloader, so the next call falls through to the lesser one.
     const intercepted = store.observedMediaFormats.audio
       .filter((format) => format.videoId === vidId() && directUrlIsUsable(format.url))
-      .sort((left, right) => right.observedAt - left.observedAt)[0];
+      .sort((left, right) => (Number(right.contentLength) || 0) - (Number(left.contentLength) || 0)
+        || right.observedAt - left.observedAt)[0];
     if (intercepted) return { ...intercepted };
     if (vidId() !== store.videoId) return null;
     let entries;
@@ -1625,9 +1969,13 @@
           + (Number(format.bitrate) || 0);
         return score(right) - score(left);
       })[0] || null;
+    // On music.youtube the URLs published in the player response answer 403;
+    // only the ones the player itself has already used are signed acceptably.
+    const observed = observedDirectAudioFormat();
+    if (MUSIC_HOST && observed) return observed;
     return selected
       ? { ...selected, url: withoutTransientMediaParams(selected.url), _novaSource: 'player-response' }
-      : observedDirectAudioFormat();
+      : observed;
   }
 
   function selectDirectVideoFormat(height) {
@@ -1734,6 +2082,131 @@
     };
   }
 
+  // googlevideo throttles a single continuous stream to roughly playback speed
+  // (music.youtube always, www often). Splitting the byte range across a few
+  // concurrent requests — the same trick the player itself uses with its
+  // `range=` parameter — is answered at full link speed.
+  const PARALLEL_RANGE_PARTS = 8;
+  // Small enough that even a short track is split: a single stream is
+  // throttled to playback speed, so two slices already halve the wait.
+  const PARALLEL_RANGE_MIN_BYTES = 128 * 1024;
+
+  // Range requests made through the `range=` query parameter are answered in
+  // googlevideo's UMP container: a sequence of (type, size, payload) parts
+  // where the media bytes live in type 21, each payload prefixed by one
+  // header-id byte. Concatenating those payloads reproduces the raw stream
+  // byte for byte (verified against an unsplit download).
+  function umpVarint(bytes, offset) {
+    const first = bytes[offset];
+    const size = first < 128 ? 1 : (first < 192 ? 2 : (first < 224 ? 3 : (first < 240 ? 4 : 5)));
+    let value;
+    if (size === 1) value = first;
+    else if (size === 2) value = (first & 0x3f) | (bytes[offset + 1] << 6);
+    else if (size === 3) value = (first & 0x1f) | (bytes[offset + 1] << 5) | (bytes[offset + 2] << 13);
+    else if (size === 4) {
+      value = (first & 0x0f) | (bytes[offset + 1] << 4) | (bytes[offset + 2] << 12)
+        | (bytes[offset + 3] << 20);
+    } else {
+      value = bytes[offset + 1] | (bytes[offset + 2] << 8)
+        | (bytes[offset + 3] << 16) | (bytes[offset + 4] << 24);
+    }
+    return [value >>> 0, size];
+  }
+
+  function extractUmpMedia(bytes) {
+    const chunks = [];
+    let offset = 0;
+    while (offset < bytes.length) {
+      const [type, typeSize] = umpVarint(bytes, offset);
+      offset += typeSize;
+      if (offset >= bytes.length) break;
+      const [size, sizeSize] = umpVarint(bytes, offset);
+      offset += sizeSize;
+      if (offset + size > bytes.length) {
+        // Truncated final part: keep the media bytes it did deliver.
+        if (type === 21 && bytes.length - offset > 1) chunks.push(bytes.subarray(offset + 1));
+        break;
+      }
+      if (type === 21 && size > 1) chunks.push(bytes.subarray(offset + 1, offset + size));
+      offset += size;
+    }
+    const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    const media = new Uint8Array(total);
+    let written = 0;
+    for (const chunk of chunks) {
+      media.set(chunk, written);
+      written += chunk.length;
+    }
+    return media;
+  }
+
+  async function fetchDirectRangeSlice(url, start, end, logTag) {
+    const wanted = end - start + 1;
+    let lastError = null;
+    // A range occasionally comes back empty or as a non-media UMP reply
+    // (stream-protection/redirect parts); those are transient.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt) await sleep(200 * attempt);
+      try {
+        const response = await (OrigFetch || window.fetch.bind(window))(
+          `${url}${url.includes('?') ? '&' : '?'}range=${start}-${end}`,
+          { credentials: 'omit' },
+        );
+        if (!response.ok) {
+          const error = new Error(`HTTP ${response.status}`);
+          error.novaHttpStatus = response.status;
+          throw error;
+        }
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        if (!bytes.length) throw new Error(`пустой ответ на диапазон ${start}-${end}`);
+        const media = bytes.length === wanted ? bytes : extractUmpMedia(bytes);
+        if (media.length < wanted) {
+          throw new Error(`диапазон ${start}-${end}: получено ${media.length} из ${wanted} байт`);
+        }
+        if (attempt) log(logTag, 'range recovered on retry', attempt + 1, `${start}-${end}`);
+        return media.length > wanted ? media.subarray(0, wanted) : media;
+      } catch (error) {
+        lastError = error;
+        if (error?.novaHttpStatus === 401 || error?.novaHttpStatus === 403
+          || error?.novaHttpStatus === 410) break;
+      }
+    }
+    throw lastError || new Error(`диапазон ${start}-${end} не получен`);
+  }
+
+  async function fetchDirectRangesInParallel(url, totalLength, onProgress, logTag, maxParts) {
+    const parts = Math.min(maxParts || PARALLEL_RANGE_PARTS,
+      Math.max(2, Math.floor(totalLength / PARALLEL_RANGE_MIN_BYTES)));
+    const chunkSize = Math.ceil(totalLength / parts);
+    const buffers = new Array(parts).fill(null);
+    let received = 0;
+    const started = Date.now();
+    await Promise.all(Array.from({ length: parts }, async (_, index) => {
+      const start = index * chunkSize;
+      const end = Math.min(totalLength - 1, start + chunkSize - 1);
+      if (start > end) {
+        buffers[index] = new Uint8Array(0);
+        return;
+      }
+      buffers[index] = await fetchDirectRangeSlice(url, start, end, logTag);
+      received += buffers[index].length;
+      onProgress(Math.min(0.99, received / totalLength));
+    }));
+    const assembled = new Uint8Array(buffers.reduce((total, part) => total + part.length, 0));
+    let offset = 0;
+    for (const part of buffers) {
+      assembled.set(part, offset);
+      offset += part.length;
+    }
+    // The server may hand back a couple of bytes more than clen announced.
+    if (assembled.length < totalLength) {
+      throw new Error(`параллельная загрузка вернула ${assembled.length} из ${totalLength} байт`);
+    }
+    log(logTag, 'parallel range download complete; parts=', parts, 'bytes=', assembled.length,
+      'seconds=', ((Date.now() - started) / 1000).toFixed(1));
+    return assembled;
+  }
+
   async function fetchDirectAudio(onProgress, suppliedFormat = null, mediaKind = 'audio') {
     const requestedVideoId = vidId();
     const format = suppliedFormat || selectDirectAudioFormat();
@@ -1741,6 +2214,8 @@
 
     const directLogTag = mediaKind === 'video' ? 'direct-video' : 'direct-audio';
     const declaredLength = Number(format.contentLength) || 0;
+    const durationSeconds = (Number(format.approxDurationMs) || 0) / 1000;
+    const fetchStartedAt = Date.now();
     const parts = [];
     let received = 0;
     let expectedLength = declaredLength;
@@ -1762,6 +2237,60 @@
       resumable: true,
     }));
     reportProgress(0.01);
+
+    if (declaredLength > PARALLEL_RANGE_MIN_BYTES * 2) {
+      try {
+        let assembled = null;
+        let parallelError = null;
+        // Fewer, larger slices on retry: a rejected slice is usually the
+        // server pushing back on concurrency, not a broken URL.
+        for (const maxParts of [PARALLEL_RANGE_PARTS, 4, 2]) {
+          try {
+            assembled = await fetchDirectRangesInParallel(
+              format.url, declaredLength, reportProgress, directLogTag, maxParts);
+            break;
+          } catch (error) {
+            parallelError = error;
+            if (error?.novaFatal || error?.novaHttpStatus === 401
+              || error?.novaHttpStatus === 403 || error?.novaHttpStatus === 410) throw error;
+            log(directLogTag, 'parallel range attempt failed with', maxParts, 'parts:',
+              String(error?.message || error));
+          }
+        }
+        if (!assembled) {
+          // Empty replies for every slice mean this URL no longer serves the
+          // track (the player has since switched to another representation).
+          // Retire it and let the caller retry with the next observed URL
+          // instead of grinding through the throttled sequential path.
+          invalidateDirectUrl(format.url);
+          const retired = parallelError || new Error('параллельная загрузка не удалась');
+          retired.novaRetiredUrl = true;
+          log(directLogTag, 'direct URL retired (no data); trying another candidate');
+          throw retired;
+        }
+        if (vidId() !== requestedVideoId) {
+          const navigationError = new Error('страница YouTube перешла к другому видео во время загрузки');
+          navigationError.novaFatal = true;
+          throw navigationError;
+        }
+        reportProgress(1);
+        return {
+          bytes: assembled,
+          mime: responseMime,
+          duration: (Number(format.approxDurationMs) || 0) / 1000,
+          captureRate: 1,
+          _novaSource: `${format._novaSource || 'player-response'}+parallel`,
+        };
+      } catch (error) {
+        if (error?.novaFatal || error?.novaRetiredUrl) throw error;
+        if (error?.novaHttpStatus === 403 || error?.novaHttpStatus === 401
+          || error?.novaHttpStatus === 410) {
+          invalidateDirectUrl(format.url);
+        }
+        log(directLogTag, 'parallel range download unavailable; falling back to stream:',
+          String(error?.message || error));
+      }
+    }
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const attemptStart = received;
@@ -1808,8 +2337,20 @@
           throw new Error(`поток начался с байта ${rangeStart}, а не с нуля`);
         }
         const responseLength = Number(response.headers.get('content-length')) || 0;
-        expectedLength = rangeTotal || expectedLength
-          || (rangeMatch ? rangeEnd + 1 : responseLength);
+        // The server's own totals are authoritative. A clen observed from
+        // request URLs can undercount by a few bytes, which used to strand
+        // the download resuming from a byte past the end of the file.
+        const serverTotal = rangeTotal
+          || (response.status === 200 && responseLength ? responseLength : 0);
+        if (serverTotal) {
+          if (expectedLength && serverTotal !== expectedLength) {
+            log(directLogTag, 'declared size corrected by server; declared=',
+              expectedLength, 'server=', serverTotal);
+          }
+          expectedLength = serverTotal;
+        } else if (!expectedLength) {
+          expectedLength = rangeMatch ? rangeEnd + 1 : responseLength;
+        }
         responseMime = format.mimeType || response.headers.get('content-type') || responseMime;
 
         const reader = response.body.getReader();
@@ -1827,8 +2368,30 @@
           parts.push(value);
           received += value.length;
           if (received > 750_000_000) throw new Error('медиадорожка превышает безопасный лимит памяти');
+          // Some endpoints (notably music.youtube) throttle direct URLs to
+          // roughly playback speed. Bailing out to the MSE capture is far
+          // faster than finishing a 1x download here — but only for tracks
+          // big enough for the wait to matter; a small file finishes in
+          // seconds even throttled, and the capture path is slower than that.
+          if (durationSeconds > 0 && expectedLength > 4 * 1024 * 1024) {
+            const elapsedSeconds = (Date.now() - fetchStartedAt) / 1000;
+            if (elapsedSeconds > 8) {
+              const speedFactor = (received / elapsedSeconds) / (expectedLength / durationSeconds);
+              if (speedFactor < 2.5) {
+                controller.abort();
+                const throttled = new Error(
+                  `сервер отдаёт прямой поток со скоростью воспроизведения (${speedFactor.toFixed(1)}x)`);
+                throttled.novaDirectThrottled = true;
+                throw throttled;
+              }
+            }
+          }
           if (expectedLength && received > expectedLength) {
-            throw new Error(`получено больше заявленного размера (${received} > ${expectedLength})`);
+            // The declared size undercounted and the server offered no total:
+            // the real size is unknown, so read to EOF and accept the stream.
+            log(directLogTag, 'declared size exceeded; reading to end of stream; declared=',
+              expectedLength, 'received=', received);
+            expectedLength = 0;
           }
           reportProgress(expectedLength ? Math.min(0.99, received / expectedLength) : 0.01);
           if (expectedLength && received === expectedLength) {
@@ -1846,6 +2409,13 @@
         lastError = new Error(`поток завершился раньше (${received} из ${expectedLength} байт)`);
       } catch (error) {
         if (error?.novaFatal) throw error;
+        if (error?.novaDirectThrottled) {
+          // Deliberate switch to the MSE path: skip the resume loop and never
+          // mark the error novaNoFallback despite the partial data.
+          log(directLogTag, 'throttled by server; falling back to MSE;',
+            'received=', received, 'reason=', error.message);
+          throw error;
+        }
         lastError = stalled
           ? new Error(`нет данных более 20 секунд после байта ${received}`)
           : error;
@@ -1862,9 +2432,14 @@
     }
 
     if (lastError) {
-      // A partially received signed track has already selected the reliable
-      // network path. Do not discard it and silently switch to real-time 1x.
-      if (received > 0) lastError.novaNoFallback = true;
+      // A substantially received signed track has already selected the
+      // reliable network path: do not discard it for a real-time 1x capture.
+      // A stream that died in its first bytes proves nothing, so there the
+      // MSE capture must still get its chance.
+      const meaningfulProgress = expectedLength
+        ? received >= expectedLength * 0.25
+        : received > 1_000_000;
+      if (meaningfulProgress) lastError.novaNoFallback = true;
       throw lastError;
     }
     if (!received) throw new Error('прямой медиапоток пуст');
@@ -2037,6 +2612,7 @@
       let pauseRequestedAt = 0;
       let resumeRequestedAt = 0;
       while (!media.ended && media.currentTime < targetEnd - 0.15) {
+        throwIfDownloadCancelled();
         if (vidId() !== requestedVideoId) {
           const navigationError = new Error('страница YouTube перешла к другому видео во время захвата аудио');
           navigationError.novaFatal = true;
@@ -2265,6 +2841,7 @@
       let pauseRequestedAt = 0;
       let resumeRequestedAt = 0;
       while (!media.ended && media.currentTime < targetEnd - 0.15) {
+        throwIfDownloadCancelled();
         if (vidId() !== requestedVideoId) {
           const navigationError = new Error('страница YouTube перешла к другому видео во время записи видео');
           navigationError.novaFatal = true;
@@ -2565,7 +3142,10 @@
     // Keep that disposable buffer at the lowest quality so a later 1080p/720p
     // download must request fresh video segments instead of reading a complete
     // same-quality SourceBuffer that our hook can no longer reconstruct.
-    if (isMp3) {
+    // Not on Music: there the audio bitrate follows the video tier, so pinning
+    // 144p makes the player fall back from Opus 251 (~150 kbit/s) to 250
+    // (~70 kbit/s) — the download would silently lose half its quality.
+    if (isMp3 && !MUSIC_HOST) {
       const lowestHeight = await lowestAvailableHeight();
       const lowestQuality = QUALITY_BY_HEIGHT[lowestHeight] || null;
       if (lowestQuality) {
@@ -2674,7 +3254,61 @@
       if (missingAudio && !store._lastInit.audio) adoptAttachedInitForCapture('audio', audioBuffers, capId);
       if (missingVideo && !store._lastInit.video) adoptAttachedInitForCapture('video', videoBuffers, capId);
       log('capture', 'fast v1 MSE seek bootstrap; missingAudio=', missingAudio, 'missingVideo=', missingVideo,
-        'audioBuffers=', audioBuffers.length, 'videoBuffers=', videoBuffers.length);
+        'audioBuffers=', audioBuffers.length, 'videoBuffers=', videoBuffers.length,
+        'workerAudio=', store.workerTransports.audio.size,
+        'workerVideo=', store.workerTransports.video.size,
+        'initFallback=', Object.keys(store.initFallback).join(',') || 'none');
+      // Music tracks are typically fully buffered already (they just played),
+      // so SABR serves nothing for the paused seeks, and the playback rescue
+      // only pulls in the NEXT track's gapless preload ("видео переключилось"
+      // reload loops). Drop the buffered ranges the capture never observed —
+      // SABR then re-serves the whole track from zero. Both kinds go together:
+      // SABR keeps a range alive while its companion buffer still covers it.
+      if (MUSIC_HOST && (missingAudio || missingVideo)) {
+        const flushEnd = (Number(v.duration) || capEnd || 0) + 5;
+        for (const kind of ['audio', 'video']) {
+          try {
+            const removed = await removeTrackPrefixForCapture(kind, flushEnd, true);
+            if (removed) log('capture', 'flushed pre-buffered range; kind=', kind, 'end=', flushEnd);
+          } catch (e) {}
+        }
+        // Freshly opened Music tracks often run their MSE in a worker: the
+        // page hook sees zero SourceBuffers and zero bytes, primers cannot
+        // help, and ~40 wasted seconds later the escalation trips ytmusic
+        // into the next track. After a page reload the session reliably
+        // lands in the page again — so reload immediately instead.
+        const workerBridged = store.workerTransports.audio.size || store.workerTransports.video.size;
+        if (!audioBuffers.length && !videoBuffers.length && !workerBridged) {
+          // Nothing to observe yet: on Music that means the track has never
+          // played, so build its media session before deciding anything.
+          await primeMusicMediaSession(v, capEnd);
+          const graceDeadline = Date.now() + 3_000;
+          let pageBuffersAppeared = false;
+          while (Date.now() < graceDeadline) {
+            await sleep(250);
+            throwIfDownloadCancelled();
+            if (liveSourceBuffers('audio', false).length
+              || liveSourceBuffers('video', false).length
+              || store.workerTransports.audio.size
+              || capturedTrackHasMedia('audio')) {
+              pageBuffersAppeared = true;
+              break;
+            }
+          }
+          if (!pageBuffersAppeared) {
+            log('capture', 'no page-visible SourceBuffers (worker MSE); requesting reload without waiting');
+            throw new Error('плеер обслуживает медиапоток в фоновом потоке — нужна перезагрузка страницы');
+          }
+          // Buffers materialized after the flush above already ran — flush
+          // again, or their pre-filled ranges starve the seek pass anyway.
+          for (const kind of ['audio', 'video']) {
+            try {
+              const removed = await removeTrackPrefixForCapture(kind, flushEnd, true);
+              if (removed) log('capture', 'flushed late-appearing buffered range; kind=', kind);
+            } catch (e) {}
+          }
+        }
+      }
     }
 
     // Do not reload the current video through loadVideoById here. On current
@@ -2737,6 +3371,7 @@
     // the appendBuffer hook keeps capturing the same original segments, so this
     // stays lossless — unlike the rendered 1x MediaRecorder fallback.
     let playbackDriven = false;
+    let musicStallFlushed = false;
     try { v.muted = true; } catch (e) {}
 
     try {
@@ -2746,6 +3381,7 @@
         // multi-second retry backoff.
         await sleep(350);
         if (store.captureError) throw store.captureError;
+        throwIfDownloadCancelled();
         if (vidId() !== capId) throw new Error('видео переключилось');
         if (!v.paused && !playbackDriven) pauseForCapture(v);
         let now = Date.now();
@@ -2848,7 +3484,33 @@
         else break;
 
         const stalledForMs = now - Math.max(lastAdvanceAt, lastMediaAt);
-        if (!playbackDriven && stalledForMs >= 20_000) {
+        if (!playbackDriven && stalledForMs >= CAPTURE_IDLE_ESCALATION_MS) {
+          if (MUSIC_HOST) {
+            // Music buffers often materialize seconds AFTER the bootstrap
+            // flush ran, already pre-filled — SABR then serves nothing. Flush
+            // once more mid-loop; if it stays dry, request the page reload
+            // right away. Playback escalation is never used here: it makes
+            // ytmusic advance to the next track mid-capture.
+            if (!musicStallFlushed) {
+              musicStallFlushed = true;
+              let flushedAny = false;
+              for (const kind of ['audio', 'video']) {
+                try {
+                  const removed = await removeTrackPrefixForCapture(kind, capEnd + 5, true);
+                  flushedAny = flushedAny || removed;
+                } catch (e) {}
+              }
+              log('capture', 'stall on music; mid-loop buffered flush; removedAny=', flushedAny,
+                'cursor=', Number(cursor.toFixed(2)));
+              // Nothing to flush means the media session still does not exist:
+              // wake it up with a short muted play instead of giving up.
+              if (!flushedAny) await primeMusicMediaSession(v, capEnd);
+              lastAdvanceAt = Date.now();
+              lastMediaAt = Date.now();
+              continue;
+            }
+            throw new Error('SABR не отвечает на запросы сегментов — нужна перезагрузка страницы');
+          }
           // SABR sometimes stops serving the paused-seek pattern altogether.
           // Real muted playback is indistinguishable from normal viewing, so it
           // reliably restarts segment delivery while capture continues.
@@ -2939,6 +3601,10 @@
     if (!media) throw new Error('video element not found');
     const requestedVideoId = vidId();
     const pairCompanion = Boolean(options.pairCompanion);
+    // With options.mp4Track set, the same removal/prime/nudge machinery runs
+    // for an fMP4 track; only the success check differs (tfdt decode times
+    // instead of WebM cluster coverage).
+    const mp4Track = options.mp4Track || null;
     const companionKind = kind === 'audio' ? 'video' : 'audio';
     const duration = Number(media.duration) || Number(player()?.getDuration?.()) || 0;
     const missingPrefixSeconds = firstTimecode / 1000;
@@ -3041,6 +3707,7 @@
       await primePrefixRequest('target');
       while (Date.now() < deadline) {
         await sleep(350);
+        throwIfDownloadCancelled();
         if (vidId() !== requestedVideoId) throw new Error('видео переключилось');
         if (store.captureError) throw store.captureError;
         try { if (!media.paused) media.pause(); } catch (e) {}
@@ -3051,23 +3718,45 @@
           lastActivityAt = Date.now();
         }
         const edge = targetBufferedEndFromZero();
-        const coverageToleranceMs = kind === 'audio' ? 500 : 2_500;
-        const coverage = webmPartsCoverage(
-          store.tracks[kind]?.parts?.slice(partCountBefore) || [],
-          0,
-          firstTimecode,
-          coverageToleranceMs,
-        );
-        const capturedEdgeSeconds = Math.max(0, Number(coverage.lastBlockMs) || 0) / 1000;
+        const newParts = store.tracks[kind]?.parts?.slice(partCountBefore) || [];
+        let covered = false;
+        let capturedEdgeSeconds = 0;
+        let coverageInfo = null;
+        if (mp4Track) {
+          let minDecode = null;
+          let maxDecode = null;
+          for (const part of newParts) {
+            const decodeTime = mp4FragmentDecodeTime(part, 0, part.length);
+            if (decodeTime !== null && Number.isFinite(decodeTime)) {
+              minDecode = minDecode === null ? decodeTime : Math.min(minDecode, decodeTime);
+              maxDecode = maxDecode === null ? decodeTime : Math.max(maxDecode, decodeTime);
+            }
+          }
+          covered = minDecode !== null && minDecode <= 0;
+          const unitsPerSecond = missingPrefixSeconds > 0
+            ? Number(mp4Track.firstDecodeTime) / missingPrefixSeconds
+            : 0;
+          capturedEdgeSeconds = maxDecode !== null && unitsPerSecond > 0
+            ? Math.min(missingPrefixSeconds, maxDecode / unitsPerSecond)
+            : 0;
+          coverageInfo = { minDecode, maxDecode, newParts: newParts.length };
+        } else {
+          const coverageToleranceMs = kind === 'audio' ? 500 : 2_500;
+          const coverage = webmPartsCoverage(newParts, 0, firstTimecode, coverageToleranceMs);
+          covered = coverage.covered;
+          capturedEdgeSeconds = Math.max(0, Number(coverage.lastBlockMs) || 0) / 1000;
+          coverageInfo = coverage;
+        }
         const repairedPrefixShare = Math.min(
           1,
           capturedEdgeSeconds / Math.max(0.001, missingPrefixSeconds),
         );
         onProgress?.(Math.min(0.999,
           completedTailShare + ((1 - completedTailShare) * repairedPrefixShare)));
-        if (appendAt > appendBefore && coverage.covered) {
-          log('capture', 'targeted WebM prefix complete; kind=', kind,
-            'sourceBufferEdge=', edge, 'coverage=', JSON.stringify(coverage));
+        if (appendAt > appendBefore && covered) {
+          log('capture', 'targeted prefix refill complete; kind=', kind,
+            'container=', mp4Track ? 'mp4' : 'webm',
+            'sourceBufferEdge=', edge, 'coverage=', JSON.stringify(coverageInfo));
           return;
         }
         if (capturedEdgeSeconds > cursor + 0.1) {
@@ -3201,6 +3890,7 @@
       await primeTailRequest('target');
       while (Date.now() < deadline) {
         await sleep(250);
+        throwIfDownloadCancelled();
         if (vidId() !== requestedVideoId) throw new Error('видео переключилось');
         if (store.captureError) throw store.captureError;
         try { if (!media.paused) media.pause(); } catch (e) {}
@@ -3387,6 +4077,7 @@
       await primeRequest();
       while (Date.now() < deadline) {
         await sleep(250);
+        throwIfDownloadCancelled();
         if (vidId() !== requestedVideoId) throw new Error('видео переключилось');
         if (store.captureError) throw store.captureError;
         try { if (!media.paused) media.pause(); } catch (e) {}
@@ -3495,6 +4186,23 @@
       },
       boundarySeconds,
     };
+  }
+
+  // Bounded head repair for fMP4 tracks. The missing length is estimated from
+  // the fragment cadence (firstDecodeTime / normalDelta fragments of ~10 s
+  // each); the removal + paired-nudge + primer machinery is shared with the
+  // WebM prefix refill, which handles SABR reliably in the field.
+  async function refillMissingMp4Prefix(kind, details, onProgress) {
+    const normalDelta = Number(details.normalDelta) || 0;
+    const firstDecodeTime = Number(details.firstDecodeTime) || 0;
+    const missingFragments = normalDelta > 0
+      ? Math.max(1, Math.round(firstDecodeTime / normalDelta))
+      : 3;
+    const firstTimecodeMs = missingFragments * 10_000;
+    return refillMissingWebmPrefix(kind, firstTimecodeMs, onProgress, {
+      pairCompanion: true,
+      mp4Track: { firstDecodeTime },
+    });
   }
 
   async function captureBackgroundSequentialReset(opts, onProgress) {
@@ -3607,6 +4315,7 @@
       while (true) {
         await sleep(350);
         if (store.captureError) throw store.captureError;
+        throwIfDownloadCancelled();
         if (vidId() !== capId) throw new Error('видео переключилось');
         try { if (!v.paused && !playbackDriven) v.pause(); } catch (e) {}
 
@@ -3654,7 +4363,7 @@
         }
 
         const stalledForMs = now - Math.max(lastAdvanceAt, lastMediaAt);
-        if (!playbackDriven && stalledForMs >= 20_000) {
+        if (!playbackDriven && stalledForMs >= CAPTURE_IDLE_ESCALATION_MS) {
           // Same rescue as the fast pass: real muted playback restarts SABR
           // delivery when the paused-seek pattern is being ignored.
           playbackDriven = true;
@@ -3776,6 +4485,257 @@
   }
 
   // ---- subtitles ------------------------------------------------------------
+  // ---- live stream capture -------------------------------------------------
+  // A live recording never accumulates media in page memory: every appended
+  // fragment is forwarded through the UI bridge to the offscreen document,
+  // which spools it to disk (OPFS). Backfill from the DVR start reuses the
+  // playback-driven pattern: muted real playback plus skip-ahead seeks that
+  // always stay inside the buffered region, so forwarded bytes stay continuous.
+  function forwardLiveAppend(transport, data) {
+    const session = store.liveSession;
+    try {
+      const kind = transport.__novaKind;
+      if (!session || session.stopped || (kind !== 'audio' && kind !== 'video')) return;
+      // After an SPA navigation the next video's fragments arrive before the
+      // capture loop can stop the session; they must never reach the file.
+      if (session.videoId && vidId() !== session.videoId) return;
+      const u8 = u8of(data);
+      if (!u8 || !u8.length) return;
+      const track = session.tracks[kind] ||= {
+        mime: transport.__novaMime || '',
+        initKey: null,
+        firstTimecode: null,
+        lastTimecode: -Infinity,
+        bytes: 0,
+        fragments: 0,
+      };
+      const mime = transport.__novaMime || track.mime || '';
+      track.mime ||= mime;
+      if (startsWithInit(u8)) {
+        const key = fragmentFingerprint(u8);
+        if (track.initKey === key) return;
+        if (track.initKey) {
+          log('live', 'representation changed mid-recording; kind=', kind,
+            '- players may need the file remuxed');
+        }
+        track.initKey = key;
+        session.post(kind, u8, track.mime, true);
+        return;
+      }
+      if (!track.initKey) {
+        // YouTube reuses attached SourceBuffers without re-appending init when
+        // the codec configuration is unchanged; adopt the remembered one — but
+        // only if it belongs to the same container. A stale WebM init in front
+        // of fMP4 fragments makes the whole track file unreadable.
+        const savedInit = transport.__novaLastInit || store._lastInit[kind];
+        const boxType = u8.length >= 8 ? String.fromCharCode(u8[4], u8[5], u8[6], u8[7]) : '';
+        const looksMp4Fragment = /^(?:ftyp|styp|moof|sidx|emsg|prft|mdat|moov|free|skip)$/.test(boxType);
+        const looksWebmFragment = u8[0] === 0x1f && u8[1] === 0x43 && u8[2] === 0xb6 && u8[3] === 0x75;
+        const fragmentContainer = looksMp4Fragment ? 'mp4'
+          : (looksWebmFragment ? 'webm' : (/mp4/i.test(mime) ? 'mp4' : 'webm'));
+        const savedContainer = savedInit?.bytes?.length
+          ? (savedInit.bytes[0] === 0x1A ? 'webm' : 'mp4') : '';
+        if (!savedInit?.bytes?.length || savedContainer !== fragmentContainer) {
+          if (!track.droppedWithoutInit) {
+            track.droppedWithoutInit = true;
+            log('live', 'dropping fragments until an init segment arrives; kind=', kind,
+              'mime=', mime || 'unknown', 'savedInitContainer=', savedContainer || 'none',
+              'fragmentContainer=', fragmentContainer);
+          }
+          return;
+        }
+        track.initKey = savedInit.initKey || fragmentFingerprint(savedInit.bytes);
+        session.post(kind, savedInit.bytes, savedInit.mime || track.mime, true);
+      }
+      // Keep the forwarded timeline monotonic: stall recovery and small back
+      // seeks re-append ranges that are already on disk.
+      let timecode = null;
+      const looksWebm = /webm/i.test(track.mime)
+        || (u8[0] === 0x1f && u8[1] === 0x43 && u8[2] === 0xb6 && u8[3] === 0x75);
+      if (looksWebm) {
+        for (let offset = 0; offset + 4 <= u8.length; offset++) {
+          if (u8[offset] === 0x1f && u8[offset + 1] === 0x43
+            && u8[offset + 2] === 0xb6 && u8[offset + 3] === 0x75) {
+            timecode = webmClusterTimecode(u8, offset);
+            break;
+          }
+        }
+      } else {
+        timecode = mp4FragmentDecodeTime(u8, 0, u8.length);
+      }
+      if (Number.isFinite(timecode) && timecode !== null) {
+        if (timecode <= track.lastTimecode) return;
+        if (track.firstTimecode == null) track.firstTimecode = timecode;
+        track.lastTimecode = timecode;
+        track.timecodesAreMs = looksWebm;
+      }
+      track.bytes += u8.length;
+      track.fragments += 1;
+      session.post(kind, u8, track.mime, false);
+    } catch (e) {}
+  }
+
+  async function captureLiveStream({ from }, onProgress) {
+    if (store.liveSession) throw new Error('запись эфира уже выполняется');
+    const media = video();
+    if (!media) throw new Error('плеер не найден');
+    const session = {
+      id: `live-${Date.now()}`,
+      videoId: vidId(),
+      tracks: Object.create(null),
+      stopped: false,
+      stopRequested: false,
+      stopReason: '',
+      postedBytes: 0,
+      post(kind, bytes, mime, init) {
+        const copy = bytes.slice();
+        session.postedBytes += copy.length;
+        window.postMessage({
+          __nova_live_chunk: true,
+          sessionId: session.id,
+          kind,
+          mime: mime || '',
+          init: Boolean(init),
+          buffer: copy.buffer,
+        }, location.origin, [copy.buffer]);
+      },
+    };
+    const previousMuted = media.muted;
+    store.liveSession = session;
+    // Passive VOD capture would duplicate every forwarded fragment in page
+    // memory; a live recording has no bounded length, so it must stay off.
+    store.capturing = false;
+    resetCapture();
+    deliberatePlaybackDepth += 1;
+    // Pin the current representation: a mid-recording SABR quality switch
+    // writes a second init segment into the track file, and stream copy of
+    // such a file is broken in every container.
+    const qualityBeforeLive = qualitySnapshot();
+    try {
+      const lockedQuality = currentQuality();
+      if (lockedQuality && lockedQuality !== 'auto') {
+        setQualityRaw(lockedQuality);
+        log('live', 'quality pinned for recording:', lockedQuality);
+      }
+    } catch (e) {}
+    let caughtUp = from !== 'start';
+    const startedAt = Date.now();
+    try {
+      if (from === 'start') {
+        media.muted = true;
+        const seekable = media.seekable;
+        const dvrStart = seekable?.length ? seekable.start(0) : 0;
+        log('live', 'seeking to DVR start:', dvrStart);
+        try { media.currentTime = Math.max(0, dvrStart + 0.25); } catch (e) {}
+      } else {
+        // The recording captures the fragments YouTube appends at the live
+        // edge — a few seconds ahead of a lagging playhead. Jump the player to
+        // the live edge so the viewer watches exactly what lands in the file.
+        const seekable = media.seekable;
+        if (seekable?.length) {
+          const liveEdge = seekable.end(seekable.length - 1);
+          const lag = liveEdge - (Number(media.currentTime) || 0);
+          if (lag > 2) {
+            log('live', 'seeking to live edge for recording; lag=', lag.toFixed(1));
+            try { media.currentTime = Math.max(0, liveEdge - 0.75); } catch (e) {}
+          }
+        }
+      }
+      if (media.paused) {
+        try { await playWithTimeout(media, 8_000); } catch (e) {}
+      }
+      let lastActivityAt = Date.now();
+      let lastPostedBytes = 0;
+      let lastEdge = 0;
+      while (!session.stopRequested) {
+        await sleep(500);
+        // Compare against the session's own snapshot: store.videoId is
+        // reassigned by the navigation handlers before this loop can notice.
+        if (session.videoId && vidId() !== session.videoId) {
+          session.stopReason = 'открыто другое видео';
+          break;
+        }
+        if (media.ended) {
+          session.stopReason = 'трансляция завершена';
+          break;
+        }
+        const seekable = media.seekable;
+        const liveEdge = seekable?.length ? seekable.end(seekable.length - 1) : 0;
+        const position = Number(media.currentTime) || 0;
+        const behind = Math.max(0, liveEdge - position);
+        if (!caughtUp) {
+          // Skip ahead only within the buffered region: those bytes were
+          // already appended (and forwarded), so no captured gap can appear.
+          let bufferedEnd = position;
+          const buffered = media.buffered;
+          for (let index = 0; index < buffered.length; index++) {
+            if (buffered.start(index) <= position + 0.5 && buffered.end(index) > bufferedEnd) {
+              bufferedEnd = buffered.end(index);
+            }
+          }
+          if (bufferedEnd - 1 > position + 6) {
+            try { media.currentTime = bufferedEnd - 1; } catch (e) {}
+          }
+          if (behind < 12) {
+            caughtUp = true;
+            try { media.muted = previousMuted; } catch (e) {}
+            log('live', 'backfill caught up with the live edge; behind=', behind.toFixed(1));
+          }
+        }
+        if (media.paused && !media.ended && !session.stopRequested) {
+          // The recording must survive YouTube's own hiccup-pauses.
+          try { await playWithTimeout(media, 4_000); } catch (e) {}
+        }
+        if (session.postedBytes !== lastPostedBytes || Math.abs(liveEdge - lastEdge) > 0.75) {
+          lastPostedBytes = session.postedBytes;
+          lastEdge = liveEdge;
+          lastActivityAt = Date.now();
+        } else if (Date.now() - lastActivityAt > 120_000) {
+          session.stopReason = 'поток не передаёт данные более 2 минут';
+          break;
+        }
+        onProgress?.({
+          seconds: (Date.now() - startedAt) / 1000,
+          bytes: session.postedBytes,
+          behind,
+          caughtUp,
+        });
+      }
+      if (!session.stopReason) session.stopReason = 'остановлено пользователем';
+      const audioTrack = session.tracks.audio;
+      const videoTrack = session.tracks.video;
+      if (!videoTrack?.bytes && !audioTrack?.bytes) {
+        throw new Error('не получено ни одного медиасегмента эфира');
+      }
+      const spanTrack = (videoTrack?.timecodesAreMs && videoTrack) || (audioTrack?.timecodesAreMs && audioTrack) || null;
+      const durationSeconds = spanTrack && Number.isFinite(spanTrack.firstTimecode)
+        && Number.isFinite(spanTrack.lastTimecode)
+        ? Math.max(0, (spanTrack.lastTimecode - spanTrack.firstTimecode) / 1000)
+        : 0;
+      log('live', 'session finished:', JSON.stringify({
+        reason: session.stopReason,
+        bytes: session.postedBytes,
+        durationSeconds: Math.round(durationSeconds),
+        video: videoTrack ? { mime: videoTrack.mime, fragments: videoTrack.fragments, bytes: videoTrack.bytes } : null,
+        audio: audioTrack ? { mime: audioTrack.mime, fragments: audioTrack.fragments, bytes: audioTrack.bytes } : null,
+      }));
+      return {
+        reason: session.stopReason,
+        bytes: session.postedBytes,
+        videoMime: videoTrack?.mime || '',
+        audioMime: audioTrack?.mime || '',
+        durationSeconds,
+      };
+    } finally {
+      session.stopped = true;
+      store.liveSession = null;
+      store.capturing = true;
+      deliberatePlaybackDepth = Math.max(0, deliberatePlaybackDepth - 1);
+      try { media.muted = previousMuted; } catch (e) {}
+      await restoreQuality(qualityBeforeLive).catch(() => {});
+    }
+  }
+
   function playerResponse() {
     try {
       const p = player();
@@ -4698,11 +5658,32 @@
     return { available: !!track, lang: track ? (track.languageCode || 'txt') : null };
   }
 
+  // Codec/bitrate of the best source audio stream, so the UI can offer a true
+  // passthrough option (.opus stays .opus) and hide pointless re-encodes.
+  function bestAudioSource() {
+    try {
+      const formats = playerResponse()?.streamingData?.adaptiveFormats;
+      const audio = (Array.isArray(formats) ? formats : [])
+        .filter((format) => /^audio\//i.test(format?.mimeType || ''))
+        .sort((left, right) => {
+          const score = (format) => ((format.audioTrack?.audioIsDefault === false ? 0 : 1) * 1e12)
+            + (format.isDrc ? 0 : 1e8)
+            + (Number(format.bitrate) || 0);
+          return score(right) - score(left);
+        })[0];
+      if (!audio) return null;
+      const mime = audio.mimeType || '';
+      const codec = /opus/i.test(mime) ? 'opus'
+        : (/mp4a|aac/i.test(mime) ? 'aac' : (/vorbis/i.test(mime) ? 'vorbis' : ''));
+      return { codec, bitrateKbps: Math.round((Number(audio.bitrate) || 0) / 1000) };
+    } catch (e) { return null; }
+  }
+
   // ---- bridge to the isolated-world UI script ------------------------------
   window.addEventListener('message', async (ev) => {
     if (ev.source !== window || ev.origin !== location.origin || !ev.data || ev.data[TO_HOOK] !== true) return;
     const {
-      cmd, reqId, height, format, end, freshPageResume, reloadCount,
+      cmd, reqId, height, format, end, freshPageResume, reloadCount, from,
     } = ev.data;
     const reply = (payload, transfer) => {
       window.postMessage({ [FROM_HOOK]: true, reqId, ...payload }, location.origin, transfer || []);
@@ -4710,12 +5691,46 @@
     try {
       if (cmd === 'info') {
         const p = player();
-        let dur = video() && video().duration;
+        const rawDuration = video() && video().duration;
+        let dur = rawDuration;
         if (!isFinite(dur) || dur <= 0) dur = 0;
-        const resp = { ok: true, videoId: vidId(), title: (p && p.getVideoData && p.getVideoData().title) || document.title.replace(/ - YouTube$/, ''), duration: dur, heights: availableHeights() };
-        log('info', JSON.stringify({ ctx: (location.pathname.indexOf('/embed/') === 0 ? 'embed' : 'page'), dur, heights: resp.heights, hasPlayer: !!p }));
+        let isLive = rawDuration === Infinity;
+        try { isLive = isLive || Boolean(p?.getVideoData?.()?.isLive); } catch (e) {}
+        let musicVideoType = '';
+        try { musicVideoType = String(playerResponse()?.videoDetails?.musicVideoType || ''); } catch (e) {}
+        const resp = { ok: true, videoId: vidId(), title: (p && p.getVideoData && p.getVideoData().title) || document.title.replace(/ - YouTube(?: Music)?$/, ''), duration: dur, heights: availableHeights(), isLive, liveRecording: Boolean(store.liveSession), audioSource: bestAudioSource(), musicVideoType };
+        log('info', JSON.stringify({ ctx: (location.pathname.indexOf('/embed/') === 0 ? 'embed' : 'page'), dur, heights: resp.heights, hasPlayer: !!p, isLive }));
         reply(resp);
+      } else if (cmd === 'live-start') {
+        const result = await captureLiveStream({ from: from === 'start' ? 'start' : 'now' }, (progress) => {
+          reply({ progress: 0.5, phase: 'live', live: progress });
+        });
+        reply({ ok: true, done: true, ...result });
+      } else if (cmd === 'live-stop') {
+        if (store.liveSession) {
+          store.liveSession.stopRequested = true;
+          reply({ ok: true, done: true });
+        } else {
+          reply({ ok: false, error: 'запись эфира не активна' });
+        }
+      } else if (cmd === 'download-cancel') {
+        store.cancelRequested = true;
+        log('capture', 'download cancel requested by user');
+        reply({ ok: true, done: true });
+      } else if (cmd === 'music-mute') {
+        // App-level mute: ytmusic overrides element.muted with its own
+        // stored volume state, so the queue silences the tab through the
+        // player API instead.
+        try {
+          if (ev.data.mute) player()?.mute?.();
+          else player()?.unMute?.();
+        } catch (e) {}
+        reply({ ok: true, done: true });
       } else if (cmd === 'download') {
+        if (video()?.duration === Infinity) {
+          throw new Error('это прямая трансляция — используйте пункт «Запись эфира» в меню');
+        }
+        store.cancelRequested = false;
         const isMp3 = format === 'mp3';
         const targetQ = isMp3 ? 'medium' : (QUALITY_BY_HEIGHT[height] || 'hd720');
         const previousQuality = qualitySnapshot();
@@ -4729,19 +5744,74 @@
         const wasPlayingAtStart = !!(mediaAtStart && !mediaAtStart.paused);
         store.playbackHold?.release();
         store.playbackHold = holdPlaybackPaused(mediaAtStart);
+        // The whole download runs silent: primers and refills really play the
+        // media and their sound distracted users. Live recording is exempt on
+        // purpose — people want to keep hearing the broadcast.
+        const previousDownloadMuted = mediaAtStart ? mediaAtStart.muted : null;
+        if (mediaAtStart) try { mediaAtStart.muted = true; } catch (e) {}
+        const musicHost = MUSIC_HOST;
+        // ytmusic auto-advances to the next queue item when a *playing* track
+        // ends, and capture seeks touch the end of the track. Pausing through
+        // the player API (not just the element) records the paused state in
+        // the app itself, so reaching the end never triggers the advance.
+        let musicAppMuted = null;
+        if (musicHost) {
+          try { player()?.pauseVideo?.(); } catch (e) {}
+          // ytmusic re-applies its own volume state on top of element.muted;
+          // only the player API mute reliably silences the tab.
+          try {
+            musicAppMuted = Boolean(player()?.isMuted?.());
+            player()?.mute?.();
+          } catch (e) {}
+          store.musicSeekClamp = true;
+        }
         log('download', 'playback pinned for capture; wasPlaying=', wasPlayingAtStart,
           'paused=', !!mediaAtStart?.paused, 'format=', format);
         try {
           let cap;
           let result;
           let completedAudioForVideo = null;
+          // Direct download is the fast path everywhere again: parallel range
+          // requests defeat the ~1x throttle that made it useless on Music.
           if (isMp3) {
+            if (musicHost) {
+              requestBestMusicAudioTier();
+              await ensureBestMusicAudioObserved(
+                Number(video()?.duration) || Number(player()?.getDuration?.()) || 0);
+            }
             try {
               const expectedDuration = Number(video()?.duration) || Number(player()?.getDuration?.()) || 0;
-              const directAudio = validateDirectAudioTrack(
-                await fetchDirectAudio((pct) => reply({ progress: pct, phase: 'direct-audio' })),
-                expectedDuration,
-              );
+              const grabDirectAudio = async () => {
+                // Several representations may have been observed for one track
+                // (the player switches them as quality changes); a URL that no
+                // longer serves data is retired inside fetchDirectAudio, so
+                // simply asking again picks the next candidate.
+                let lastError = null;
+                for (let candidate = 0; candidate < 3; candidate++) {
+                  try {
+                    return await fetchDirectAudio((pct) => reply({ progress: pct, phase: 'direct-audio' }));
+                  } catch (error) {
+                    lastError = error;
+                    if (error?.novaFatal || error?.novaNoFallback) throw error;
+                    log('direct-audio', 'candidate', candidate + 1, 'failed:',
+                      String(error?.message || error));
+                  }
+                }
+                throw lastError;
+              };
+              let directAudio;
+              try {
+                directAudio = validateDirectAudioTrack(await grabDirectAudio(), expectedDuration);
+              } catch (firstError) {
+                // A Music track opened by the queue has never played, so no
+                // media URL has been observed yet. One short muted play makes
+                // the player request its first segments — and reveal the URL.
+                if (!MUSIC_HOST || firstError?.novaFatal || firstError?.novaNoFallback) throw firstError;
+                log('direct-audio', 'no usable direct URL yet; priming playback:',
+                  String(firstError?.message || firstError));
+                await primeMusicMediaSession(video(), expectedDuration);
+                directAudio = validateDirectAudioTrack(await grabDirectAudio(), expectedDuration);
+              }
               cap = { duration: Number(video()?.duration) || directAudio.duration || 0 };
               result = { audio: directAudio };
             } catch (error) {
@@ -4986,6 +6056,35 @@
                   return await repairCapturedWebmLocally(error, onRecoveryProgress);
                 }
 
+                if (brokenMp4Prefix && (details?.kind === 'audio' || details?.kind === 'video')) {
+                  // Same bounded local repair the WebM tracks get: re-request
+                  // only the missing opening fragments instead of a reload.
+                  let currentDetails = details;
+                  for (let attempt = 0; attempt < 2; attempt++) {
+                    throwIfDownloadCancelled();
+                    try {
+                      await refillMissingMp4Prefix(currentDetails.kind, currentDetails, (pct) => {
+                        onRecoveryProgress?.(pct, 'buffering-prefix');
+                      });
+                    } catch (refillError) {
+                      log('assembly', 'bounded MP4 prefix refill failed:', refillError?.message || refillError);
+                      break;
+                    }
+                    try {
+                      return assembleForCurrentDownload();
+                    } catch (nextError) {
+                      const nextDetails = nextError?.details;
+                      if (nextDetails?.container === 'mp4'
+                        && Number(nextDetails?.firstDecodeTime) > 0
+                        && (nextDetails?.kind === 'audio' || nextDetails?.kind === 'video')) {
+                        currentDetails = nextDetails;
+                        continue;
+                      }
+                      throw nextError;
+                    }
+                  }
+                }
+
                 const completedReloads = Math.max(0, Number(reloadCount) || 0);
                 if (completedReloads < 2) {
                   const retry = new Error(
@@ -5043,6 +6142,29 @@
               cap = { actualHeight: rendered.actualHeight, duration: rendered.duration };
               result = rendered;
             };
+            // Field observation: a manual page reload reliably revives a wedged
+            // SABR session, while the rendered 1x recording is painfully slow.
+            // Prefer the automatic reload retry and keep 1x as the very last
+            // resort after both reload attempts are spent.
+            const renderedOrReload = async (reason) => {
+              throwIfDownloadCancelled();
+              const completedReloads = Math.max(0, Number(reloadCount) || 0);
+              if (completedReloads < 2) {
+                const retry = new Error('получение сегментов остановилось; страница будет обновлена, загрузка продолжится автоматически');
+                retry.novaFatal = true;
+                retry.details = {
+                  reloadRequired: true,
+                  reason: 'capture-stalled',
+                  cause: String(reason?.message || reason || ''),
+                  videoId: vidId(),
+                  reloadCount: completedReloads,
+                };
+                log('capture', 'requesting automatic page reload instead of rendered 1x fallback:',
+                  retry.details.cause);
+                throw retry;
+              }
+              await captureRenderedVideoFallback(reason);
+            };
             try {
               cap = await captureBackground({
                 targetQ, end, isMp3, height,
@@ -5059,6 +6181,22 @@
               if (captureError?.novaFatal) throw captureError;
 
               if (!result && isMp3) {
+                throwIfDownloadCancelled();
+                const completedReloads = Math.max(0, Number(reloadCount) || 0);
+                if (completedReloads < 2) {
+                  const retry = new Error('получение аудиосегментов остановилось; страница будет обновлена, загрузка продолжится автоматически');
+                  retry.novaFatal = true;
+                  retry.details = {
+                    reloadRequired: true,
+                    reason: 'capture-stalled',
+                    cause: String(captureError?.message || captureError || ''),
+                    videoId: vidId(),
+                    reloadCount: completedReloads,
+                  };
+                  log('capture', 'requesting automatic page reload instead of rendered audio fallback:',
+                    retry.details.cause);
+                  throw retry;
+                }
                 log('capture', 'fallback to rendered audio after MSE:', captureError?.message || captureError);
                 reply({ progress: 0.001, phase: 'rendered-audio' });
                 const renderedAudio = await withDeliberatePlayback(() => captureRenderedAudio(
@@ -5074,7 +6212,7 @@
                   await captureSequentialVideo(captureError);
                 } catch (sequentialError) {
                   if (sequentialError?.novaFatal) throw sequentialError;
-                  await captureRenderedVideoFallback(sequentialError);
+                  await renderedOrReload(sequentialError);
                 }
               }
             }
@@ -5094,10 +6232,10 @@
                     });
                   } catch (sequentialError) {
                     if (sequentialError?.novaFatal) throw sequentialError;
-                    await captureRenderedVideoFallback(sequentialError);
+                    await renderedOrReload(sequentialError);
                   }
                 } else {
-                  await captureRenderedVideoFallback(assemblyError);
+                  await renderedOrReload(assemblyError);
                 }
               }
             }
@@ -5147,9 +6285,17 @@
           }
           reply(payload, transfers);
         } finally {
+          store.cancelRequested = false;
           store.capturing = true;
+          store.musicSeekClamp = false;
           store.playbackHold?.release();
           store.playbackHold = null;
+          if (mediaAtStart && previousDownloadMuted !== null && vidId() === videoIdAtStart) {
+            try { mediaAtStart.muted = previousDownloadMuted; } catch (e) {}
+          }
+          if (musicHost && musicAppMuted === false) {
+            try { player()?.unMute?.(); } catch (e) {}
+          }
           // Give the user back exactly the play state they had.
           if (wasPlayingAtStart && vidId() === videoIdAtStart) {
             try { video()?.play()?.catch?.(() => {}); } catch (e) {}
@@ -5176,7 +6322,7 @@
       store.mp3Isolation = null;
       resetCapture();
     }
-    store.capturing = true; // keep passive capture on while watching
+    if (!store.liveSession) store.capturing = true; // keep passive capture on while watching
     scheduleAutoplayOff();
     scheduleDefaultQuality();
   });

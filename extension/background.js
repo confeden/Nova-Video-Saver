@@ -2,14 +2,24 @@
 // browser downloads. ffmpeg.wasm itself runs in offscreen.html.
 
 const LOG_KEY = 'nova_logs';
-const LOG_LIMIT = 200;
+const LOG_LIMIT = 400;
 const LOG_ENTRY_LIMIT = 4_000;
 const ERROR_DETAIL_LIMIT = 50_000;
-const ERROR_LOG_FILENAME = 'NYD-debug.txt';
+const ERROR_LOG_FILENAME = 'NVS-debug.txt';
 const RELOAD_DOWNLOAD_PREFIX = 'nova_reload_download:';
 const RELOAD_GUARD_PREFIX = 'nova_reload_guard:';
 const RELOAD_GUARD_TTL_MS = 5 * 60_000;
+const UPDATE_MANIFEST_URL = 'https://raw.githubusercontent.com/confeden/nova_updates/main/nvs.json';
+const UPDATE_FALLBACK_API = 'https://api.github.com/repos/confeden/Nova-Video-Saver/releases/latest';
+const UPDATE_RELEASES_PAGE = 'https://github.com/confeden/Nova-Video-Saver/releases';
+const UPDATE_STATE_KEY = 'nova_update';
+const UPDATE_ALARM = 'nvs-update-check';
+const UPDATE_CHECK_PERIOD_MINUTES = 8 * 60;
 const HANDLED_MESSAGES = new Set([
+  'nova-check-update',
+  'nova-fetch-cover',
+  'nova-reload-tab',
+  'nova-navigate-tab',
   'nova-log',
   'nova-error',
   'nova-ensure',
@@ -84,10 +94,19 @@ function validateCaptionUrl(value) {
 
 async function downloadErrorLog(message, sender) {
   await logWrite.catch(() => {});
-  const stored = await chrome.storage.local.get(LOG_KEY).catch(() => ({}));
+  const stored = await chrome.storage.local.get([LOG_KEY, 'nvs_playlist_queue', UPDATE_STATE_KEY])
+    .catch(() => ({}));
   const logs = Array.isArray(stored[LOG_KEY]) ? stored[LOG_KEY] : [];
+  // Extension state snapshot: without it "silent" misbehaviour (stalled
+  // queues, stale pending downloads) is invisible in reports.
+  const sessionState = await chrome.storage.session.get(null).catch(() => ({}));
+  const state = {
+    playlistQueue: stored.nvs_playlist_queue || null,
+    updateState: stored[UPDATE_STATE_KEY] || null,
+    session: sessionState,
+  };
   const report = [
-    'Nova Youtube Downloader error report',
+    'Nova Video Saver error report',
     `Time: ${new Date().toISOString()}`,
     `Version: ${chrome.runtime.getManifest().version}`,
     `Context: ${message.context || 'unknown'}`,
@@ -96,6 +115,7 @@ async function downloadErrorLog(message, sender) {
     '',
     truncate(message.error || 'Unknown error', ERROR_DETAIL_LIMIT),
     message.details ? `\nDetails:\n${truncate(message.details, ERROR_DETAIL_LIMIT)}` : '',
+    `\nState:\n${truncate(state, ERROR_DETAIL_LIMIT)}`,
     logs.length ? `\nRecent logs:\n${logs.map((entry) =>
       `[${formatTimestamp(entry?.ts)}] [${entry?.tag || 'log'}] ${entry?.text || ''}`
     ).join('\n')}` : '',
@@ -105,6 +125,113 @@ async function downloadErrorLog(message, sender) {
   const id = await saveDownload(url, ERROR_LOG_FILENAME);
   return { ok: true, id, filename: ERROR_LOG_FILENAME };
 }
+
+// ---- update checks -----------------------------------------------------
+// nvs.json in confeden/nova_updates mirrors the desktop/Android updater
+// manifests: { version, url, sha256, release_url }. The GitHub releases API
+// is only a fallback for the window between a release and the bot commit.
+
+function compareVersions(a, b) {
+  const left = String(a || '').split('.').map((part) => Number.parseInt(part, 10) || 0);
+  const right = String(b || '').split('.').map((part) => Number.parseInt(part, 10) || 0);
+  for (let index = 0; index < Math.max(left.length, right.length); index++) {
+    const diff = (left[index] || 0) - (right[index] || 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
+async function fetchLatestVersionInfo() {
+  try {
+    const response = await fetch(UPDATE_MANIFEST_URL, { cache: 'no-store' });
+    if (!response.ok) throw new Error(`nvs.json HTTP ${response.status}`);
+    const data = await response.json();
+    if (!/^\d+(\.\d+)*$/.test(String(data.version || ''))) throw new Error('nvs.json version is malformed');
+    return {
+      version: String(data.version),
+      downloadUrl: typeof data.url === 'string' ? data.url : '',
+      releaseUrl: typeof data.release_url === 'string' ? data.release_url : UPDATE_RELEASES_PAGE,
+      source: 'nvs.json',
+    };
+  } catch (manifestError) {
+    const response = await fetch(UPDATE_FALLBACK_API, {
+      cache: 'no-store',
+      headers: { Accept: 'application/vnd.github+json' },
+    });
+    if (!response.ok) throw new Error(`releases API HTTP ${response.status}`);
+    const release = await response.json();
+    const version = String(release.tag_name || '').replace(/^v/i, '');
+    if (!/^\d+(\.\d+)*$/.test(version)) throw new Error('release tag is malformed');
+    const zip = (release.assets || []).find((asset) => /\.zip$/i.test(asset?.name || ''));
+    return {
+      version,
+      downloadUrl: zip?.browser_download_url || '',
+      releaseUrl: release.html_url || UPDATE_RELEASES_PAGE,
+      source: 'releases-api',
+    };
+  }
+}
+
+async function applyUpdateBadge(available) {
+  try {
+    await chrome.action.setBadgeText({ text: available ? '+' : '' });
+    if (available) {
+      await chrome.action.setBadgeBackgroundColor({ color: '#212121' });
+      await chrome.action.setBadgeTextColor({ color: '#35d477' });
+    }
+  } catch (error) { /* action API missing only in tests */ }
+}
+
+async function checkForUpdates() {
+  const current = chrome.runtime.getManifest().version;
+  try {
+    const latest = await fetchLatestVersionInfo();
+    const available = compareVersions(latest.version, current) > 0;
+    const state = {
+      available,
+      current,
+      latest: latest.version,
+      downloadUrl: latest.downloadUrl,
+      releaseUrl: latest.releaseUrl,
+      source: latest.source,
+      checkedAt: Date.now(),
+      error: '',
+    };
+    await chrome.storage.local.set({ [UPDATE_STATE_KEY]: state });
+    await applyUpdateBadge(available);
+    return { ok: true, ...state };
+  } catch (error) {
+    const stored = await chrome.storage.local.get(UPDATE_STATE_KEY).catch(() => ({}));
+    const previous = stored[UPDATE_STATE_KEY] || {};
+    const state = {
+      ...previous,
+      current,
+      checkedAt: Date.now(),
+      error: String(error?.message || error),
+    };
+    await chrome.storage.local.set({ [UPDATE_STATE_KEY]: state }).catch(() => {});
+    return { ok: false, ...state };
+  }
+}
+
+function scheduleUpdateChecks() {
+  chrome.alarms.create(UPDATE_ALARM, {
+    delayInMinutes: 1,
+    periodInMinutes: UPDATE_CHECK_PERIOD_MINUTES,
+  });
+}
+
+chrome.runtime.onInstalled.addListener(() => {
+  scheduleUpdateChecks();
+  checkForUpdates();
+});
+chrome.runtime.onStartup.addListener(() => {
+  scheduleUpdateChecks();
+  checkForUpdates();
+});
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === UPDATE_ALARM) checkForUpdates();
+});
 
 async function handleMessage(message, sender) {
   const reloadDownloadKey = () => {
@@ -116,6 +243,53 @@ async function handleMessage(message, sender) {
     return `${RELOAD_GUARD_PREFIX}${sender.tab.id}`;
   };
   switch (message.t) {
+    case 'nova-check-update':
+      return checkForUpdates();
+
+    // Cover art for audio downloads. Fetched here because content pages are
+    // bound by page CORS and the offscreen document by its COEP; the service
+    // worker with the i.ytimg.com host permission has neither restriction.
+    case 'nova-fetch-cover': {
+      const videoId = String(message.videoId || '');
+      if (!/^[A-Za-z0-9_-]{6,}$/.test(videoId)) throw new Error('некорректный идентификатор видео');
+      for (const name of ['maxresdefault', 'hqdefault']) {
+        try {
+          const response = await fetch(`https://i.ytimg.com/vi/${videoId}/${name}.jpg`, { cache: 'no-store' });
+          if (!response.ok) continue;
+          const buffer = new Uint8Array(await response.arrayBuffer());
+          // A real JPEG only: ffmpeg embeds it as the ID3/covr picture as-is.
+          if (buffer.length < 2_000 || buffer[0] !== 0xFF || buffer[1] !== 0xD8) continue;
+          let binary = '';
+          const step = 0x8000;
+          for (let offset = 0; offset < buffer.length; offset += step) {
+            binary += String.fromCharCode(...buffer.subarray(offset, Math.min(offset + step, buffer.length)));
+          }
+          return { ok: true, b64: btoa(binary), source: name };
+        } catch (error) { /* try the next thumbnail size */ }
+      }
+      return { ok: false, error: 'обложка недоступна' };
+    }
+
+    // YouTube's SPA router can intercept page-initiated location.reload()/
+    // assign() and keep a wedged media session alive. Browser-level tab
+    // reloads/navigations (what a manual F5 does) cannot be intercepted.
+    case 'nova-reload-tab': {
+      if (!Number.isInteger(sender?.tab?.id)) throw new Error('вкладка не определена');
+      await chrome.tabs.reload(sender.tab.id);
+      return { ok: true };
+    }
+
+    case 'nova-navigate-tab': {
+      if (!Number.isInteger(sender?.tab?.id)) throw new Error('вкладка не определена');
+      const url = new URL(String(message.url || ''));
+      const allowedOrigins = ['https://www.youtube.com', 'https://music.youtube.com'];
+      if (!allowedOrigins.includes(url.origin) || url.pathname !== '/watch') {
+        throw new Error('навигация разрешена только на страницы просмотра YouTube');
+      }
+      await chrome.tabs.update(sender.tab.id, { url: url.href });
+      return { ok: true };
+    }
+
     case 'nova-log':
       await appendLog({
         ts: Date.now(),
@@ -183,6 +357,8 @@ async function handleMessage(message, sender) {
               error: 'повторная загрузка краёв уже выполнялась дважды; циклическое обновление остановлено',
             };
           }
+          const audioFormat = ['original', 'mp3', 'm4a', 'aac', 'flac', 'wav']
+            .includes(pending.audioFormat) ? pending.audioFormat : null;
           await chrome.storage.session.set({
             [guardKey]: {
               videoId: String(pending.videoId),
@@ -195,6 +371,7 @@ async function handleMessage(message, sender) {
               title: String(pending.title || '').slice(0, 300),
               duration: Math.max(0, Number(pending.duration) || 0),
               format: pending.format,
+              audioFormat,
               height: pending.format === 'mp3' ? null : Number(pending.height),
               createdAt: Number(pending.createdAt),
               token: pending.token.slice(0, 100),

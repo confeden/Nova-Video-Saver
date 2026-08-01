@@ -1,23 +1,41 @@
 {
   "manifest_version": 3,
-  "name": "Nova Youtube Downloader",
-  "version": "1.2",
-  "description": "Скачивание видео/аудио/субтитров в удобном формате и разрешении без внешних сервисов",
-  "permissions": ["downloads", "offscreen", "storage"],
-  "host_permissions": ["https://www.youtube.com/*"],
+  "name": "Nova Video Saver",
+  "version": "1.3",
+  "description": "Скачивание видео/аудио/субтитров YouTube, запись трансляций YouTube и Twitch — без внешних сервисов",
+  "permissions": ["downloads", "offscreen", "storage", "alarms"],
+  "host_permissions": [
+    "https://www.youtube.com/*",
+    "https://music.youtube.com/*",
+    "https://i.ytimg.com/*",
+    "https://raw.githubusercontent.com/*",
+    "https://api.github.com/*"
+  ],
   "background": { "service_worker": "background.js" },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": { "16": "icons/16.png", "48": "icons/48.png", "128": "icons/128.png" }
+  },
   "content_scripts": [
     {
-      "matches": ["https://www.youtube.com/*"],
+      "matches": ["https://www.youtube.com/*", "https://music.youtube.com/*"],
       "js": ["content_hook.js"],
       "run_at": "document_start",
       "world": "MAIN",
       "all_frames": false
     },
     {
-      "matches": ["https://www.youtube.com/*"],
+      "matches": ["https://www.youtube.com/*", "https://music.youtube.com/*"],
       "js": ["content_ui.js"],
       "css": ["content_ui.css"],
+      "run_at": "document_idle",
+      "world": "ISOLATED",
+      "all_frames": false
+    },
+    {
+      "matches": ["https://www.twitch.tv/*"],
+      "js": ["twitch_ui.js"],
+      "css": ["twitch_ui.css"],
       "run_at": "document_idle",
       "world": "ISOLATED",
       "all_frames": false

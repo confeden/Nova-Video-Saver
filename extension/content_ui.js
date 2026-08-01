@@ -1,6 +1,7 @@
 // Isolated-world UI and the only bridge between the page hook and extension APIs.
 (() => {
   const BUTTON_ID = 'nova-download-btn';
+  const IS_MUSIC = location.hostname === 'music.youtube.com';
   const TO_HOOK = '__nova_to_hook';
   const FROM_HOOK = '__nova_from_hook';
   const TO_UI = '__nova_to_ui';
@@ -59,7 +60,8 @@
   function callHook(cmd, payload = {}, onProgress) {
     return new Promise((resolve, reject) => {
       const reqId = requestSequence++;
-      const timeoutMs = cmd === 'download' ? 70_000 : (cmd === 'subtitles' ? 120_000 : 15_000);
+      const timeoutMs = cmd === 'download' ? 70_000
+        : (cmd === 'live-start' ? 180_000 : (cmd === 'subtitles' ? 120_000 : 15_000));
       let timeout;
       const touch = () => {
         clearTimeout(timeout);
@@ -80,7 +82,7 @@
 
   async function reportError(context, error, details) {
     const text = String(error?.stack || error?.message || error);
-    console.error('[Nova Youtube Downloader]', error);
+    console.error('[Nova Video Saver]', error);
     return chrome.runtime.sendMessage({ t: 'nova-error', context, error: text, details }).catch(() => null);
   }
 
@@ -100,41 +102,52 @@
     return element;
   }
 
-  function createDownloadIcon() {
+
+  // The brand icon everywhere: a perfectly round ring with two equilateral
+  // down-arrows that touch (the upper apex meets the lower triangle's edge).
+  function createCircleIcon() {
     const namespace = 'http://www.w3.org/2000/svg';
     const svg = document.createElementNS(namespace, 'svg');
-    svg.setAttribute('viewBox', '0 0 44 32');
+    svg.setAttribute('viewBox', '0 0 36 36');
     svg.setAttribute('aria-hidden', 'true');
-    const outline = document.createElementNS(namespace, 'rect');
-    outline.setAttribute('x', '1');
-    outline.setAttribute('y', '1');
-    outline.setAttribute('width', '42');
-    outline.setAttribute('height', '30');
-    outline.setAttribute('rx', '15');
-    outline.setAttribute('fill', 'none');
-    outline.setAttribute('stroke', '#35d477');
-    outline.setAttribute('stroke-width', '1.5');
-    outline.setAttribute('vector-effect', 'non-scaling-stroke');
+    const ring = document.createElementNS(namespace, 'circle');
+    ring.setAttribute('cx', '18');
+    ring.setAttribute('cy', '18');
+    ring.setAttribute('r', '16.9');
+    ring.setAttribute('fill', 'none');
+    ring.setAttribute('stroke', '#35d477');
+    ring.setAttribute('stroke-width', '2.2');
     const arrows = document.createElementNS(namespace, 'path');
     arrows.setAttribute('fill', '#35d477');
-    arrows.setAttribute('d', 'M12.2 5.4h19.6L22 13.7z M12.2 18.3h19.6L22 26.6z');
-    svg.append(outline, arrows);
+    arrows.setAttribute('d', 'M10.8 5.53h14.4L18 18z M10.8 18h14.4L18 30.47z');
+    svg.append(ring, arrows);
     return svg;
   }
 
   function createButton() {
-    const button = createElement('button', 'ytp-button nova-download-btn');
+    const button = createElement('button', IS_MUSIC
+      ? 'nova-download-btn nova-music-btn'
+      : 'ytp-button nova-download-btn');
     button.id = BUTTON_ID;
     button.type = 'button';
-    button.title = 'NYD (Nova Youtube Downloader)';
+    button.title = 'NVS (Nova Video Saver)';
     button.setAttribute('aria-label', button.title);
-    button.append(createDownloadIcon());
+    button.append(createCircleIcon());
     button.addEventListener('click', openMenu);
     return button;
   }
 
   function ensureButton() {
     if (location.pathname !== '/watch' || document.getElementById(BUTTON_ID)) return;
+    if (IS_MUSIC) {
+      // The Music player bar keeps its right-hand controls (volume, repeat…)
+      // in ytmusic-player-bar; the button sits immediately left of the volume.
+      const bar = document.querySelector('ytmusic-player-bar');
+      const volume = bar?.querySelector('tp-yt-paper-icon-button.volume, #volume-slider ~ tp-yt-paper-icon-button, .volume');
+      if (volume?.parentElement) volume.parentElement.insertBefore(createButton(), volume);
+      else if (bar?.querySelector('.right-controls-buttons')) bar.querySelector('.right-controls-buttons').prepend(createButton());
+      return;
+    }
     const controls = document.querySelector('.ytp-right-controls');
     if (controls) controls.prepend(createButton());
   }
@@ -161,7 +174,7 @@
     return createElement('div', 'nova-menu-head', text);
   }
 
-  function createBrandHeading() {
+  function createBrandHeading(updateState) {
     const heading = createElement('div', 'nova-menu-head nova-brand-head');
     const label = createElement('span');
     const version = chrome.runtime.getManifest().version;
@@ -170,8 +183,17 @@
     link.target = '_blank';
     link.rel = 'noopener noreferrer';
     link.addEventListener('click', () => closeMenu());
-    label.append(`Nova Youtube Downloader v${version} | `, link);
+    label.append(`Nova Video Saver v${version} | `, link);
     heading.append(label);
+    if (updateState?.available) {
+      const updateLink = createElement('a', 'nova-update-link', 'Доступно обновление');
+      updateLink.href = updateState.releaseUrl || 'https://github.com/confeden/Nova-Video-Saver/releases';
+      updateLink.target = '_blank';
+      updateLink.rel = 'noopener noreferrer';
+      updateLink.title = `Вышла версия ${updateState.latest || ''} — открыть страницу релиза`.trim();
+      updateLink.addEventListener('click', () => closeMenu());
+      heading.append(updateLink);
+    }
     return heading;
   }
 
@@ -180,26 +202,89 @@
     if (description) item.append(' ', createElement('span', 'nova-ext', description));
   }
 
-  function addDownloadItems(info) {
-    menu.append(createHeading('Качество видео (MP4 / MP3)'));
-    const heights = [...new Set(info.heights || [])].sort((a, b) => b - a);
-    for (const height of heights) {
+  // Every audio download is format 'mp3' for the page hook (identical capture
+  // path); audioFormat only changes how the offscreen encoder packages it.
+  // The list is built per-video: passthrough of the real source codec first,
+  // then re-encodes ordered by descending quality. YouTube sources are always
+  // lossy (Opus/AAC), so lossless containers (FLAC/WAV) are never offered.
+  function audioFormatsFor(info) {
+    const codec = info?.audioSource?.codec || '';
+    const bitrate = Number(info?.audioSource?.bitrateKbps) || 0;
+    const codecLabel = codec === 'aac' ? 'AAC' : (codec === 'vorbis' ? 'Vorbis' : 'Opus');
+    const originalExtension = codec === 'aac' ? '.m4a' : (codec === 'vorbis' ? '.ogg' : '.opus');
+    const formats = [{
+      id: 'original',
+      title: `Оригинал (${codecLabel})`,
+      note: `как в источнике${bitrate ? `, ~${bitrate} кбит/с` : ''} · без перекодирования`,
+      extension: originalExtension,
+    }];
+    // Re-encoding AAC back into AAC would only lose quality: when the source
+    // is AAC the passthrough above already produces the best possible .m4a.
+    if (codec !== 'aac') {
+      formats.push({ id: 'm4a', title: 'M4A (AAC)', note: '256 кбит/с · с обложкой', extension: '.m4a' });
+    }
+    formats.push({ id: 'mp3', title: 'MP3', note: 'VBR V0, ~245 кбит/с · с обложкой', extension: '.mp3' });
+    return formats;
+  }
+
+  function audioFormatMeta(audioFormat, info) {
+    return audioFormatsFor(info).find((entry) => entry.id === audioFormat)
+      || { id: audioFormat, title: String(audioFormat || 'mp3').toUpperCase(), extension: '.mp3' };
+  }
+
+  function addDownloadItems(info, { videoAllowed = true } = {}) {
+    if (videoAllowed) {
+      menu.append(createHeading('Видео'));
+      const heights = [...new Set(info.heights || [])].sort((a, b) => b - a);
+      for (const height of heights) {
+        const item = createElement('div', 'nova-menu-item');
+        setItemLabel(item, `${height}p`, 'MP4 video');
+        item.addEventListener('click', () => {
+          closeMenu();
+          startDownload({ format: 'mp4', height }, info);
+        });
+        menu.append(item);
+      }
+    }
+
+    menu.append(createHeading('Аудио'));
+    for (const audio of audioFormatsFor(info)) {
       const item = createElement('div', 'nova-menu-item');
-      setItemLabel(item, `${height}p`, 'MP4 video');
+      setItemLabel(item, audio.title, audio.note);
       item.addEventListener('click', () => {
         closeMenu();
-        startDownload({ format: 'mp4', height }, info);
+        startDownload({ format: 'mp3', height: null, audioFormat: audio.id }, info);
       });
       menu.append(item);
     }
+  }
 
-    const mp3 = createElement('div', 'nova-menu-item');
-    setItemLabel(mp3, 'MP3', 'звук (аудиодорожка)');
-    mp3.addEventListener('click', () => {
+  function addLiveSection(info) {
+    menu.append(createHeading('Прямая трансляция'));
+    const options = [
+      { from: 'start', title: 'Записать эфир с начала', note: 'докачает DVR-буфер быстрее реального времени и продолжит запись' },
+      { from: 'now', title: 'Записать с текущего момента', note: 'запись до конца эфира или до остановки' },
+    ];
+    for (const option of options) {
+      const item = createElement('div', 'nova-menu-item');
+      setItemLabel(item, option.title, option.note);
+      item.addEventListener('click', () => {
+        closeMenu();
+        void startLiveRecording(info, option.from);
+      });
+      menu.append(item);
+    }
+  }
+
+  function addPlaylistSection(info, items) {
+    menu.append(createHeading('Плейлист'));
+    const item = createElement('div', 'nova-menu-item');
+    setItemLabel(item, 'Скачать плейлист…', `${items.length} видео, выбор в списке`);
+    item.addEventListener('click', () => {
       closeMenu();
-      startDownload({ format: 'mp3', height: null }, info);
+      openPlaylistPicker(info, items);
     });
-    menu.append(mp3);
+    menu.append(item);
   }
 
   function addSubtitleItems(info, availability) {
@@ -215,7 +300,6 @@
     const language = availability.lang || 'доступный';
     const formats = [
       ['.srt', 'srt', 'SRT (с тайм-кодами)'],
-      ['.vtt', 'vtt', 'VTT (с тайм-кодами)'],
       ['.txt', 'txt', 'простой текст (без тайм-кодов)'],
     ];
     for (const [extension, format, description] of formats) {
@@ -229,27 +313,30 @@
     }
   }
 
-  function addFormatSelector(transcode) {
-    menu.append(createHeading('Формат видео'));
-    const formats = [
-      { value: false, title: 'Современный кодек (VP9)', note: 'быстро, без перекодирования' },
-      { value: true, title: 'Кодек H.264 (перекодирование)', note: 'медленно, но совместимо с устаревшими плеерами' },
-    ];
-    let selected = Boolean(transcode);
-    const rows = formats.map((format) => {
-      const row = createElement('div', `nova-menu-radio${selected === format.value ? ' sel' : ''}`);
+  function addRadioSelector(heading, storageKey, options, current) {
+    menu.append(createHeading(heading));
+    let selected = current;
+    const rows = options.map((option) => {
+      const row = createElement('div', `nova-menu-radio${selected === option.value ? ' sel' : ''}`);
       const text = createElement('span', 'nova-radio-txt');
-      text.append(createElement('b', null, format.title), createElement('i', null, format.note));
+      text.append(createElement('b', null, option.title), createElement('i', null, option.note));
       row.append(createElement('span', 'nova-dot'), text);
       row.addEventListener('click', (event) => {
         event.stopPropagation();
-        selected = format.value;
-        chrome.storage.local.set({ transcode: selected }).catch((error) => reportError('ui/settings', error));
-        rows.forEach((item, index) => item.classList.toggle('sel', formats[index].value === selected));
+        selected = option.value;
+        chrome.storage.local.set({ [storageKey]: selected }).catch((error) => reportError('ui/settings', error));
+        rows.forEach((item, index) => item.classList.toggle('sel', options[index].value === selected));
       });
       return row;
     });
     menu.append(...rows);
+  }
+
+  function addFormatSelector(transcode) {
+    addRadioSelector('Кодек видео', 'transcode', [
+      { value: false, title: 'Оригинал (без перекодирования)', note: 'исходное качество и минимальный размер — рекомендуется' },
+      { value: true, title: 'Сжатый MP4 (H.264)', note: 'аппаратное перекодирование, почти без потерь; для старых плееров и ТВ' },
+    ], Boolean(transcode));
   }
 
   async function openMenu(event) {
@@ -262,16 +349,26 @@
     menuOpening = true;
 
     try {
-      const [info, availability, settings] = await Promise.all([
+      const [info, availability, settings, updateStored] = await Promise.all([
         callHook('info'),
         callHook('subs-available'),
-        chrome.storage.local.get('transcode'),
+        chrome.storage.local.get(['transcode']),
+        chrome.storage.local.get('nova_update').catch(() => ({})),
       ]);
       menu = createElement('div', 'nova-menu');
-      menu.append(createBrandHeading());
-      addDownloadItems(info);
-      addSubtitleItems(info, availability);
-      addFormatSelector(settings.transcode);
+      menu.append(createBrandHeading(updateStored?.nova_update));
+      if (info.isLive) {
+        addLiveSection(info);
+      } else {
+        // Music "songs" (art tracks) have no real footage — the video stream is
+        // a static cover rendered as video, so only audio options make sense.
+        const artTrackOnly = IS_MUSIC && info.musicVideoType === 'MUSIC_VIDEO_TYPE_ATV';
+        addDownloadItems(info, { videoAllowed: !artTrackOnly });
+        const playlistItems = playlistIdFromLocation() ? scrapePlaylistItems() : [];
+        if (playlistItems.length > 1) addPlaylistSection(info, playlistItems);
+        addSubtitleItems(info, availability);
+        if (!artTrackOnly) addFormatSelector(settings.transcode);
+      }
       document.body.append(menu);
 
       const buttonRect = document.getElementById(BUTTON_ID)?.getBoundingClientRect();
@@ -297,13 +394,22 @@
       box.id = 'nova-toast';
       const bar = createElement('div', 'nova-toast-bar');
       bar.append(createElement('i'));
-      box.append(createElement('span', 'nova-toast-txt'), bar, createElement('div', 'nova-toast-stages'));
+      const cancelButton = createElement('button', 'nova-toast-cancel', 'Отменить загрузку');
+      cancelButton.type = 'button';
+      cancelButton.hidden = true;
+      cancelButton.addEventListener('click', () => box.__novaCancel?.());
+      box.append(createElement('span', 'nova-toast-txt'), bar, createElement('div', 'nova-toast-stages'), cancelButton);
       document.body.append(box);
     }
     const text = box.querySelector('.nova-toast-txt');
     const legacyBar = box.querySelector(':scope > .nova-toast-bar');
     const progress = legacyBar.querySelector('i');
     const stages = box.querySelector('.nova-toast-stages');
+    const cancel = box.querySelector('.nova-toast-cancel');
+    const hideCancel = () => {
+      box.__novaCancel = null;
+      cancel.hidden = true;
+    };
     return {
       set(message, fraction = 0) {
         clearTimeout(toastHideTimer);
@@ -312,7 +418,17 @@
         stages.classList.remove('show');
         legacyBar.hidden = false;
         progress.style.width = `${Math.round(Math.max(0, Math.min(1, fraction)) * 100)}%`;
+        hideCancel();
         box.classList.add('show');
+      },
+      setCancel(handler, label = 'Отменить загрузку') {
+        if (!handler) {
+          hideCancel();
+          return;
+        }
+        box.__novaCancel = handler;
+        cancel.textContent = label;
+        cancel.hidden = false;
       },
       beginStages(message, definitions) {
         clearTimeout(toastHideTimer);
@@ -429,12 +545,12 @@
     }
   }
 
-  async function startDownload({ format, height }, info, options = {}) {
+  async function startDownload({ format, height, audioFormat = 'mp3' }, info, options = {}) {
     const notification = getToast();
     if (downloadInProgress) {
       notification.set('Другая загрузка уже выполняется', 1);
       notification.hide(4000);
-      return;
+      return 'busy';
     }
     downloadInProgress = true;
     if (!options.freshPageResume) await clearReloadGuard();
@@ -458,6 +574,13 @@
       try { primedMedia.muted = true; } catch (error) {}
       primedMedia.pause();
     }
+    if (IS_MUSIC && primedMedia && primedState) {
+      // ytmusic auto-advances to the next queue item when a playing track
+      // ends, and downloads seek near the end: every Music download runs
+      // paused and the track stays paused afterwards.
+      primedState.paused = true;
+      try { primedMedia.pause(); } catch (error) {}
+    }
     let primedStateRestored = false;
     let reloadScheduled = false;
     const restorePrimedMedia = () => {
@@ -468,8 +591,9 @@
       if (primedState.paused) primedMedia.pause();
       else primedMedia.play().catch(() => {});
     };
-    const label = isMp3 ? 'MP3' : `${height}p`;
-    const processingLabel = isMp3 ? 'Кодирование MP3' : 'Склейка / кодирование';
+    const audioMeta = audioFormatMeta(audioFormat, info);
+    const label = isMp3 ? audioMeta.title : `${height}p`;
+    const processingLabel = isMp3 ? 'Кодирование аудио' : 'Склейка / кодирование';
     notification.beginStages(`Подготовка ${label}…`, [
       { id: 'capture', label: 'Получение сегментов' },
       { id: 'engine', label: 'Запуск медиадвижка' },
@@ -481,11 +605,25 @@
     let scaleDown = false;
     const jobId = crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`;
 
+    let cancelRequested = false;
+    notification.setCancel(() => {
+      if (cancelRequested) return;
+      cancelRequested = true;
+      notification.setCancel(null);
+      // Cancelling one item of a running playlist queue stops the whole queue.
+      void clearQueue();
+      try { sessionStorage.removeItem('nvs_queue_token'); } catch (error) {}
+      document.getElementById('nova-queue')?.remove();
+      void callHook('download-cancel').catch(() => {});
+      if (IS_MUSIC) void callHook('music-mute', { mute: false }).catch(() => {});
+      void sendRuntimeMessage({ t: 'nova-abort', jobId }, 10_000).catch(() => {});
+    });
+
     const onFfmpegProgress = (message) => {
       if (message?.t !== 'nova-progress' || message.jobId !== jobId) return;
       const value = Math.max(0, Math.min(1, message.value || 0));
       const fallback = isMp3
-        ? 'Кодирование MP3'
+        ? 'Кодирование аудио'
         : (scaleDown ? 'Уменьшение видео' : 'Склейка / кодирование');
       notification.stage('process', value, value >= 1 ? 'done' : 'active', message.status || fallback);
     };
@@ -498,7 +636,7 @@
         () => notification.stage('engine', 1, 'done'),
         () => notification.stage('engine', null, 'queued', 'Повторный запуск медиадвижка'),
       );
-      const { transcode = false } = await chrome.storage.local.get('transcode');
+      const { transcode = false } = await chrome.storage.local.get(['transcode']);
       const captured = await callHook('download', {
         height,
         format,
@@ -519,7 +657,16 @@
         notification.stage('capture', message.progress, message.progress >= 1 ? 'done' : 'active', captureLabel);
       });
       restorePrimedMedia();
+      // The hook may have finished a phase without a cancellation checkpoint;
+      // never save a file the user has already cancelled.
+      if (cancelRequested) {
+        const cancelledError = new Error('загрузка отменена пользователем');
+        cancelledError.details = { cancelled: true };
+        throw cancelledError;
+      }
       notification.stage('capture', 1, 'done');
+      // Transfer/processing cannot be interrupted mid-ffmpeg; hide the button.
+      notification.setCancel(null);
 
       const actualHeight = !isMp3 && Number(captured.actualHeight) > 0 ? Number(captured.actualHeight) : height;
       scaleDown = !isMp3 && actualHeight > height;
@@ -527,19 +674,22 @@
       const outputHeight = isMp3 ? null : (scaleDown ? height : actualHeight);
       const shouldTranscode = isMp3 || Boolean(transcode) || scaleDown || Boolean(captured.forceTranscode);
       const processStatus = isMp3
-        ? 'Кодирование MP3'
+        ? 'Кодирование аудио'
         : (scaleDown
           ? `Уменьшение ${actualHeight}p до ${height}p`
           : (unavailableHigherQuality
             ? `Склейка ${actualHeight}p без апскейлинга`
             : (shouldTranscode ? 'Перекодирование в H.264/AAC' : 'Склейка дорожек')));
 
-      const extension = isMp3 ? '.mp3' : '.mp4';
+      const extension = isMp3 ? audioMeta.extension : '.mp4';
       const filename = `${safeFilename(info.title)}${isMp3 ? '' : ` [${outputHeight}p]`}${extension}`;
       notification.stage('transfer', 0, 'active', 'Передача и сборка');
       const result = await muxViaOffscreen({
         jobId,
         format,
+        audioFormat: isMp3 ? audioFormat : null,
+        audioQuality: 'best',
+        videoId: info.videoId || '',
         video: isMp3 ? null : captured._v,
         videoPrefix: isMp3 ? null : captured._vp,
         audio: captured._a,
@@ -566,7 +716,13 @@
       await clearReloadGuard();
       notification.set(`Готово: ${result.filename || filename}`, 1);
       notification.hide(4000);
+      return true;
     } catch (error) {
+      if (cancelRequested || error?.details?.cancelled) {
+        notification.set('Загрузка отменена', 1);
+        notification.hide(4000);
+        return false;
+      }
       const reloadCount = Math.max(0, Number(options.reloadCount) || 0);
       if (error?.details?.reloadRequired && reloadCount < 2) {
         try {
@@ -577,6 +733,7 @@
               title: info.title,
               duration: Number(info.duration) || 0,
               format,
+              audioFormat: isMp3 ? audioFormat : null,
               height: isMp3 ? null : Number(height),
               createdAt: Date.now(),
               token: crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`,
@@ -602,8 +759,30 @@
             try { primedMedia.muted = true; } catch (primeError) {}
             try { primedMedia.pause(); } catch (primeError) {}
           }
-          setTimeout(() => location.reload(), 100);
-          return;
+          // Nova's own reload: the playlist queue must survive it, while a
+          // manual user reload (no flag) cancels the queue on the next load.
+          try { sessionStorage.setItem('nvs_queue_nav', '1'); } catch (navError) {}
+          // Reload through the browser, not the page: YouTube's SPA router can
+          // intercept location.reload() and keep the wedged media session
+          // alive — a tab-level reload behaves like a manual F5. On Music the
+          // reload must target the track's own URL: a plain reload lets
+          // ytmusic reopen the queue on the NEXT track and strand the resume.
+          let reloadRequest = { t: 'nova-reload-tab' };
+          if (IS_MUSIC && info.videoId) {
+            const target = new URL('/watch', location.origin);
+            target.searchParams.set('v', info.videoId);
+            // Keep the playlist context: /watch?v= without list makes ytmusic
+            // start a RADIO for the track and wander off to other songs.
+            const listId = playlistIdFromLocation();
+            if (listId) target.searchParams.set('list', listId);
+            reloadRequest = { t: 'nova-navigate-tab', url: target.href };
+          }
+          setTimeout(() => {
+            sendRuntimeMessage(reloadRequest, 5_000)
+              .then((response) => { if (!response?.ok) location.reload(); })
+              .catch(() => location.reload());
+          }, 100);
+          return 'reload';
         } catch (reloadError) {
           error = reloadError;
         }
@@ -616,7 +795,9 @@
         format, height, videoId: info.videoId,
         ...(error?.details ? { capture: error.details } : {}),
       });
+      return false;
     } finally {
+      notification.setCancel(null);
       if (!reloadScheduled) restorePrimedMedia();
       chrome.runtime.onMessage.removeListener(onFfmpegProgress);
       downloadInProgress = false;
@@ -654,6 +835,8 @@
       const started = await sendRuntimeMessage({
         t: 'nova-begin', jobId, tabId: registration.tabId,
         filename: job.filename, format: job.format,
+        audioFormat: job.audioFormat, audioQuality: job.audioQuality,
+        videoId: job.videoId || '',
         videoMime: job.videoMime, audioMime: job.audioMime,
         videoPrefixMime: job.videoPrefixMime,
         videoPrefixBoundary: job.videoPrefixBoundary,
@@ -726,6 +909,28 @@
 
       const age = Date.now() - Number(pending.createdAt);
       const locationVideoId = videoIdFromLocation();
+      if (IS_MUSIC && pending.reloadAttempted === true && pending.videoId
+        && locationVideoId && locationVideoId !== pending.videoId) {
+        // ytmusic sometimes reopens the queue on the NEXT track after a
+        // reload; the pending download then silently died here. Go back to
+        // the track it belongs to (once) and resume there.
+        let alreadyRedirected = false;
+        try { alreadyRedirected = sessionStorage.getItem('nvs_resume_redirect') === pending.videoId; } catch (error) {}
+        if (!alreadyRedirected) {
+          try { sessionStorage.setItem('nvs_resume_redirect', pending.videoId); } catch (error) {}
+          try { sessionStorage.setItem('nvs_queue_nav', '1'); } catch (error) {}
+          const target = new URL('/watch', location.origin);
+          target.searchParams.set('v', pending.videoId);
+          // Without the list param ytmusic opens a radio and drifts further.
+          const listId = playlistIdFromLocation();
+          if (listId) target.searchParams.set('list', listId);
+          const navigated = await sendRuntimeMessage({
+            t: 'nova-navigate-tab', url: target.href,
+          }, 5_000).catch(() => null);
+          if (navigated?.ok) return; // pending stays stored; retried after load
+        }
+      }
+      try { sessionStorage.removeItem('nvs_resume_redirect'); } catch (error) {}
       const valid = pending.reloadAttempted === true
         && (pending.format === 'mp4' || pending.format === 'mp3')
         && typeof pending.token === 'string'
@@ -753,7 +958,10 @@
         const media = document.querySelector('video');
         if (!media) return;
         try { media.muted = true; } catch (error) {}
-        try { media.pause(); } catch (error) {}
+        // On Music a player paused at zero never builds its MSE buffers, so
+        // the resumed capture starved and reloaded again. Muted playback from
+        // zero warms it up; the capture pins the pause itself once it starts.
+        if (!IS_MUSIC) try { media.pause(); } catch (error) {}
         try {
           if (Number(media.currentTime) > 0.05) media.currentTime = 0;
         } catch (error) {}
@@ -788,10 +996,11 @@
       const cleared = await clearReloadDownload();
       if (!cleared?.ok) throw new Error('не удалось подтвердить одноразовое возобновление');
       downloadInProgress = false;
-      await startDownload(
+      const outcome = await startDownload(
         {
           format: pending.format,
           height: pending.format === 'mp3' ? null : Number(pending.height),
+          audioFormat: pending.format === 'mp3' ? (pending.audioFormat || 'mp3') : 'mp3',
         },
         info,
         {
@@ -800,6 +1009,7 @@
           reloadCount: Number(pending.reloadCount),
         },
       );
+      return { videoId: pending.videoId, ok: outcome === true, reloading: outcome === 'reload' };
     } catch (error) {
       await clearReloadGuard();
       downloadInProgress = false;
@@ -810,11 +1020,556 @@
         videoId: pending?.videoId,
         height: pending?.height,
       });
+      return pending?.videoId ? { videoId: pending.videoId, ok: false } : null;
+    }
+  }
+
+  // ---- live stream recording ----------------------------------------------
+  // The hook forwards every MSE fragment through window.postMessage; this side
+  // relays them (per-track, in order, with backpressure) to the offscreen
+  // document, which spools them to OPFS and muxes the file at stop.
+  let liveJob = null;
+
+  function removeLivePanel() {
+    document.getElementById('nova-live-panel')?.remove();
+  }
+
+  function renderLivePanel(state) {
+    let box = document.getElementById('nova-live-panel');
+    if (!box) {
+      box = createElement('div');
+      box.id = 'nova-live-panel';
+      const head = createElement('div', 'nova-live-head');
+      head.append(createElement('span', 'nova-live-dot'), createElement('span', 'nova-live-txt'));
+      const stopButton = createElement('button', 'nova-btn nova-live-stop', 'Остановить и сохранить');
+      stopButton.addEventListener('click', () => {
+        stopButton.disabled = true;
+        stopButton.textContent = 'Останавливаю…';
+        void callHook('live-stop').catch(() => {});
+      });
+      box.append(head, stopButton);
+      document.body.append(box);
+    }
+    const label = box.querySelector('.nova-live-txt');
+    const megabytes = (Number(state.bytes || 0) / (1024 * 1024)).toFixed(1);
+    const total = Math.max(0, Math.floor(Number(state.seconds) || 0));
+    const minutes = Math.floor(total / 60);
+    const seconds = String(total % 60).padStart(2, '0');
+    label.textContent = state.caughtUp
+      ? `Запись эфира: ${minutes}:${seconds} · ${megabytes} МБ`
+      : `Догоняю эфир (отставание ${Math.round(Number(state.behind) || 0)} с) · ${megabytes} МБ`;
+  }
+
+  async function startLiveRecording(info, from) {
+    const notification = getToast();
+    if (downloadInProgress) {
+      notification.set('Другая загрузка уже выполняется', 1);
+      notification.hide(4000);
+      return false;
+    }
+    downloadInProgress = true;
+    const jobId = crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`;
+    const chains = { video: Promise.resolve(), audio: Promise.resolve() };
+    liveJob = { jobId, failed: '', queuedBytes: 0, sentBytes: 0 };
+    const failLiveTransfer = (reason) => {
+      if (liveJob && !liveJob.failed) {
+        liveJob.failed = reason;
+        void callHook('live-stop').catch(() => {});
+      }
+    };
+    const onLiveChunk = (event) => {
+      if (event.source !== window || event.origin !== location.origin) return;
+      const data = event.data;
+      if (!data || data.__nova_live_chunk !== true || !data.buffer) return;
+      if (!liveJob || liveJob.jobId !== jobId || liveJob.failed) return;
+      const bytes = new Uint8Array(data.buffer);
+      liveJob.queuedBytes += bytes.length;
+      if (liveJob.queuedBytes - liveJob.sentBytes > 192 * 1024 * 1024) {
+        failLiveTransfer('передача сегментов не успевает за эфиром');
+        return;
+      }
+      const track = data.kind === 'audio' ? 'audio' : 'video';
+      chains[track] = chains[track].then(async () => {
+        if (!liveJob || liveJob.failed) return;
+        for (let offset = 0; offset < bytes.length; offset += TRANSFER_CHUNK_SIZE) {
+          const part = bytes.subarray(offset, Math.min(offset + TRANSFER_CHUNK_SIZE, bytes.length));
+          const response = await sendRuntimeMessage({
+            t: 'nova-live-chunk', jobId, track, mime: data.mime || '', b64: encodeBase64(part),
+          }, 60_000);
+          if (!response?.ok) throw new Error(response?.error || 'сегмент не принят обработчиком');
+        }
+        liveJob.sentBytes += bytes.length;
+      }).catch((error) => failLiveTransfer(String(error?.message || error)));
+    };
+    window.addEventListener('message', onLiveChunk);
+    const onFfmpegProgress = (message) => {
+      if (message?.t !== 'nova-progress' || message.jobId !== jobId) return;
+      notification.set(message.status || 'Сборка записи эфира…', Math.max(0, Math.min(1, message.value || 0)));
+    };
+    chrome.runtime.onMessage.addListener(onFfmpegProgress);
+    try {
+      notification.set('Подготовка записи эфира…', 0.05);
+      const ensured = await sendRuntimeMessage({ t: 'nova-ensure' }, 30_000);
+      if (!ensured?.ok) throw new Error(ensured?.error || 'не удалось запустить обработчик медиа');
+      const registration = await sendRuntimeMessage({ t: 'nova-register-job', jobId }, 10_000);
+      if (!registration?.ok || !Number.isInteger(registration.tabId)) {
+        throw new Error(registration?.error || 'не удалось определить вкладку записи');
+      }
+      const begun = await sendRuntimeMessage({
+        t: 'nova-live-begin', jobId, tabId: registration.tabId,
+      }, 30_000);
+      if (!begun?.ok) throw new Error(begun?.error || 'не удалось начать запись эфира');
+      notification.hide(800);
+      renderLivePanel({
+        seconds: 0, bytes: 0, behind: 0, caughtUp: from !== 'start',
+      });
+      const result = await callHook('live-start', { from }, (message) => {
+        if (message.live) renderLivePanel(message.live);
+      });
+      removeLivePanel();
+      if (liveJob.failed) throw new Error(liveJob.failed);
+      notification.set('Эфир записан, передаю остаток данных…', 0.15);
+      await Promise.allSettled([chains.video, chains.audio]);
+      if (liveJob.failed) throw new Error(liveJob.failed);
+      notification.set('Собираю файл записи…', 0.25);
+      const filename = `${safeFilename(info.title)} [LIVE].mp4`;
+      const finalized = await sendRuntimeMessage({
+        t: 'nova-live-finalize',
+        jobId,
+        filename,
+        duration: Number(result.durationSeconds) || 0,
+        videoMime: result.videoMime || '',
+        audioMime: result.audioMime || '',
+      }, 60 * 60_000);
+      if (!finalized?.ok) throw new Error(finalized?.error || 'не удалось собрать запись эфира');
+      notification.set(finalized.split
+        ? 'Готово: запись сохранена двумя файлами (видео + звук): она слишком велика для склейки в браузере'
+        : (finalized.singleTrack
+          ? `Внимание: плеер передал только ${finalized.singleTrack === 'audio' ? 'аудио' : 'видео'}дорожку — сохранена она (${finalized.filename})`
+          : `Готово: ${finalized.filename || filename} (${result.reason || 'эфир записан'})`), 1);
+      notification.hide(9000);
+      return true;
+    } catch (error) {
+      removeLivePanel();
+      await sendRuntimeMessage({ t: 'nova-live-abort', jobId }, 10_000).catch(() => {});
+      const detail = String(error?.message || error);
+      notification.set(`Ошибка записи эфира: ${detail.slice(0, 240)}`, 1);
+      notification.hide(9000);
+      await reportError('ui/live', error, { videoId: info.videoId, from });
+      return false;
+    } finally {
+      window.removeEventListener('message', onLiveChunk);
+      chrome.runtime.onMessage.removeListener(onFfmpegProgress);
+      liveJob = null;
+      downloadInProgress = false;
+    }
+  }
+
+  // ---- playlist queue ------------------------------------------------------
+  // The queue survives navigation in chrome.storage.local; each watch page
+  // load picks up the first pending item, downloads it with the regular
+  // single-video pipeline and then navigates to the next video itself.
+  const QUEUE_KEY = 'nvs_playlist_queue';
+  let queueRunning = false;
+  // Consumed once per page load: set by Nova right before its own reloads and
+  // navigations. A page load without it means the user reloaded manually.
+  let pageLoadWasNovaNavigation = false;
+  try {
+    pageLoadWasNovaNavigation = sessionStorage.getItem('nvs_queue_nav') === '1';
+    sessionStorage.removeItem('nvs_queue_nav');
+  } catch (error) {}
+
+  function playlistIdFromLocation() {
+    try { return new URL(location.href).searchParams.get('list') || ''; } catch (error) { return ''; }
+  }
+
+  function scrapePlaylistItems() {
+    if (IS_MUSIC) return scrapeMusicQueueItems();
+    const items = [];
+    const seen = new Set();
+    for (const row of document.querySelectorAll('ytd-playlist-panel-video-renderer')) {
+      const link = row.querySelector('a#wc-endpoint') || row.querySelector('a[href*="watch"]');
+      let videoId = '';
+      try { videoId = new URL(link?.href || '', location.origin).searchParams.get('v') || ''; } catch (error) {}
+      if (!videoId || seen.has(videoId)) continue;
+      seen.add(videoId);
+      const titleNode = row.querySelector('#video-title');
+      const title = (titleNode?.getAttribute('title') || titleNode?.textContent || videoId).trim();
+      items.push({ videoId, title });
+    }
+    return items;
+  }
+
+  // YT Music queue rows expose no watch link; the video id lives in the
+  // thumbnail URL (i.ytimg.com/vi/<id>/...).
+  function scrapeMusicQueueItems() {
+    const items = [];
+    const seen = new Set();
+    for (const row of document.querySelectorAll('ytmusic-player-queue-item')) {
+      const thumb = row.querySelector('img');
+      const videoId = ((thumb?.src || '').match(/\/vi\/([A-Za-z0-9_-]{6,})\//) || [])[1] || '';
+      if (!videoId || seen.has(videoId)) continue;
+      seen.add(videoId);
+      const titleNode = row.querySelector('.song-title');
+      const artistNode = row.querySelector('.byline');
+      const title = [
+        (artistNode?.getAttribute('title') || artistNode?.textContent || '').trim(),
+        (titleNode?.getAttribute('title') || titleNode?.textContent || videoId).trim(),
+      ].filter(Boolean).join(' - ');
+      items.push({ videoId, title });
+    }
+    return items;
+  }
+
+  async function readQueue() {
+    const stored = await chrome.storage.local.get(QUEUE_KEY).catch(() => ({}));
+    return stored[QUEUE_KEY] || null;
+  }
+  async function writeQueue(queue) {
+    await chrome.storage.local.set({ [QUEUE_KEY]: queue }).catch(() => {});
+  }
+  async function clearQueue() {
+    await chrome.storage.local.remove(QUEUE_KEY).catch(() => {});
+  }
+
+  function closePlaylistPicker() {
+    document.getElementById('nova-playlist-overlay')?.remove();
+  }
+
+  function openPlaylistPicker(info, items) {
+    closePlaylistPicker();
+    const overlay = createElement('div');
+    overlay.id = 'nova-playlist-overlay';
+    const panel = createElement('div', 'nova-playlist');
+    panel.append(createElement('div', 'nova-playlist-head', `Скачивание плейлиста — ${items.length} видео`));
+    panel.append(createElement('div', 'nova-playlist-note',
+      'В списке видео, уже загруженные плеером. Если плейлист длиннее — прокрутите его на странице и откройте это окно снова.'));
+
+    const formatRow = createElement('div', 'nova-playlist-format');
+    formatRow.append(createElement('span', null, 'Формат:'));
+    const select = document.createElement('select');
+    // On Music the queue mixes songs and clips; a fixed video height would
+    // fail on the audio-only entries, so the queue is audio-only there.
+    if (!IS_MUSIC) {
+      const videoGroup = document.createElement('optgroup');
+      videoGroup.label = '─── Видео ───';
+      const heights = [...new Set(info.heights || [])].sort((a, b) => b - a);
+      for (const h of heights) videoGroup.append(new Option(`🎬 ${h}p (MP4)`, `mp4:${h}`));
+      if (videoGroup.children.length) select.append(videoGroup);
+    }
+    const audioGroup = document.createElement('optgroup');
+    audioGroup.label = '─── Аудио ───';
+    for (const audio of audioFormatsFor(info)) audioGroup.append(new Option(`🎵 ${audio.title}`, `mp3:${audio.id}`));
+    select.append(audioGroup);
+    formatRow.append(select);
+    panel.append(formatRow);
+
+    const allRow = createElement('label', 'nova-playlist-row nova-playlist-all');
+    const selectAll = document.createElement('input');
+    selectAll.type = 'checkbox';
+    selectAll.checked = true;
+    allRow.append(selectAll, createElement('span', 'nova-playlist-title', 'Выбрать все'));
+    panel.append(allRow);
+
+    const list = createElement('div', 'nova-playlist-list');
+    const checks = items.map((item, index) => {
+      const row = createElement('label', 'nova-playlist-row');
+      const check = document.createElement('input');
+      check.type = 'checkbox';
+      check.checked = true;
+      check.addEventListener('change', () => {
+        selectAll.checked = checks.every((box) => box.checked);
+      });
+      row.append(check,
+        createElement('span', 'nova-playlist-idx', String(index + 1)),
+        createElement('span', 'nova-playlist-title', item.title));
+      list.append(row);
+      return check;
+    });
+    panel.append(list);
+    selectAll.addEventListener('change', () => checks.forEach((box) => { box.checked = selectAll.checked; }));
+
+    const actions = createElement('div', 'nova-playlist-actions');
+    const startButton = createElement('button', 'nova-btn primary', 'Скачать выбранные');
+    const closeButton = createElement('button', 'nova-btn', 'Закрыть');
+    actions.append(startButton, closeButton);
+    panel.append(actions);
+    overlay.append(panel);
+    document.body.append(overlay);
+    closeButton.addEventListener('click', closePlaylistPicker);
+    overlay.addEventListener('click', (event) => {
+      if (event.target === overlay) closePlaylistPicker();
+    });
+    startButton.addEventListener('click', async () => {
+      const chosen = items.filter((_, index) => checks[index].checked);
+      if (!chosen.length) return;
+      const [format, sub] = String(select.value).split(':');
+      // The token lives in this tab's sessionStorage: another tab (or a tab
+      // opened after this one closes) can never adopt and resume this queue.
+      const token = crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`;
+      try { sessionStorage.setItem('nvs_queue_token', token); } catch (error) {}
+      await writeQueue({
+        listId: playlistIdFromLocation(),
+        createdAt: Date.now(),
+        active: true,
+        token,
+        format: {
+          format: format === 'mp3' ? 'mp3' : 'mp4',
+          height: format === 'mp4' ? Number(sub) : null,
+          audioFormat: format === 'mp3' ? sub : null,
+        },
+        items: chosen.map((item) => ({
+          videoId: item.videoId,
+          title: item.title.slice(0, 200),
+          status: 'pending',
+        })),
+      });
+      closePlaylistPicker();
+      void processPlaylistQueue(null);
+    });
+  }
+
+  function renderQueuePanel(queue, state = {}) {
+    let box = document.getElementById('nova-queue');
+    if (!box) {
+      box = createElement('div');
+      box.id = 'nova-queue';
+      const body = createElement('div', 'nova-queue-body');
+      const cancelButton = createElement('button', 'nova-btn nova-queue-cancel', 'Отменить очередь');
+      cancelButton.addEventListener('click', async () => {
+        await clearQueue();
+        try { sessionStorage.removeItem('nvs_queue_token'); } catch (error) {}
+        if (IS_MUSIC) void callHook('music-mute', { mute: false }).catch(() => {});
+        // Do not touch the toast here: a download may be mid-item and owns the
+        // staged progress UI (with its own cancel button). Removing the panel
+        // is the visible confirmation that the queue is gone.
+        box.remove();
+      });
+      const actions = createElement('div', 'nova-queue-actions');
+      actions.append(cancelButton);
+      body.append(createElement('div', 'nova-queue-list'), actions);
+      box.append(createElement('div', 'nova-queue-pill'), body);
+      document.body.append(box);
+    }
+    const done = queue.items.filter((item) => item.status === 'done').length;
+    const failed = queue.items.filter((item) => item.status === 'error').length;
+    const activeItem = queue.items.find((item) => item.status === 'active');
+    const pill = box.querySelector('.nova-queue-pill');
+    pill.textContent = state.finished
+      ? `Плейлист: готово ${done}/${queue.items.length}${failed ? `, ошибок: ${failed}` : ''}`
+      : `Плейлист: ${done}/${queue.items.length}${activeItem ? ` · ${activeItem.title}` : ''}`;
+    box.querySelector('.nova-queue-cancel').textContent = state.finished ? 'Закрыть' : 'Отменить очередь';
+    box.classList.toggle('finished', Boolean(state.finished));
+    const list = box.querySelector('.nova-queue-list');
+    list.replaceChildren(...queue.items.map((item, index) => {
+      const row = createElement('div', `nova-queue-row ${item.status}`);
+      const icon = item.status === 'done' ? '✓'
+        : (item.status === 'error' ? '✗' : (item.status === 'active' ? '▶' : '•'));
+      row.append(createElement('span', 'nova-queue-ic', icon),
+        createElement('span', 'nova-queue-idx', `${index + 1}.`),
+        createElement('span', 'nova-queue-title', item.title));
+      return row;
+    }));
+  }
+
+  async function waitForPlayerReady(videoId, deadlineMs = 30_000, onTick) {
+    const deadline = Date.now() + deadlineMs;
+    while (Date.now() < deadline) {
+      onTick?.();
+      const candidate = await callHook('info').catch(() => null);
+      onTick?.();
+      if (candidate?.videoId === videoId && Number(candidate.duration) > 0) return candidate;
+      await new Promise((resolve) => setTimeout(resolve, 400));
+    }
+    return null;
+  }
+
+  // Mirror of the reload-resume priming: pin the fresh player to a muted pause
+  // at zero so YouTube builds its MSE session from the opening segments. Queue
+  // items that skipped this occasionally landed in a wedged SABR session.
+  function holdQueueMediaAtStart() {
+    const media = document.querySelector('video');
+    if (!media) return;
+    try { media.muted = true; } catch (error) {}
+    // Music player: muted playback instead of a pause — paused at zero it
+    // never loads metadata/buffers and the queue item waits out its 30s.
+    if (!IS_MUSIC) try { media.pause(); } catch (error) {}
+    try {
+      if (Number(media.currentTime) > 0.05) media.currentTime = 0;
+    } catch (error) {}
+  }
+
+  async function processPlaylistQueue(resumedResult, entry = 'inline') {
+    if (location.pathname !== '/watch' || queueRunning || downloadInProgress) return;
+    if (resumedResult?.reloading) return;
+    // Claim the runner slot before any await: the startup path and the
+    // yt-navigate-finish handler can otherwise both pass the guard above and
+    // download the same item twice.
+    queueRunning = true;
+    try {
+      let queue = await readQueue();
+      if (!queue?.active || !Array.isArray(queue.items) || !queue.items.length) return;
+      let sessionToken = null;
+      try { sessionToken = sessionStorage.getItem('nvs_queue_token'); } catch (error) {}
+      if (!queue.token || queue.token !== sessionToken) {
+        // Queue owned by another tab: never adopt it here — and never destroy
+        // it either, its owner tab may be running it right now. Only remove
+        // tokenless (pre-token) queues and abandoned ones nobody can resume.
+        if (!queue.token || Date.now() - Number(queue.createdAt || 0) > 12 * 60 * 60_000) {
+          await clearQueue();
+        }
+        return;
+      }
+      if (entry === 'load') {
+        if (!pageLoadWasNovaNavigation) {
+          // A page load without Nova's navigation flag is the user pressing
+          // reload by hand — that is the stop signal for the queue.
+          await clearQueue();
+          try { sessionStorage.removeItem('nvs_queue_token'); } catch (error) {}
+          const notification = getToast();
+          notification.set('Очередь плейлиста остановлена после обновления страницы', 1);
+          notification.hide(6000);
+          return;
+        }
+      }
+      const active = queue.items.find((item) => item.status === 'active');
+      if (active) {
+        // A reload-resume that just finished settles the interrupted item;
+        // anything else (browser restart, stray navigation) retries it.
+        if (resumedResult && resumedResult.videoId === active.videoId) {
+          active.status = resumedResult.ok ? 'done' : 'error';
+        } else {
+          active.status = 'pending';
+        }
+        await writeQueue(queue);
+      }
+      renderQueuePanel(queue);
+      while (true) {
+        queue = await readQueue();
+        if (!queue?.active) break;
+        const next = queue.items.find((item) => item.status === 'pending');
+        if (!next) {
+          renderQueuePanel(queue, { finished: true });
+          const done = queue.items.filter((item) => item.status === 'done').length;
+          const failed = queue.items.filter((item) => item.status === 'error').length;
+          const notification = getToast();
+          notification.set(`Плейлист: скачано ${done} из ${queue.items.length}${failed ? `, с ошибками: ${failed}` : ''}`, 1);
+          notification.hide(8000);
+          await clearQueue();
+          if (IS_MUSIC) {
+            // The queue kept the tab silent; give the sound back at the end.
+            void callHook('music-mute', { mute: false }).catch(() => {});
+            try { document.querySelector('video').muted = false; } catch (error) {}
+          }
+          break;
+        }
+        if (videoIdFromLocation() !== next.videoId) {
+          renderQueuePanel(queue);
+          // Music included: every queue item gets a REAL page load. Tracks
+          // opened through ytmusic's SPA switching inherit a wedged media
+          // session and stall, while a fresh load downloads first try (the
+          // beforeunload prompt is stripped by the hook, so loads are silent).
+          const target = new URL('/watch', location.origin);
+          target.searchParams.set('v', next.videoId);
+          if (queue.listId) target.searchParams.set('list', queue.listId);
+          try { sessionStorage.setItem('nvs_queue_nav', '1'); } catch (error) {}
+          // Navigate through the browser so every queue item starts as a real
+          // page load; page-initiated navigation gets intercepted into an SPA
+          // transition where YouTube preloads media before the URL changes and
+          // the captured head is lost.
+          const navigated = await sendRuntimeMessage({
+            t: 'nova-navigate-tab', url: target.href,
+          }, 5_000).catch(() => null);
+          if (!navigated?.ok) location.assign(target.href);
+          return;
+        }
+        next.status = 'active';
+        await writeQueue(queue);
+        renderQueuePanel(queue);
+        holdQueueMediaAtStart();
+        // Never write a stale queue copy after a long await: the user may have
+        // cancelled meanwhile, and writing would resurrect the cleared queue.
+        const settleItem = async (videoId, status) => {
+          const current = await readQueue();
+          if (!current?.active || current.token !== queue.token) return false;
+          const item = current.items.find((entry) => entry.videoId === videoId
+            && (entry.status === 'active' || entry.status === 'pending'));
+          if (item) item.status = status;
+          await writeQueue(current);
+          renderQueuePanel(current);
+          return true;
+        };
+        const ready = await waitForPlayerReady(next.videoId, 30_000, holdQueueMediaAtStart);
+        if (!ready) {
+          if (!(await settleItem(next.videoId, 'error'))) break;
+          continue;
+        }
+        const outcome = await startDownload({
+          format: queue.format?.format === 'mp3' ? 'mp3' : 'mp4',
+          height: Number(queue.format?.height) || null,
+          audioFormat: queue.format?.audioFormat || 'mp3',
+        }, ready, {
+          // Music: keep the tab silent for the whole queue run; the last
+          // item unmutes when the queue finishes.
+          restoreMediaState: { paused: true, time: 0, muted: IS_MUSIC },
+        });
+        if (outcome === 'reload') return; // resume continues after the reload
+        if (outcome === 'busy') {
+          // The user started a manual download while the queue was between
+          // items: put the item back, wait the manual download out, retry.
+          if (!(await settleItem(next.videoId, 'pending'))) break;
+          while (downloadInProgress) {
+            await new Promise((resolve) => setTimeout(resolve, 2_000));
+          }
+          continue;
+        }
+        if (!(await settleItem(next.videoId, outcome === true ? 'done' : 'error'))) break;
+        await new Promise((resolve) => setTimeout(resolve, 1_500));
+      }
+    } finally {
+      queueRunning = false;
+      // The queue app-mutes the Music tab; if this tab's queue is over for
+      // ANY reason (finished, cancelled, errored out), the sound must come
+      // back. ytmusic persists its mute state across reloads, so a missed
+      // unmute used to leave the tab silent until toggled by hand. Gated on
+      // the tab's own token: without it this must never touch a mute the
+      // user set manually.
+      if (IS_MUSIC) {
+        let hadToken = false;
+        try { hadToken = Boolean(sessionStorage.getItem('nvs_queue_token')); } catch (error) {}
+        if (hadToken) {
+          const remaining = await readQueue().catch(() => null);
+          if (!remaining?.active) {
+            try { sessionStorage.removeItem('nvs_queue_token'); } catch (error) {}
+            void callHook('music-mute', { mute: false }).catch(() => {});
+          }
+        }
+      }
     }
   }
 
   new MutationObserver(scheduleButton).observe(document.documentElement, { childList: true, subtree: true });
   document.addEventListener('yt-navigate-finish', scheduleButton);
   scheduleButton();
-  void resumeReloadedVideoDownload();
+  // With an active queue the freshly navigated track starts playing out loud
+  // for the seconds before the download begins; silence it as early as
+  // possible (the capture itself mutes only for its own duration).
+  function muteEarlyIfQueueActive() {
+    try {
+      if (!sessionStorage.getItem('nvs_queue_token')) return;
+      holdQueueMediaAtStart();
+      // ytmusic re-applies its stored volume over element.muted; mute the
+      // player app itself for the whole queue run (unmuted at completion).
+      if (IS_MUSIC) void callHook('music-mute', { mute: true }).catch(() => {});
+    } catch (error) {}
+  }
+  document.addEventListener('yt-navigate-finish', () => {
+    muteEarlyIfQueueActive();
+    setTimeout(() => { void processPlaylistQueue(null); }, 1_500);
+  });
+  muteEarlyIfQueueActive();
+  (async () => {
+    const resumed = await resumeReloadedVideoDownload();
+    await processPlaylistQueue(resumed || null, 'load');
+  })();
 })();

@@ -1,0 +1,59 @@
+/* Record button matches Twitch player-control buttons (3rem hit area, 2rem
+   icon) and never overlaps them: it is prepended as a flow item inside the
+   right control group, so FrankerFaceZ and native buttons keep their spots. */
+.nvs-twitch-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  width: auto;
+  min-width: 3rem;
+  height: 3rem;
+  padding: 0 0.4rem;
+  border: none;
+  border-radius: 0.4rem;
+  background: transparent;
+  color: #35d477;
+  cursor: pointer;
+  vertical-align: top;
+}
+.nvs-twitch-btn:hover { background: rgba(255, 255, 255, 0.16); color: #4ade87; }
+.nvs-twitch-btn svg { width: 2rem; height: 2rem; display: block; }
+.nvs-twitch-btn .nvs-rec-dot { opacity: 0; }
+.nvs-twitch-btn.recording { color: #eb0400; }
+.nvs-twitch-btn.recording .nvs-arrows { opacity: 0; }
+.nvs-twitch-btn.recording .nvs-rec-dot {
+  opacity: 1;
+  animation: nvs-rec-pulse 1.2s ease-in-out infinite;
+}
+.nvs-twitch-btn .nvs-rec-time {
+  font-size: 1.2rem;
+  font-variant-numeric: tabular-nums;
+  color: #eb0400;
+}
+.nvs-twitch-btn .nvs-rec-time:empty { display: none; }
+
+@keyframes nvs-rec-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+#nvs-twitch-toast {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 2147483647;
+  max-width: 360px;
+  padding: 12px 16px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(20, 20, 20, 0.95);
+  color: #fff;
+  font: 13px/1.4 Inter, Roobert, "Helvetica Neue", Helvetica, Arial, sans-serif;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
+  opacity: 0;
+  transform: translateY(8px);
+  transition: opacity 0.2s, transform 0.2s;
+  pointer-events: none;
+}
+#nvs-twitch-toast.show { opacity: 1; transform: translateY(0); }

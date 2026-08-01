@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="head">
+    <img src="icons/48.png" alt="" width="28" height="28">
+    <div class="titles">
+      <b>Nova Video Saver</b>
+      <span id="current-version">v…</span>
+    </div>
+  </div>
+  <div id="status" class="status">Проверка обновлений…</div>
+  <a id="release-link" class="release-link" target="_blank" rel="noopener noreferrer" hidden>
+    Открыть страницу нового релиза
+  </a>
+  <div class="footer">
+    <button id="recheck" type="button">Проверить обновления</button>
+    <a href="https://t.me/nova_txt" target="_blank" rel="noopener noreferrer">t.me/nova_txt</a>
+  </div>
+  <button id="export-log" class="export-log" type="button">Сохранить журнал диагностики (NVS-debug)</button>
+  <script src="popup.js"></script>
+</body>
+</html>

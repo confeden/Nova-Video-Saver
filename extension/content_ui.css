@@ -8,11 +8,11 @@
   overflow: visible;
 }
 .nova-download-btn:hover { opacity: 1; }
-/* Smooth vector outline with the double-arrow group centered in the player control. */
+/* A square box keeps the brand ring perfectly round inside the control. */
 .nova-download-btn svg {
   position: absolute;
-  width: 44px;
-  height: 32px;
+  width: 27px;
+  height: 27px;
   top: 50%;
   left: 50%;
   display: block;
@@ -20,6 +20,43 @@
   shape-rendering: geometricPrecision;
 }
 .nova-ext { color: #9aa0a6; font-size: 12px; margin-left: 4px; }
+
+/* Circle brand button inside the YouTube Music player bar (left of volume) */
+.nova-music-btn {
+  width: 40px;
+  height: 40px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  align-self: center;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  cursor: pointer;
+  opacity: .85;
+}
+.nova-music-btn:hover { opacity: 1; }
+.nova-music-btn svg {
+  width: 24px;
+  height: 24px;
+  display: block;
+  shape-rendering: geometricPrecision;
+}
+
+/* «Доступно обновление» — bold green with a soft lemon-vanilla glow */
+.nova-brand-head a.nova-update-link {
+  margin-left: 8px;
+  color: #35d477;
+  font-weight: 700;
+  text-shadow:
+    0 0 6px rgba(255, 243, 191, .9),
+    0 0 14px rgba(255, 236, 160, .45);
+}
+.nova-brand-head a.nova-update-link:hover {
+  color: #4ade87;
+  text-decoration: underline;
+}
 
 .nova-menu {
   position: fixed;
@@ -29,6 +66,9 @@
   border-radius: 12px;
   padding: 6px;
   min-width: 240px;
+  max-height: min(72vh, 640px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   box-shadow: 0 8px 28px rgba(0,0,0,.55);
   font-family: "YouTube Sans", Roboto, Arial, sans-serif;
 }
@@ -159,3 +199,185 @@
 #nova-toast .nova-stage.error .nova-stage-bar i { background: var(--nova-progress-color); }
 #nova-toast .nova-stage.done .nova-stage-value,
 #nova-toast .nova-stage.error .nova-stage-value { color: var(--nova-progress-text); }
+#nova-toast .nova-toast-cancel {
+  pointer-events: auto;
+  display: block;
+  width: 100%;
+  margin-top: 10px;
+  padding: 7px 10px;
+  border: 1px solid rgba(255,255,255,.22);
+  border-radius: 8px;
+  background: rgba(255,255,255,.08);
+  color: #ff8a80;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+#nova-toast .nova-toast-cancel:hover { background: rgba(255,110,100,.16); }
+#nova-toast .nova-toast-cancel[hidden] { display: none; }
+
+/* ---- playlist picker ---------------------------------------------------- */
+#nova-playlist-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483647;
+  background: rgba(0,0,0,.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: "YouTube Sans", Roboto, Arial, sans-serif;
+}
+.nova-playlist {
+  width: min(560px, 92vw);
+  max-height: 82vh;
+  display: flex;
+  flex-direction: column;
+  background: rgba(24,24,24,.99);
+  border: 1px solid rgba(255,255,255,.14);
+  border-radius: 14px;
+  padding: 16px;
+  color: #fff;
+  box-shadow: 0 14px 44px rgba(0,0,0,.6);
+}
+.nova-playlist-head { font-size: 16px; font-weight: 600; margin-bottom: 6px; }
+.nova-playlist-note { color: #9aa0a6; font-size: 12px; line-height: 1.35; margin-bottom: 10px; }
+.nova-playlist-format {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+  font-size: 13px;
+}
+.nova-playlist-format select {
+  flex: 1;
+  background: #1f2124;
+  color: #fff;
+  border: 1px solid rgba(255,255,255,.18);
+  border-radius: 8px;
+  padding: 7px 10px;
+  font-size: 13px;
+}
+.nova-playlist-list {
+  flex: 1;
+  overflow-y: auto;
+  border: 1px solid rgba(255,255,255,.1);
+  border-radius: 10px;
+  padding: 4px;
+  margin-bottom: 12px;
+}
+.nova-playlist-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13.5px;
+}
+.nova-playlist-row:hover { background: rgba(255,255,255,.08); }
+.nova-playlist-row input { accent-color: #35d477; width: 15px; height: 15px; flex: 0 0 auto; }
+.nova-playlist-all { margin-bottom: 6px; font-weight: 600; }
+.nova-playlist-idx { color: #9aa0a6; min-width: 22px; text-align: right; flex: 0 0 auto; }
+.nova-playlist-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.nova-playlist-actions { display: flex; gap: 10px; justify-content: flex-end; }
+.nova-btn {
+  border: 1px solid rgba(255,255,255,.2);
+  border-radius: 9px;
+  background: #26282b;
+  color: #fff;
+  padding: 8px 14px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.nova-btn:hover { background: #303338; }
+.nova-btn.primary { background: #35d477; border-color: #35d477; color: #08361d; font-weight: 600; }
+.nova-btn.primary:hover { background: #4ade87; }
+
+/* ---- live recording panel ----------------------------------------------- */
+#nova-live-panel {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 2147483647;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 280px;
+  padding: 13px 16px;
+  background: rgba(20,20,20,.96);
+  border: 1px solid rgba(255,255,255,.14);
+  border-radius: 12px;
+  color: #fff;
+  font-family: "YouTube Sans", Roboto, Arial, sans-serif;
+  font-size: 13px;
+  box-shadow: 0 10px 30px rgba(0,0,0,.55);
+}
+#nova-live-panel .nova-live-head { display: flex; align-items: center; gap: 9px; }
+#nova-live-panel .nova-live-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #ff4e45;
+  animation: nova-live-pulse 1.2s ease-in-out infinite;
+  flex: 0 0 auto;
+}
+#nova-live-panel .nova-live-txt { font-variant-numeric: tabular-nums; }
+#nova-live-panel .nova-live-stop { align-self: stretch; }
+
+@keyframes nova-live-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .35; }
+}
+
+/* ---- playlist queue panel (pill collapses, expands on hover) ------------ */
+#nova-queue {
+  position: fixed;
+  left: 20px;
+  bottom: 20px;
+  z-index: 2147483646;
+  max-width: 380px;
+  background: rgba(20,20,20,.96);
+  border: 1px solid rgba(255,255,255,.12);
+  border-radius: 12px;
+  color: #fff;
+  font-family: "YouTube Sans", Roboto, Arial, sans-serif;
+  font-size: 13px;
+  box-shadow: 0 10px 30px rgba(0,0,0,.55);
+  overflow: hidden;
+}
+#nova-queue .nova-queue-pill {
+  padding: 10px 14px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #78e9a5;
+}
+#nova-queue .nova-queue-body { display: none; padding: 0 10px 10px; }
+#nova-queue:hover .nova-queue-body { display: block; }
+#nova-queue .nova-queue-list {
+  max-height: 44vh;
+  overflow-y: auto;
+  margin-bottom: 8px;
+}
+#nova-queue .nova-queue-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 6px;
+  border-radius: 6px;
+}
+#nova-queue .nova-queue-row .nova-queue-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#nova-queue .nova-queue-ic { min-width: 14px; text-align: center; }
+#nova-queue .nova-queue-idx { color: #9aa0a6; min-width: 20px; text-align: right; }
+#nova-queue .nova-queue-row.done .nova-queue-ic { color: #35d477; }
+#nova-queue .nova-queue-row.error .nova-queue-ic { color: #ff6b6b; }
+#nova-queue .nova-queue-row.active { background: rgba(53,212,119,.12); }
+#nova-queue .nova-queue-row.pending { opacity: .65; }
+#nova-queue .nova-queue-actions { display: flex; justify-content: flex-end; }

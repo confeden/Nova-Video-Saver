@@ -26,7 +26,11 @@ function sendProgress(value, status, percent = value * 100) {
 }
 
 function processingStatus(job) {
-  if (job.format === 'mp3') return 'Кодирование MP3…';
+  if (job.format === 'mp3') {
+    return job.audioFormat === 'original'
+      ? 'Извлечение оригинальной аудиодорожки…'
+      : `Кодирование ${String(job.audioFormat || 'mp3').toUpperCase()}…`;
+  }
   if (job.scaleHeight) return `Масштабирование до ${job.scaleHeight}p…`;
   return job.transcode ? 'Перекодирование в H.264/AAC…' : 'Склейка дорожек…';
 }
@@ -74,6 +78,179 @@ function createFFmpegInstance() {
     progressFromLog(message);
   });
   return instance;
+}
+
+// ---- WebCodecs / Mediabunny hardware transcode ---------------------------
+// Re-encoding VP9→H.264 in wasm x264 runs far below realtime. Mediabunny
+// (MPL-2.0, vendored ESM bundle) drives the OS hardware encoder through
+// WebCodecs instead: typically 3–8x realtime. Any failure falls back to the
+// proven ffmpeg pipeline below.
+let mediabunnyLoad;
+
+function getMediabunny() {
+  if (!mediabunnyLoad) {
+    mediabunnyLoad = import(chrome.runtime.getURL('vendor/mediabunny/mediabunny.min.mjs'))
+      .catch((error) => {
+        mediabunnyLoad = undefined;
+        throw error;
+      });
+  }
+  return mediabunnyLoad;
+}
+
+async function tryWebcodecsTranscode(job, videoBytes, audioBytes) {
+  if (typeof VideoEncoder !== 'function' || typeof VideoDecoder !== 'function') {
+    throw new Error('WebCodecs недоступен в этом браузере');
+  }
+  const {
+    Input, Output, Conversion, ALL_FORMATS, BlobSource, BufferTarget,
+    Mp4OutputFormat, QUALITY_HIGH,
+    getFirstEncodableVideoCodec, getFirstEncodableAudioCodec,
+  } = await getMediabunny();
+
+  const videoCodec = await getFirstEncodableVideoCodec(['avc'], { width: 2560, height: 1440 });
+  if (!videoCodec) throw new Error('кодировщик H.264 недоступен');
+  const audioCodec = await getFirstEncodableAudioCodec(['aac', 'opus']);
+  if (!audioCodec) throw new Error('кодировщик аудио недоступен');
+
+  const videoInput = new Input({ formats: ALL_FORMATS, source: new BlobSource(new Blob([videoBytes])) });
+  const audioInput = new Input({ formats: ALL_FORMATS, source: new BlobSource(new Blob([audioBytes])) });
+  const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+
+  // «Сжатый MP4, почти без потерь»: H.264 needs headroom over the VP9/AV1
+  // source for equal quality, but an uncapped quality preset can triple the
+  // file size. Target ~1.5× the source bitrate, bounded to sane limits.
+  const sourceBitsPerSecond = job.duration > 0 ? (videoBytes.length * 8) / job.duration : 0;
+  const videoBitrate = sourceBitsPerSecond > 0
+    ? Math.round(Math.min(Math.max(sourceBitsPerSecond * 1.5, 700_000), 16_000_000))
+    : QUALITY_HIGH;
+
+  // Composable conversions add their tracks to one shared Output; matching
+  // codecs (already-H.264 video, already-AAC audio) are stream-copied.
+  const videoConversion = await Conversion.init({
+    input: videoInput,
+    output,
+    composable: true,
+    video: { codec: videoCodec, bitrate: videoBitrate },
+    audio: { discard: true },
+  });
+  const audioConversion = await Conversion.init({
+    input: audioInput,
+    output,
+    composable: true,
+    audio: { codec: audioCodec, bitrate: 192e3 },
+    video: { discard: true },
+  });
+  const discarded = [...videoConversion.discardedTracks, ...audioConversion.discardedTracks];
+  if (discarded.length) {
+    throw new Error(`дорожка не поддерживается WebCodecs: ${discarded.map((entry) => entry.reason).join(', ')}`);
+  }
+
+  let lastTick = Date.now();
+  videoConversion.onProgress = (progress) => {
+    lastTick = Date.now();
+    if (!activeJob) return;
+    const value = 0.1 + Math.max(0, Math.min(1, progress)) * 0.85;
+    activeJob.lastProgressAt = lastTick;
+    sendProgress(value, 'Аппаратное перекодирование в H.264/AAC…');
+  };
+
+  let stallTimer;
+  const stallGuard = new Promise((_, reject) => {
+    const check = () => {
+      if (Date.now() - lastTick > 120_000) {
+        reject(new Error('аппаратное перекодирование не показывает прогресс более 120 секунд'));
+        return;
+      }
+      stallTimer = setTimeout(check, 5_000);
+    };
+    stallTimer = setTimeout(check, 5_000);
+  });
+  try {
+    await output.start();
+    await Promise.race([
+      Promise.all([videoConversion.execute(), audioConversion.execute()]),
+      stallGuard,
+    ]);
+    await output.finalize();
+  } catch (error) {
+    await videoConversion.cancel?.().catch(() => {});
+    await audioConversion.cancel?.().catch(() => {});
+    try {
+      if (output.state === 'started' || output.state === 'pending') await output.cancel();
+    } catch (cancelError) {}
+    throw error;
+  } finally {
+    clearTimeout(stallTimer);
+  }
+  const buffer = output.target.buffer;
+  if (!buffer?.byteLength) throw new Error('WebCodecs вернул пустой результат');
+  return new Uint8Array(buffer);
+}
+
+// Stream-copy remux through Mediabunny. ffmpeg's mov demuxer gives up part way
+// through a fragmented MP4 assembled from captured segments (exit code 0, a few
+// seconds of output); Mediabunny parses the fragment index itself and either
+// produces the whole track or fails loudly.
+async function muxVodWithMediabunny(job, videoBytes, audioBytes) {
+  const {
+    Input, Output, Conversion, ALL_FORMATS, BlobSource, BufferTarget, Mp4OutputFormat,
+  } = await getMediabunny();
+  const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+  const videoInput = new Input({ formats: ALL_FORMATS, source: new BlobSource(new Blob([videoBytes])) });
+  const audioInput = new Input({ formats: ALL_FORMATS, source: new BlobSource(new Blob([audioBytes])) });
+  const videoConversion = await Conversion.init({
+    input: videoInput, output, composable: true, audio: { discard: true },
+  });
+  const audioConversion = await Conversion.init({
+    input: audioInput, output, composable: true, video: { discard: true },
+  });
+  const discarded = [...videoConversion.discardedTracks, ...audioConversion.discardedTracks];
+  if (discarded.length) {
+    throw new Error(`дорожка не поддерживается: ${discarded.map((entry) => entry.reason).join(', ')}`);
+  }
+  let lastTick = Date.now();
+  videoConversion.onProgress = (progress) => {
+    lastTick = Date.now();
+    if (!activeJob) return;
+    activeJob.lastProgressAt = lastTick;
+    sendProgress(0.1 + Math.max(0, Math.min(1, progress)) * 0.85, 'Сборка дорожек…');
+  };
+  audioConversion.onProgress = () => { lastTick = Date.now(); };
+  let stallTimer;
+  const stallGuard = new Promise((_, reject) => {
+    const check = () => {
+      if (Date.now() - lastTick > 120_000) {
+        reject(new Error('сборка не показывает прогресс более 120 секунд'));
+        return;
+      }
+      stallTimer = setTimeout(check, 5_000);
+    };
+    stallTimer = setTimeout(check, 5_000);
+  });
+  try {
+    await output.start();
+    await Promise.race([
+      Promise.all([videoConversion.execute(), audioConversion.execute()]),
+      stallGuard,
+    ]);
+    await output.finalize();
+  } catch (error) {
+    await videoConversion.cancel?.().catch(() => {});
+    await audioConversion.cancel?.().catch(() => {});
+    try {
+      if (output.state === 'started' || output.state === 'pending') await output.cancel();
+    } catch (cancelError) {}
+    throw error;
+  } finally {
+    clearTimeout(stallTimer);
+  }
+  const buffer = output.target.buffer;
+  if (!buffer?.byteLength) throw new Error('сборка вернула пустой файл');
+  const bytes = new Uint8Array(buffer);
+  const short = outputDurationMismatch(job, bytes);
+  if (short) throw new Error(short);
+  return bytes;
 }
 
 async function loadSingleThreadFFmpeg() {
@@ -222,6 +399,10 @@ function beginJob(message) {
     filename: message.filename || 'video.mp4',
     transcode: Boolean(message.transcode),
     format: message.format || 'mp4',
+    audioFormat: ['original', 'mp3', 'm4a', 'aac', 'flac', 'wav'].includes(message.audioFormat)
+      ? message.audioFormat : 'mp3',
+    videoId: /^[A-Za-z0-9_-]{6,}$/.test(String(message.videoId || '')) ? String(message.videoId) : '',
+    audioQuality: message.audioQuality === 'best' ? 'best' : 'standard',
     scaleHeight: Number(message.scaleHeight) || 0,
     duration: Number(message.duration) > 0 ? Number(message.duration) : 0,
     audioCaptureRate: Math.min(4, Math.max(1, Number(message.audioCaptureRate) || 1)),
@@ -256,7 +437,7 @@ function abortJob(message) {
   return { ok: true };
 }
 
-function buildRuns(job, videoName, audioName, videoPrefixName) {
+function buildRuns(job, videoName, audioName, videoPrefixName, coverName) {
   const progressOutput = ['-progress', 'pipe:1', '-nostats'];
   const audioInput = ['-i', audioName];
   if (job.format === 'mp3') {
@@ -276,11 +457,72 @@ function buildRuns(job, videoName, audioName, videoPrefixName) {
     if (job.duration > 0) tempoFilters.push(`atrim=duration=${job.duration.toFixed(3)}`);
     const restoreDuration = ['-filter:a', tempoFilters.join(',')];
     const exactDuration = job.duration > 0 ? ['-t', job.duration.toFixed(3)] : [];
-    return [{
-      out: 'out.mp3', type: 'audio/mpeg', extension: '.mp3',
+    const best = job.audioQuality === 'best';
+    const encodeRun = (out, type, extension, codecArgs, extraArgs = []) => ({
+      out, type, extension,
       args: [...progressOutput, ...audioInput, '-vn', ...restoreDuration,
-        ...exactDuration, '-c:a', 'libmp3lame', '-b:a', '192k', '-threads', '0', 'out.mp3'],
-    }];
+        ...exactDuration, ...codecArgs, '-threads', '0', ...extraArgs, out],
+    });
+    // Same encode with the thumbnail attached as the cover picture (ID3 APIC
+    // for MP3, covr atom for M4A). Distinct output name: ffmpeg without -y
+    // must never collide with the coverless twin that follows it.
+    const coverEncodeRun = (out, type, extension, codecArgs, extraArgs = []) => ({
+      out: `cover-${out}`, type, extension,
+      args: [...progressOutput, ...audioInput, '-i', coverName,
+        '-map', '0:a:0', '-map', '1:v:0', ...restoreDuration, ...exactDuration,
+        ...codecArgs, '-c:v', 'copy', '-disposition:v:0', 'attached_pic',
+        '-metadata:s:v', 'title=Album cover', '-metadata:s:v', 'comment=Cover (front)',
+        '-threads', '0', ...extraArgs, `cover-${out}`],
+    });
+    // Cover runs come first with a coverless twin after each: a rejected
+    // thumbnail can never fail the whole job.
+    const pushEncoded = (out, type, extension, codecArgs, extraArgs = []) => {
+      if (coverName) runs.push(coverEncodeRun(out, type, extension, codecArgs, extraArgs));
+      runs.push(encodeRun(out, type, extension, codecArgs, extraArgs));
+    };
+    const runs = [];
+    if (job.audioFormat === 'original' && (job.audioCaptureRate || 1) <= 1.0001) {
+      // Passthrough of the source stream: AAC stays in .m4a, Opus/Vorbis go to
+      // their native Ogg containers. Encoded fallback below covers copy errors.
+      const sourceIsAac = /mp4a|aac/i.test(job.audioMime || '');
+      const sourceIsVorbis = /vorbis/i.test(job.audioMime || '');
+      const copyOut = sourceIsAac ? 'out.m4a' : (sourceIsVorbis ? 'out.ogg' : 'out.opus');
+      const copyType = sourceIsAac ? 'audio/mp4' : 'audio/ogg';
+      if (sourceIsAac && coverName) {
+        // AAC passthrough into M4A supports the cover; Ogg/Opus does not.
+        runs.push({
+          out: 'cover-out.m4a', type: copyType, extension: '.m4a',
+          args: [...progressOutput, ...audioInput, '-i', coverName,
+            '-map', '0:a:0', '-map', '1:v:0', ...exactDuration,
+            '-c:a', 'copy', '-c:v', 'copy', '-disposition:v:0', 'attached_pic',
+            '-metadata:s:v', 'title=Album cover', '-metadata:s:v', 'comment=Cover (front)',
+            '-movflags', '+faststart', 'cover-out.m4a'],
+        });
+      }
+      runs.push({
+        out: copyOut, type: copyType, extension: `.${copyOut.split('.').pop()}`,
+        args: [...progressOutput, ...audioInput, '-vn', ...exactDuration,
+          '-c:a', 'copy', ...(sourceIsAac ? ['-movflags', '+faststart'] : []), copyOut],
+      });
+      pushEncoded('out.m4a', 'audio/mp4', '.m4a',
+        ['-c:a', 'aac', '-b:a', '256k'], ['-movflags', '+faststart']);
+    } else if (job.audioFormat === 'm4a' || (job.audioFormat === 'original')) {
+      pushEncoded('out.m4a', 'audio/mp4', '.m4a',
+        ['-c:a', 'aac', '-b:a', best ? '256k' : '192k'], ['-movflags', '+faststart']);
+    } else if (job.audioFormat === 'aac') {
+      runs.push(encodeRun('out.aac', 'audio/aac', '.aac',
+        ['-c:a', 'aac', '-b:a', best ? '256k' : '192k']));
+    } else if (job.audioFormat === 'flac') {
+      runs.push(encodeRun('out.flac', 'audio/flac', '.flac',
+        ['-c:a', 'flac', '-compression_level', '5']));
+    } else if (job.audioFormat === 'wav') {
+      runs.push(encodeRun('out.wav', 'audio/wav', '.wav', ['-c:a', 'pcm_s16le']));
+    } else {
+      pushEncoded('out.mp3', 'audio/mpeg', '.mp3',
+        ['-c:a', 'libmp3lame', ...(best ? ['-q:a', '0'] : ['-b:a', '192k'])],
+        ['-id3v2_version', '3']);
+    }
+    return runs;
   }
 
   const videoInput = ['-i', videoName];
@@ -333,6 +575,10 @@ function buildRuns(job, videoName, audioName, videoPrefixName) {
     }];
   }
 
+  // A fragmented-MP4 video track muxed with -c copy can stop at the first
+  // fragment boundary ffmpeg dislikes, yielding a short file with exit code 0.
+  // The retries below rebuild timestamps and drop -shortest, so a track the
+  // demuxer ends early no longer truncates the other one.
   return [
     {
       out: 'out.mp4', type: 'video/mp4', extension: '.mp4',
@@ -340,11 +586,78 @@ function buildRuns(job, videoName, audioName, videoPrefixName) {
         '-c', 'copy', '-strict', '-2', '-shortest', '-movflags', '+faststart', 'out.mp4'],
     },
     {
+      out: 'repaired.mp4', type: 'video/mp4', extension: '.mp4',
+      args: [...progressOutput, '-fflags', '+genpts+igndts',
+        ...videoInput, ...audioInput, '-map', '0:v:0', '-map', '1:a:0',
+        '-c', 'copy', '-strict', '-2', '-movflags', '+faststart', 'repaired.mp4'],
+    },
+    {
       out: 'out.webm', type: 'video/webm', extension: '.webm',
       args: [...progressOutput, ...videoInput, ...audioInput, '-map', '0:v:0', '-map', '1:a:0',
         '-c', 'copy', '-shortest', 'out.webm'],
     },
+    {
+      // Last resort: re-encode the video, which never inherits a broken
+      // fragment index. Slow, but it always yields the full length.
+      out: 'reencoded.mp4', type: 'video/mp4', extension: '.mp4',
+      args: [...progressOutput, ...videoInput, ...audioInput, '-map', '0:v:0', '-map', '1:a:0',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20', '-pix_fmt', 'yuv420p',
+        '-threads', '0', '-c:a', 'aac', '-b:a', '160k',
+        '-movflags', '+faststart', 'reencoded.mp4'],
+    },
   ];
+}
+
+// Duration of a finished MP4/WebM, read straight from the container. A stream
+// copy can silently stop at a bad fragment boundary and produce a short file
+// with exit code 0 — that must not reach the user as "готово".
+function containerDurationSeconds(bytes) {
+  try {
+    if (bytes[0] === 0x1a && bytes[1] === 0x45 && bytes[2] === 0xdf && bytes[3] === 0xa3) {
+      return null; // WebM duration lives in a float element; not parsed here
+    }
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const walk = (start, end, depth) => {
+      let offset = start;
+      while (offset + 8 <= end) {
+        let size = view.getUint32(offset);
+        const type = String.fromCharCode(bytes[offset + 4], bytes[offset + 5],
+          bytes[offset + 6], bytes[offset + 7]);
+        let header = 8;
+        if (size === 1) {
+          size = Number(view.getBigUint64(offset + 8));
+          header = 16;
+        }
+        if (size === 0) size = end - offset;
+        if (size < 8) return null;
+        if (type === 'mvhd') {
+          const version = bytes[offset + header];
+          const timescale = version === 1
+            ? view.getUint32(offset + header + 20) : view.getUint32(offset + header + 12);
+          const duration = version === 1
+            ? Number(view.getBigUint64(offset + header + 24)) : view.getUint32(offset + header + 16);
+          return timescale > 0 ? duration / timescale : null;
+        }
+        if (type === 'moov' && depth < 2) {
+          const found = walk(offset + header, offset + size, depth + 1);
+          if (found !== null) return found;
+        }
+        offset += size;
+      }
+      return null;
+    };
+    return walk(0, bytes.length, 0);
+  } catch (error) {
+    return null;
+  }
+}
+
+function outputDurationMismatch(job, bytes) {
+  if (job.format === 'mp3' || !(job.duration > 10)) return '';
+  const actual = containerDurationSeconds(bytes);
+  if (actual === null || !(actual > 0)) return '';
+  if (actual >= job.duration * 0.9) return '';
+  return `собранный файл длится ${actual.toFixed(1)} сек вместо ${job.duration.toFixed(1)} сек`;
 }
 
 function ffmpegIntegrityError(logs) {
@@ -362,7 +675,9 @@ function ffmpegIntegrityError(logs) {
 const MP3_BYTES_PER_SECOND = 192_000 / 8;
 
 function mp3LengthMismatch(job, bytes) {
-  if (job.format !== 'mp3' || !(job.duration > 10) || !bytes?.length) return '';
+  // The probe assumes 192k CBR; VBR and other codecs have no fixed byte rate.
+  if (job.format !== 'mp3' || job.audioFormat !== 'mp3' || job.audioQuality === 'best'
+    || !(job.duration > 10) || !bytes?.length) return '';
   const encodedSeconds = bytes.length / MP3_BYTES_PER_SECOND;
   const tolerance = Math.max(3, job.duration * 0.01);
   if (Math.abs(encodedSeconds - job.duration) <= tolerance) return '';
@@ -395,9 +710,10 @@ async function finalizeJob(message) {
 
     let videoName;
     let videoPrefixName;
+    let videoBytes = null;
     if (job.format !== 'mp3') {
       videoName = `video.${extensionFor(job.videoMime)}`;
-      const videoBytes = concatParts(job.video);
+      videoBytes = concatParts(job.video);
       if (!videoBytes.length) throw new Error('пустые данные видео');
       assertContainerHeader(videoBytes, job.videoMime, 'video');
       inputs.push({ name: videoName, bytes: videoBytes });
@@ -411,12 +727,70 @@ async function finalizeJob(message) {
         files.add(videoPrefixName);
       }
     }
-    await writeInputFiles(instance, inputs);
+
+    // Thumbnail as embedded cover art for audio outputs that support pictures.
+    // Best effort: any failure just means a coverless file.
+    let coverName = null;
+    if (job.format === 'mp3' && job.videoId
+      && ['original', 'mp3', 'm4a'].includes(job.audioFormat)) {
+      sendProgress(0.07, 'Загрузка обложки…');
+      const cover = await chrome.runtime.sendMessage({ t: 'nova-fetch-cover', videoId: job.videoId })
+        .catch(() => null);
+      if (cover?.ok && cover.b64) {
+        try {
+          inputs.push({ name: 'cover.jpg', bytes: decodeBase64(cover.b64) });
+          files.add('cover.jpg');
+          coverName = 'cover.jpg';
+        } catch (error) { coverName = null; }
+      }
+    }
 
     let output;
     let selectedRun;
     let lastError = '';
-    for (const run of buildRuns(job, videoName, audioName, videoPrefixName)) {
+    // Hardware path first: only for plain transcode jobs (no prefix concat,
+    // no downscale — those still need ffmpeg's filter graph).
+    if (job.format !== 'mp3' && job.transcode && !videoPrefixName && !job.scaleHeight && videoBytes) {
+      sendProgress(0.08, 'Запуск аппаратного перекодирования…');
+      try {
+        output = await tryWebcodecsTranscode(job, videoBytes, audioBytes);
+        const shortOutput = outputDurationMismatch(job, output);
+        if (shortOutput) throw new Error(shortOutput);
+        selectedRun = { out: 'webcodecs.mp4', type: 'video/mp4', extension: '.mp4' };
+      } catch (error) {
+        output = undefined;
+        chrome.runtime.sendMessage({
+          t: 'nova-log',
+          tag: 'webcodecs',
+          text: `hardware transcode unavailable, falling back to ffmpeg: ${String(error?.message || error)}`,
+        }).catch(() => {});
+      }
+    }
+
+    // Plain (non-transcoding) mux of a captured video: Mediabunny first. Its
+    // fragment-aware copy avoids the truncated files ffmpeg's stream copy
+    // produces for fMP4 video paired with WebM audio.
+    if (!selectedRun && job.format !== 'mp3' && !job.transcode && !videoPrefixName
+      && !job.scaleHeight && videoBytes) {
+      sendProgress(0.08, 'Сборка дорожек…');
+      try {
+        output = await muxVodWithMediabunny(job, videoBytes, audioBytes);
+        selectedRun = { out: 'mediabunny.mp4', type: 'video/mp4', extension: '.mp4' };
+        chrome.runtime.sendMessage({
+          t: 'nova-log', tag: 'mux',
+          text: `mediabunny copy-remux ok; bytes=${output.length} duration=${(containerDurationSeconds(output) || 0).toFixed(1)}`,
+        }).catch(() => {});
+      } catch (error) {
+        output = undefined;
+        chrome.runtime.sendMessage({
+          t: 'nova-log', tag: 'mux',
+          text: `mediabunny copy-remux unavailable, using ffmpeg: ${String(error?.message || error)}`,
+        }).catch(() => {});
+      }
+    }
+
+    if (!selectedRun) await writeInputFiles(instance, inputs);
+    for (const run of selectedRun ? [] : buildRuns(job, videoName, audioName, videoPrefixName, coverName)) {
       ffmpegLogs.length = 0;
       job.integrityError = '';
       job.lastProgress = 0;
@@ -429,12 +803,17 @@ async function finalizeJob(message) {
       if (exitCode === 0 && !integrityError) {
         const candidate = await instance.readFile(run.out).catch(() => null);
         if (candidate?.length) {
-          lengthError = mp3LengthMismatch(job, candidate);
+          lengthError = mp3LengthMismatch(job, candidate) || outputDurationMismatch(job, candidate);
           if (!lengthError) {
             output = candidate;
             selectedRun = run;
             break;
           }
+          chrome.runtime.sendMessage({
+            t: 'nova-log',
+            tag: 'ffmpeg',
+            text: `run ${run.out} rejected: ${lengthError}`,
+          }).catch(() => {});
         }
       }
       lastError = integrityError || lengthError
@@ -442,9 +821,15 @@ async function finalizeJob(message) {
     }
 
     if (!selectedRun) throw new Error(lastError || 'ffmpeg не собрал файл');
+    chrome.runtime.sendMessage({
+      t: 'nova-log', tag: 'mux',
+      text: `output ready; run=${selectedRun.out} bytes=${output.length}`
+        + ` duration=${(containerDurationSeconds(output) || 0).toFixed(1)} expected=${(job.duration || 0).toFixed(1)}`
+        + ` file=${job.filename}`,
+    }).catch(() => {});
     sendProgress(0.97, 'Подготовка файла к сохранению…', 97);
 
-    const filename = job.filename.replace(/\.(mp4|webm|mp3)$/i, '') + selectedRun.extension;
+    const filename = job.filename.replace(/\.(mp4|webm|mp3|m4a|aac|flac|wav|ogg|opus)$/i, '') + selectedRun.extension;
     const url = URL.createObjectURL(new Blob([output], { type: selectedRun.type }));
     let downloadAccepted = false;
     try {
@@ -479,6 +864,442 @@ async function finalizeJob(message) {
     job.videoPrefix.length = 0;
     job.audio.length = 0;
     if (activeJob === job) activeJob = undefined;
+  }
+}
+
+// ---- live recording jobs -------------------------------------------------
+// Live fragments stream into OPFS as they arrive, so page and offscreen RAM
+// stay flat no matter how long the broadcast runs. Finalize muxes both track
+// files with stream copy; recordings too large for the wasm filesystem are
+// saved as separate video/audio files instead of failing.
+const LIVE_DIR = 'nvs-live';
+const LIVE_MAX_BYTES = 24 * 1024 * 1024 * 1024;
+const LIVE_MUX_LIMIT = 1_400_000_000;
+const LIVE_MEMFS_FALLBACK_LIMIT = 700_000_000;
+const liveJobs = new Map();
+
+async function liveDirectory() {
+  const root = await navigator.storage.getDirectory();
+  return root.getDirectoryHandle(LIVE_DIR, { create: true });
+}
+
+async function cleanupStaleLiveFiles() {
+  try {
+    const dir = await liveDirectory();
+    for await (const name of dir.keys()) {
+      const activeJob = [...liveJobs.values()].some((job) => name.startsWith(job.id));
+      if (!activeJob) await dir.removeEntry(name).catch(() => {});
+    }
+  } catch (error) { /* OPFS unavailable: live begin will report it */ }
+}
+cleanupStaleLiveFiles();
+
+const LIVE_STALE_MS = 10 * 60_000;
+
+async function evictStaleLiveJobs() {
+  for (const [jobId, job] of [...liveJobs]) {
+    if (Date.now() - job.lastActivity <= LIVE_STALE_MS) continue;
+    // The recording tab is gone (closed/crashed) and can never abort its job;
+    // release the slot so future recordings are not blocked until restart.
+    liveJobs.delete(jobId);
+    await closeLiveWriters(job).catch(() => {});
+    await removeLiveFiles(job);
+  }
+}
+
+function beginLiveJob(message) {
+  if (typeof message.jobId !== 'string' || !message.jobId) {
+    return { ok: false, error: 'идентификатор записи отсутствует' };
+  }
+  if (!Number.isInteger(message.tabId)) return { ok: false, error: 'вкладка записи не определена' };
+  if (liveJobs.has(message.jobId)) return { ok: false, error: 'эта запись уже начата' };
+  if (liveJobs.size >= 2) return { ok: false, error: 'слишком много одновременных записей эфира' };
+  liveJobs.set(message.jobId, {
+    id: message.jobId,
+    tabId: message.tabId,
+    startedAt: Date.now(),
+    lastActivity: Date.now(),
+    files: {},
+    writers: {},
+    writeChain: {},
+    mimes: {},
+    bytes: { video: 0, audio: 0 },
+  });
+  getFFmpeg().catch(() => {});
+  return { ok: true };
+}
+
+async function liveWriter(job, track) {
+  if (!job.writers[track]) {
+    const dir = await liveDirectory();
+    job.files[track] = await dir.getFileHandle(`${job.id}-${track}.bin`, { create: true });
+    job.writers[track] = await job.files[track].createWritable();
+  }
+  return job.writers[track];
+}
+
+function appendLiveChunk(message) {
+  const job = liveJobs.get(message.jobId);
+  if (!job) return Promise.resolve({ ok: false, error: 'запись эфира не найдена' });
+  const track = message.track === 'audio' ? 'audio' : 'video';
+  if (message.mime && !job.mimes[track]) job.mimes[track] = String(message.mime);
+  let bytes;
+  try {
+    bytes = decodeBase64(message.b64);
+  } catch (error) {
+    return Promise.resolve({ ok: false, error: `повреждённый фрагмент: ${String(error?.message || error)}` });
+  }
+  if (job.bytes.video + job.bytes.audio + bytes.length > LIVE_MAX_BYTES) {
+    return Promise.resolve({ ok: false, error: 'превышен предельный размер записи (24 ГБ)' });
+  }
+  job.lastActivity = Date.now();
+  // Per-track write chain keeps fragments ordered and gives the sender real
+  // backpressure: the response is sent only after the bytes are on disk.
+  job.writeChain[track] = (job.writeChain[track] || Promise.resolve()).then(async () => {
+    const writer = await liveWriter(job, track);
+    await writer.write(bytes);
+    job.bytes[track] += bytes.length;
+  });
+  return job.writeChain[track]
+    .then(() => ({ ok: true }))
+    .catch((error) => ({ ok: false, error: String(error?.message || error) }));
+}
+
+async function closeLiveWriters(job) {
+  for (const track of Object.keys(job.writers)) {
+    await job.writeChain[track]?.catch(() => {});
+    await job.writers[track].close().catch(() => {});
+  }
+  job.writers = {};
+}
+
+async function removeLiveFiles(job) {
+  try {
+    const dir = await liveDirectory();
+    for (const track of Object.keys(job.files)) {
+      await dir.removeEntry(`${job.id}-${track}.bin`).catch(() => {});
+    }
+  } catch (error) {}
+}
+
+async function abortLiveJob(message) {
+  const job = liveJobs.get(message.jobId);
+  if (!job) return { ok: true };
+  liveJobs.delete(message.jobId);
+  await closeLiveWriters(job).catch(() => {});
+  await removeLiveFiles(job);
+  return { ok: true };
+}
+
+async function saveBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  let accepted = false;
+  try {
+    const response = await chrome.runtime.sendMessage({ t: 'nova-save', url, filename });
+    if (!response?.ok) throw new Error(response?.error || 'не удалось сохранить файл');
+    accepted = true;
+  } finally {
+    if (accepted) setTimeout(() => URL.revokeObjectURL(url), 10 * 60_000);
+    else URL.revokeObjectURL(url);
+  }
+}
+
+function liveContainerExtension(mime) {
+  return /mp4/i.test(mime || '') ? 'mp4' : 'webm';
+}
+
+// Direct progress for live muxing: it does not use the shared ffmpeg activeJob
+// slot, so it reports with its own tab/job ids.
+function sendLiveProgress(job, value, status) {
+  const progress = Math.max(0, Math.min(1, Number(value) || 0));
+  chrome.runtime.sendMessage({
+    t: 'nova-progress',
+    tabId: job.tabId,
+    jobId: job.id,
+    value: progress,
+    percent: progress * 100,
+    ...(status ? { status } : {}),
+  }).catch(() => {});
+}
+
+// Primary live mux: Mediabunny stream-copies both OPFS track files into one
+// container, writing the result straight back to OPFS. No wasm filesystem, no
+// 1.4 GB ceiling, runs at disk speed — the recording ends up in the browser's
+// downloads as a single ordinary file.
+async function muxLiveWithMediabunny(job, tracks, baseName) {
+  const {
+    Input, Output, Conversion, ALL_FORMATS, BlobSource, StreamTarget,
+    Mp4OutputFormat, WebMOutputFormat, MkvOutputFormat,
+  } = await getMediabunny();
+  const videoIsMp4 = /mp4/i.test(job.mimes.video || '');
+  const audioIsMp4 = /mp4/i.test(job.mimes.audio || '');
+  // Matching containers keep their native format; mixed pairs (e.g. VP9 WebM
+  // video + AAC fMP4 audio, common on live) go into MKV, which stream-copies
+  // both codecs instead of forcing a transcode or a discard.
+  let format;
+  let extension;
+  if (videoIsMp4 && audioIsMp4) {
+    format = new Mp4OutputFormat();
+    extension = '.mp4';
+  } else if (!videoIsMp4 && !audioIsMp4) {
+    format = new WebMOutputFormat();
+    extension = '.webm';
+  } else {
+    format = new MkvOutputFormat();
+    extension = '.mkv';
+  }
+  const dir = await liveDirectory();
+  const outHandle = await dir.getFileHandle(`${job.id}-out${extension}`, { create: true });
+  const fsWritable = await outHandle.createWritable();
+  let fsClosed = false;
+  const target = new StreamTarget(new WritableStream({
+    write: (chunk) => fsWritable.write({ type: 'write', position: chunk.position, data: chunk.data }),
+    close: async () => {
+      fsClosed = true;
+      await fsWritable.close();
+    },
+  }), { chunked: true });
+  const output = new Output({ format, target });
+  const videoInput = new Input({ formats: ALL_FORMATS, source: new BlobSource(tracks.video) });
+  const audioInput = new Input({ formats: ALL_FORMATS, source: new BlobSource(tracks.audio) });
+  // No codec forced: compatible tracks are stream-copied; a genuinely
+  // incompatible one would transcode through WebCodecs instead of failing.
+  const videoConversion = await Conversion.init({
+    input: videoInput, output, composable: true, audio: { discard: true },
+  });
+  const audioConversion = await Conversion.init({
+    input: audioInput, output, composable: true, video: { discard: true },
+  });
+  const discarded = [...videoConversion.discardedTracks, ...audioConversion.discardedTracks];
+  if (discarded.length) {
+    throw new Error(`дорожка не поддерживается: ${discarded.map((entry) => entry.reason).join(', ')}`);
+  }
+  let lastTick = Date.now();
+  videoConversion.onProgress = (progress) => {
+    lastTick = Date.now();
+    sendLiveProgress(job, 0.1 + Math.max(0, Math.min(1, progress)) * 0.85, 'Склейка записи эфира…');
+  };
+  audioConversion.onProgress = () => { lastTick = Date.now(); };
+  let stallTimer;
+  const stallGuard = new Promise((_, reject) => {
+    const check = () => {
+      if (Date.now() - lastTick > 180_000) {
+        reject(new Error('склейка записи не показывает прогресс более 180 секунд'));
+        return;
+      }
+      stallTimer = setTimeout(check, 5_000);
+    };
+    stallTimer = setTimeout(check, 5_000);
+  });
+  try {
+    await output.start();
+    await Promise.race([
+      Promise.all([videoConversion.execute(), audioConversion.execute()]),
+      stallGuard,
+    ]);
+    await output.finalize();
+    if (!fsClosed) await fsWritable.close().catch(() => {});
+  } catch (error) {
+    await videoConversion.cancel?.().catch(() => {});
+    await audioConversion.cancel?.().catch(() => {});
+    try {
+      if (output.state === 'started' || output.state === 'pending') await output.cancel();
+    } catch (cancelError) {}
+    if (!fsClosed) await fsWritable.abort?.().catch(() => {});
+    await dir.removeEntry(`${job.id}-out${extension}`).catch(() => {});
+    throw error;
+  } finally {
+    clearTimeout(stallTimer);
+  }
+  const outFile = await outHandle.getFile();
+  const inputBytes = tracks.video.size + tracks.audio.size;
+  // A structurally "successful" mux that copied almost no packets (unreadable
+  // input) must not swallow the recording: fall back to ffmpeg/split files.
+  if (!outFile.size || outFile.size < inputBytes * 0.05) {
+    await dir.removeEntry(`${job.id}-out${extension}`).catch(() => {});
+    throw new Error(`склейка записала подозрительно мало данных (${outFile.size} из ${inputBytes} байт)`);
+  }
+  chrome.runtime.sendMessage({
+    t: 'nova-log',
+    tag: 'live',
+    text: `mediabunny mux ok; out=${extension} bytes=${outFile.size} video=${tracks.video.size} audio=${tracks.audio.size}`,
+  }).catch(() => {});
+  const filename = `${baseName}${extension}`;
+  sendLiveProgress(job, 0.97, 'Подготовка файла к сохранению…');
+  await saveBlob(outFile, filename);
+  sendLiveProgress(job, 1, 'Файл передан браузеру…');
+  return filename;
+}
+
+async function finalizeLiveJob(message) {
+  const job = liveJobs.get(message.jobId);
+  if (!job) throw new Error('запись эфира не найдена');
+  liveJobs.delete(message.jobId);
+  const baseName = String(message.filename || 'live.mp4').replace(/\.(mp4|webm|mp3|m4a|mkv)$/i, '');
+  try {
+    await closeLiveWriters(job);
+    const tracks = {};
+    for (const track of Object.keys(job.files)) {
+      const file = await job.files[track].getFile();
+      if (file.size > 0) tracks[track] = file;
+    }
+    if (!tracks.video && !tracks.audio) throw new Error('запись не содержит медиаданных');
+
+    // Single-track broadcast (or one track never arrived): save it as-is,
+    // with an explicit suffix so an audio-only file is never mistaken for a
+    // broken video.
+    if (!tracks.video || !tracks.audio) {
+      const track = tracks.video ? 'video' : 'audio';
+      const extension = liveContainerExtension(job.mimes[track]);
+      const filename = `${baseName}.${track === 'audio' ? 'audio' : 'video'}.${extension}`;
+      await saveBlob(tracks[track], filename);
+      return { ok: true, filename, singleTrack: track };
+    }
+
+    try {
+      const filename = await muxLiveWithMediabunny(job, tracks, baseName);
+      // The saved download streams from the OPFS output file; the source track
+      // files are no longer needed. The output itself is cleaned next session.
+      await removeLiveFiles(job);
+      return { ok: true, filename };
+    } catch (error) {
+      await chrome.runtime.sendMessage({
+        t: 'nova-log',
+        tag: 'live',
+        text: `mediabunny mux failed, trying ffmpeg: ${String(error?.message || error)}`,
+      }).catch(() => {});
+    }
+
+    const totalBytes = tracks.video.size + tracks.audio.size;
+    if (totalBytes <= LIVE_MUX_LIMIT && !activeJob) {
+      // Claim the shared processing slot synchronously: getFFmpeg() inside
+      // muxLiveTracks can await for seconds and a VOD nova-begin arriving in
+      // that window must not clobber this job (or vice versa).
+      activeJob = {
+        id: job.id,
+        tabId: job.tabId,
+        phase: 'processing',
+        format: 'live',
+        transcode: false,
+        scaleHeight: 0,
+        duration: Number(message.duration) > 0 ? Number(message.duration) : 0,
+        lastProgress: 0,
+        lastProgressAt: Date.now(),
+      };
+      try {
+        const filename = await muxLiveTracks(job, tracks, baseName);
+        await removeLiveFiles(job);
+        return { ok: true, filename };
+      } catch (error) {
+        // Fall through to the split-file path: the recording itself is intact.
+        await chrome.runtime.sendMessage({
+          t: 'nova-log',
+          tag: 'live',
+          text: `mux failed, saving split files: ${String(error?.message || error)}`,
+        }).catch(() => {});
+      }
+    }
+
+    const videoName = `${baseName}.video.${liveContainerExtension(job.mimes.video)}`;
+    const audioName = `${baseName}.audio.${liveContainerExtension(job.mimes.audio)}`;
+    await saveBlob(tracks.video, videoName);
+    await saveBlob(tracks.audio, audioName);
+    // The object URLs above read straight from OPFS-backed files; deleting the
+    // files immediately could break the pending downloads, so cleanup happens
+    // on the next live recording / offscreen start instead.
+    return { ok: true, split: true, filename: videoName };
+  } catch (error) {
+    await removeLiveFiles(job).catch(() => {});
+    error.details = {
+      live: true,
+      bytes: job.bytes,
+      mimes: job.mimes,
+      ffmpegLogs: ffmpegLogs.slice(-10),
+    };
+    throw error;
+  }
+}
+
+async function muxLiveTracks(job, tracks, baseName) {
+  // activeJob is already claimed (synchronously) by finalizeLiveJob.
+  const instance = await getFFmpeg();
+  activeJob.lastProgressAt = Date.now();
+  const files = new Set();
+  let mounted = false;
+  const mountPoint = '/nvs-live-in';
+  try {
+    sendProgress(0.05, 'Подготовка записи эфира…');
+    let videoName;
+    let audioName;
+    try {
+      await instance.createDir(mountPoint);
+      await instance.mount('WORKERFS', { files: [tracks.video, tracks.audio] }, mountPoint);
+      mounted = true;
+      videoName = `${mountPoint}/${tracks.video.name}`;
+      audioName = `${mountPoint}/${tracks.audio.name}`;
+    } catch (mountError) {
+      // WORKERFS unavailable: fall back to MEMFS for recordings that fit.
+      if (tracks.video.size + tracks.audio.size > LIVE_MEMFS_FALLBACK_LIMIT) throw mountError;
+      videoName = 'live-video.bin';
+      audioName = 'live-audio.bin';
+      await instance.writeFile(videoName, new Uint8Array(await tracks.video.arrayBuffer()));
+      await instance.writeFile(audioName, new Uint8Array(await tracks.audio.arrayBuffer()));
+      files.add(videoName);
+      files.add(audioName);
+    }
+    const progressOutput = ['-progress', 'pipe:1', '-nostats'];
+    const runs = [
+      {
+        out: 'live-out.mp4', type: 'video/mp4', extension: '.mp4',
+        args: [...progressOutput, '-i', videoName, '-i', audioName, '-map', '0:v:0', '-map', '1:a:0',
+          '-c', 'copy', '-strict', '-2', '-movflags', '+faststart', 'live-out.mp4'],
+      },
+      {
+        out: 'live-out.webm', type: 'video/webm', extension: '.webm',
+        args: [...progressOutput, '-i', videoName, '-i', audioName, '-map', '0:v:0', '-map', '1:a:0',
+          '-c', 'copy', 'live-out.webm'],
+      },
+      {
+        out: 'live-out.mkv', type: 'video/x-matroska', extension: '.mkv',
+        args: [...progressOutput, '-i', videoName, '-i', audioName, '-map', '0:v:0', '-map', '1:a:0',
+          '-c', 'copy', 'live-out.mkv'],
+      },
+    ];
+    let output;
+    let selectedRun;
+    let lastError = '';
+    for (const run of runs) {
+      ffmpegLogs.length = 0;
+      activeJob.lastProgress = 0;
+      activeJob.lastProgressAt = Date.now();
+      sendProgress(0.1, 'Склейка записи эфира…');
+      files.add(run.out);
+      const exitCode = await execWithProgressWatchdog(instance, run.args, activeJob, SINGLE_THREAD_STALL_MS);
+      if (exitCode === 0) {
+        const candidate = await instance.readFile(run.out).catch(() => null);
+        if (candidate?.length) {
+          output = candidate;
+          selectedRun = run;
+          break;
+        }
+      }
+      lastError = `ffmpeg код ${exitCode}: ${ffmpegLogs.slice(-6).join(' | ')}`;
+    }
+    if (!selectedRun) throw new Error(lastError || 'ffmpeg не собрал запись эфира');
+    sendProgress(0.97, 'Подготовка файла к сохранению…', 97);
+    const filename = `${baseName}${selectedRun.extension}`;
+    await saveBlob(new Blob([output], { type: selectedRun.type }), filename);
+    sendProgress(1, 'Файл передан браузеру…', 100);
+    return filename;
+  } finally {
+    for (const name of files) {
+      try { await instance.deleteFile(name); } catch (error) {}
+    }
+    if (mounted) {
+      try { await instance.unmount(mountPoint); } catch (error) {}
+      try { await instance.deleteDir(mountPoint); } catch (error) {}
+    }
+    activeJob = undefined;
   }
 }
 
@@ -517,6 +1338,22 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
   if (message.t === 'nova-finalize') {
     finalizeJob(message).then(sendResponse).catch(async (error) => sendResponse(await reportError(error)));
+    return true;
+  }
+  if (message.t === 'nova-live-begin') {
+    evictStaleLiveJobs().catch(() => {}).then(() => sendResponse(beginLiveJob(message)));
+    return true;
+  }
+  if (message.t === 'nova-live-chunk') {
+    appendLiveChunk(message).then(sendResponse);
+    return true;
+  }
+  if (message.t === 'nova-live-abort') {
+    abortLiveJob(message).then(sendResponse).catch(() => sendResponse({ ok: true }));
+    return true;
+  }
+  if (message.t === 'nova-live-finalize') {
+    finalizeLiveJob(message).then(sendResponse).catch(async (error) => sendResponse(await reportError(error)));
     return true;
   }
   return false;

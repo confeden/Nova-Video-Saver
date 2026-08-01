@@ -1,0 +1,86 @@
+name: Update Auto-Updater JSON (nvs.json)
+
+# Запускается когда релиз ОПУБЛИКОВАН (нажата кнопка Publish).
+# Требуется секрет UPDATES_TOKEN — PAT с правом записи в confeden/nova_updates
+# (такой же, как в репозиториях Nova и Nova-Android).
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  update-nvs-json:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve release info
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          TAG_NAME="${{ github.event.release.tag_name }}"
+          CLEAN_VERSION="${TAG_NAME#v}"
+          RELEASE_API="https://api.github.com/repos/${{ github.repository }}/releases/tags/${TAG_NAME}"
+          # Ищем zip среди ассетов релиза, имя может меняться между версиями.
+          ASSET_URL=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            "$RELEASE_API" \
+            | python3 -c 'import json,sys; assets=json.load(sys.stdin).get("assets",[]); urls=[a["browser_download_url"] for a in assets if a.get("name","").lower().endswith(".zip") and a.get("browser_download_url")]; print(urls[0]) if urls else sys.exit(1)')
+          echo "VERSION=$CLEAN_VERSION" >> "$GITHUB_ENV"
+          echo "ASSET_URL=$ASSET_URL" >> "$GITHUB_ENV"
+          echo "RELEASE_URL=https://github.com/${{ github.repository }}/releases/tag/${TAG_NAME}" >> "$GITHUB_ENV"
+
+      - name: Download asset (with retry)
+        shell: bash
+        run: |
+          for attempt in 1 2 3 4 5 6; do
+            echo "Попытка $attempt скачать архив..."
+            if wget --timeout=30 -q "${{ env.ASSET_URL }}" -O extension.zip 2>/dev/null; then
+              FILE_SIZE=$(stat -c%s extension.zip 2>/dev/null || echo 0)
+              if [ "$FILE_SIZE" -gt 1000 ]; then
+                echo "Архив скачан (${FILE_SIZE} байт)."
+                exit 0
+              fi
+              rm -f extension.zip
+            fi
+            [ "$attempt" -lt 6 ] && sleep 20
+          done
+          echo "Не удалось скачать архив релиза." >&2
+          exit 1
+
+      - name: Calculate SHA256
+        shell: bash
+        run: |
+          HASH=$(sha256sum extension.zip | awk '{print $1}')
+          echo "SHA256=$HASH" >> "$GITHUB_ENV"
+
+      - name: Checkout updates repo
+        uses: actions/checkout@v4
+        with:
+          repository: confeden/nova_updates
+          token: ${{ secrets.UPDATES_TOKEN }}
+          path: updates_repo
+
+      - name: Update nvs.json and push
+        shell: bash
+        run: |
+          cd updates_repo
+          cat > nvs.json <<EOF
+          {
+            "version": "${{ env.VERSION }}",
+            "url": "${{ env.ASSET_URL }}",
+            "sha256": "${{ env.SHA256 }}",
+            "release_url": "${{ env.RELEASE_URL }}"
+          }
+          EOF
+          git config user.name "Nova Update Bot"
+          git config user.email "bot@nova.app"
+          git add nvs.json
+          if git diff --cached --quiet; then
+            echo "nvs.json не изменился, пропускаем коммит"
+          else
+            git commit -m "Auto-update Nova Video Saver to version ${{ env.VERSION }}"
+            git push
+          fi
