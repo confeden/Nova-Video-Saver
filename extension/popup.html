@@ -9,17 +9,21 @@
     <img src="icons/48.png" alt="" width="28" height="28">
     <div class="titles">
       <b>Nova Video Saver</b>
-      <span id="current-version">v…</span>
+      <span class="subtitle">
+        <span id="current-version">v…</span>
+        <a href="https://t.me/nova_txt" target="_blank" rel="noopener noreferrer">t.me/nova_txt</a>
+      </span>
     </div>
   </div>
   <div id="status" class="status">Проверка обновлений…</div>
-  <a id="release-link" class="release-link" target="_blank" rel="noopener noreferrer" hidden>
-    Открыть страницу нового релиза
+  <a id="release-link" class="release-link" target="_blank" rel="noopener noreferrer">
+    Открыть страницу актуального релиза
   </a>
   <div class="footer">
     <button id="recheck" type="button">Проверить обновления</button>
-    <a href="https://t.me/nova_txt" target="_blank" rel="noopener noreferrer">t.me/nova_txt</a>
   </div>
+  <div id="recovered" class="status update" hidden></div>
+  <button id="save-recovered" class="export-log" type="button" hidden>Сохранить готовый файл</button>
   <button id="export-log" class="export-log" type="button">Сохранить журнал диагностики (NVS-debug)</button>
   <script src="popup.js"></script>
 </body>

@@ -31,7 +31,12 @@ const HANDLED_MESSAGES = new Set([
   'nova-get-reload-download',
   'nova-clear-reload-download',
   'nova-clear-reload-guard',
+  'nova-ping',
+  'nova-flush-recovered',
+  'nova-fetch-media',
 ]);
+const MEDIA_SLICE_LIMIT = 8 * 1024 * 1024;
+const RECOVERY_KEY = 'nova_recovered';
 
 let offscreenCreation;
 let logWrite = Promise.resolve();
@@ -78,6 +83,18 @@ async function ensureOffscreen() {
   await offscreenCreation;
 }
 
+// Finished files the offscreen document could not hand over (see the recovery
+// store there). Flushing needs that document, so it is created on demand.
+async function flushRecoveredFiles() {
+  const stored = await chrome.storage.local.get(RECOVERY_KEY).catch(() => ({}));
+  const entries = Array.isArray(stored[RECOVERY_KEY]) ? stored[RECOVERY_KEY] : [];
+  if (!entries.some((entry) => entry && !entry.savedAt)) return { ok: true, saved: 0, pending: 0 };
+  await ensureOffscreen();
+  const result = await chrome.runtime.sendMessage({ t: 'nova-flush' })
+    .catch((error) => ({ ok: false, error: String(error?.message || error) }));
+  return result || { ok: false, error: 'обработчик медиа не ответил' };
+}
+
 async function saveDownload(url, filename) {
   if (typeof url !== 'string' || !url) throw new Error('download URL is missing');
   if (typeof filename !== 'string' || !filename) throw new Error('download filename is missing');
@@ -94,7 +111,8 @@ function validateCaptionUrl(value) {
 
 async function downloadErrorLog(message, sender) {
   await logWrite.catch(() => {});
-  const stored = await chrome.storage.local.get([LOG_KEY, 'nvs_playlist_queue', UPDATE_STATE_KEY])
+  const stored = await chrome.storage.local
+    .get([LOG_KEY, 'nvs_playlist_queue', UPDATE_STATE_KEY, RECOVERY_KEY])
     .catch(() => ({}));
   const logs = Array.isArray(stored[LOG_KEY]) ? stored[LOG_KEY] : [];
   // Extension state snapshot: without it "silent" misbehaviour (stalled
@@ -103,6 +121,7 @@ async function downloadErrorLog(message, sender) {
   const state = {
     playlistQueue: stored.nvs_playlist_queue || null,
     updateState: stored[UPDATE_STATE_KEY] || null,
+    recovered: stored[RECOVERY_KEY] || null,
     session: sessionState,
   };
   const report = [
@@ -141,9 +160,15 @@ function compareVersions(a, b) {
   return 0;
 }
 
+// Both endpoints are routinely unreachable behind filtering, where a fetch can
+// hang for minutes and keep this worker busy; bound them.
+const UPDATE_FETCH_TIMEOUT_MS = 15_000;
+
 async function fetchLatestVersionInfo() {
   try {
-    const response = await fetch(UPDATE_MANIFEST_URL, { cache: 'no-store' });
+    const response = await fetch(UPDATE_MANIFEST_URL, {
+      cache: 'no-store', signal: AbortSignal.timeout(UPDATE_FETCH_TIMEOUT_MS),
+    });
     if (!response.ok) throw new Error(`nvs.json HTTP ${response.status}`);
     const data = await response.json();
     if (!/^\d+(\.\d+)*$/.test(String(data.version || ''))) throw new Error('nvs.json version is malformed');
@@ -157,6 +182,7 @@ async function fetchLatestVersionInfo() {
     const response = await fetch(UPDATE_FALLBACK_API, {
       cache: 'no-store',
       headers: { Accept: 'application/vnd.github+json' },
+      signal: AbortSignal.timeout(UPDATE_FETCH_TIMEOUT_MS),
     });
     if (!response.ok) throw new Error(`releases API HTTP ${response.status}`);
     const release = await response.json();
@@ -224,10 +250,12 @@ function scheduleUpdateChecks() {
 chrome.runtime.onInstalled.addListener(() => {
   scheduleUpdateChecks();
   checkForUpdates();
+  flushRecoveredFiles().catch(() => {});
 });
 chrome.runtime.onStartup.addListener(() => {
   scheduleUpdateChecks();
   checkForUpdates();
+  flushRecoveredFiles().catch(() => {});
 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === UPDATE_ALARM) checkForUpdates();
@@ -307,9 +335,54 @@ async function handleMessage(message, sender) {
       await ensureOffscreen();
       return { ok: true };
 
+    // Heartbeat from the offscreen document. Receiving it resets this
+    // worker's idle timer, so a long mux can no longer outlive the worker
+    // that has to accept its result.
+    case 'nova-ping':
+      return { ok: true };
+
+    case 'nova-flush-recovered':
+      return flushRecoveredFiles();
+
     case 'nova-save': {
       const id = await saveDownload(message.url, message.filename);
       return { ok: true, id };
+    }
+
+    // Range-fetch a media slice on the page's behalf. googlevideo refuses the
+    // mobile-client URLs when a page asks for them — the request carries the
+    // browser's Origin/Sec-Fetch headers and is bound by CORS. Here there is
+    // neither: the host permission makes this an ordinary extension request,
+    // which is much closer to what the URL was issued for.
+    case 'nova-fetch-media': {
+      const url = new URL(String(message.url || ''));
+      if (url.protocol !== 'https:' || !url.hostname.endsWith('.googlevideo.com')) {
+        throw new Error('media URL is not allowed');
+      }
+      const start = Math.max(0, Number(message.start) || 0);
+      const end = Number(message.end);
+      if (!Number.isFinite(end) || end < start) throw new Error('media range is invalid');
+      if (end - start + 1 > MEDIA_SLICE_LIMIT) throw new Error('media range is too large');
+      // Without a deadline a refused slice can hold the bridge for its full
+      // 30 s timeout, and eight of them at once starve the repair work that
+      // follows the failed direct attempt.
+      const response = await fetch(url.href, {
+        credentials: 'omit',
+        cache: 'no-store',
+        headers: { Range: `bytes=${start}-${end}` },
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!response.ok) {
+        const reason = await response.text().then((text) => text.trim().slice(0, 160)).catch(() => '');
+        return { ok: false, status: response.status, error: reason || `HTTP ${response.status}` };
+      }
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      let binary = '';
+      const step = 0x8000;
+      for (let offset = 0; offset < bytes.length; offset += step) {
+        binary += String.fromCharCode(...bytes.subarray(offset, Math.min(offset + step, bytes.length)));
+      }
+      return { ok: true, status: response.status, b64: btoa(binary) };
     }
 
     case 'nova-fetch-caption': {

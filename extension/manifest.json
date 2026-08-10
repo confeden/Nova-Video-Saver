@@ -1,15 +1,20 @@
 {
   "manifest_version": 3,
   "name": "Nova Video Saver",
-  "version": "1.3",
+  "version": "1.4",
   "description": "Скачивание видео/аудио/субтитров YouTube, запись трансляций YouTube и Twitch — без внешних сервисов",
   "permissions": ["downloads", "offscreen", "storage", "alarms"],
   "host_permissions": [
     "https://www.youtube.com/*",
     "https://music.youtube.com/*",
     "https://i.ytimg.com/*",
+    "https://*.googlevideo.com/*",
     "https://raw.githubusercontent.com/*",
-    "https://api.github.com/*"
+    "https://api.github.com/*",
+    "https://rutube.ru/*",
+    "https://rutube.sport/*",
+    "https://*.rutube.ru/*",
+    "https://*.rtbcdn.ru/*"
   ],
   "background": { "service_worker": "background.js" },
   "action": {
@@ -28,6 +33,14 @@
       "matches": ["https://www.youtube.com/*", "https://music.youtube.com/*"],
       "js": ["content_ui.js"],
       "css": ["content_ui.css"],
+      "run_at": "document_idle",
+      "world": "ISOLATED",
+      "all_frames": false
+    },
+    {
+      "matches": ["https://rutube.ru/*", "https://rutube.sport/*"],
+      "js": ["rutube.js"],
+      "css": ["rutube.css"],
       "run_at": "document_idle",
       "world": "ISOLATED",
       "all_frames": false

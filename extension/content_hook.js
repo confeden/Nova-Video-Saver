@@ -142,6 +142,14 @@
     captureError: null,
     sourceBuffers: { audio: new Set(), video: new Set() },
     observedMediaFormats: { audio: [], video: [] },
+    innertubeFormats: null,
+    innertubeRefusals: 0,
+    innertubeBlockedUntil: 0,
+    mediaViaWorker: false,
+    // Set to 'audio'/'video' while a sequential pass rebuilds that one track.
+    singleTrackPass: null,
+    // True for the whole of a download: capture helpers must not un-silence.
+    silenceHeld: false,
     invalidDirectUrls: new Set(),
     mediaEpochStart: performance.now(),
     completedAudioCache: null,
@@ -180,6 +188,43 @@
     // SourceBuffers and discard only ones already detached from their source.
     liveSourceBuffers('audio', false);
     liveSourceBuffers('video', false);
+  }
+
+  // A capture helper snapshots `muted` when it starts and restores it when it
+  // finishes. That snapshot can predate the download-wide mute, so restoring it
+  // un-silences the tab in the middle of a download — which is why sound kept
+  // returning however hard the top level muted things. While a download holds
+  // the silence, these local restores are ignored.
+  function restoreMediaMuted(media, previousMuted) {
+    try { if (media) media.muted = store.silenceHeld ? true : previousMuted; } catch (e) {}
+  }
+
+  // YouTube's own player re-asserts `muted = false` while it manages playback:
+  // measured at 22 writes in 12 seconds during a capture, all from base.js.
+  // Reacting to `volumechange` is far too late — on a page busy with capture the
+  // event arrives hundreds of milliseconds after the write, and those windows
+  // (up to 867 ms observed) are exactly the sound users hear. So the write is
+  // refused at the property level for as long as a download holds the silence.
+  function installSilenceClamp() {
+    const proto = HTMLMediaElement.prototype;
+    const descriptor = Object.getOwnPropertyDescriptor(proto, 'muted');
+    if (typeof descriptor?.get !== 'function' || typeof descriptor?.set !== 'function') return () => {};
+    try {
+      Object.defineProperty(proto, 'muted', {
+        configurable: true,
+        enumerable: descriptor.enumerable,
+        get() { return descriptor.get.call(this); },
+        set(value) {
+          if (value === false && store.silenceHeld) return;
+          descriptor.set.call(this, value);
+        },
+      });
+    } catch (e) {
+      return () => {};
+    }
+    return () => {
+      try { Object.defineProperty(proto, 'muted', descriptor); } catch (e) {}
+    };
   }
 
   function liveSourceBuffers(kind, currentVideoOnly = true) {
@@ -253,12 +298,15 @@
         ? 'audio' : (/^video\//i.test(mimeType) || VIDEO_ITAG_HEIGHT.has(itag) ? 'video' : null);
       if (!kind) return;
       const durationSeconds = Number(url.searchParams.get('dur')) || Number(video()?.duration) || 0;
-      const sizeMatch = (url.searchParams.get('size') || '').match(/x(\d+)$/i);
+      // Rungs are named by the short edge: a portrait Short's 1080p stream is
+      // 1080x1920, so reading the tall side would label it "1920p".
+      const sizeMatch = (url.searchParams.get('size') || '').match(/^(\d+)x(\d+)$/i);
+      const shortEdge = sizeMatch
+        ? Math.min(Number(sizeMatch[1]), Number(sizeMatch[2]))
+        : Math.min(Number(url.searchParams.get('width')) || Infinity,
+          Number(url.searchParams.get('height')) || Infinity);
       const observedHeight = kind === 'video'
-        ? (VIDEO_ITAG_HEIGHT.get(itag)
-          || Number(url.searchParams.get('height'))
-          || Number(sizeMatch?.[1])
-          || null)
+        ? (VIDEO_ITAG_HEIGHT.get(itag) || (Number.isFinite(shortEdge) ? shortEdge : 0) || null)
         : null;
       const entry = {
         url: withoutTransientMediaParams(url.href),
@@ -420,6 +468,12 @@
               };
             }
           } else {
+            // A sequential pass rewinds and replays the whole video to rebuild
+            // ONE track. The player keeps serving the other one, and those bytes
+            // piled onto an already complete track: a finished 555 MB video grew
+            // to 750 MB during an audio-only pass and tripped the memory ceiling.
+            // The companion is already captured — drop its fragments here.
+            if (store.singleTrackPass && store.singleTrackPass !== kind) return;
             const appendMediaTime = Number(video()?.currentTime);
             if (!store._lastInit[kind] && transport.__novaLastInit) {
               // YouTube commonly reuses one SourceBuffer across SPA videos and
@@ -980,8 +1034,21 @@
         blockTimecodes.push(...webmClusterBlockTimecodes(bytes, cluster.offset, sourceEnd));
       }
       blockTimecodes.sort((left, right) => left - right);
-      const uniqueTimecodes = blockTimecodes.filter((timecode, index) => (
-        index === 0 || timecode - blockTimecodes[index - 1] > 2
+      // Matroska block timecodes are signed relative to their cluster, so a
+      // stray or partially appended block can land before zero. Such a value is
+      // not a hole in the recording: kept in the list it fabricated a
+      // "14274 ms gap" ending at 0, and the repair that followed was handed a
+      // negative start it could only reject — three times, before escalating to
+      // a re-capture that doubled the track and blew the memory ceiling.
+      const negativeBlocks = blockTimecodes.filter((timecode) => timecode < 0).length;
+      const sanitizedTimecodes = negativeBlocks
+        ? blockTimecodes.filter((timecode) => timecode >= 0) : blockTimecodes;
+      if (negativeBlocks) {
+        log('assembly', `webm ${kind}; ignored`, negativeBlocks,
+          'block timecode(s) before zero');
+      }
+      const uniqueTimecodes = sanitizedTimecodes.filter((timecode, index) => (
+        index === 0 || timecode - sanitizedTimecodes[index - 1] > 2
       ));
       const blockDeltas = uniqueTimecodes.slice(1)
         .map((timecode, index) => timecode - uniqueTimecodes[index])
@@ -1112,6 +1179,7 @@
     };
     const normalizedClusters = [];
     let overlapDuplicates = 0;
+    let overlapKeptBoth = 0;
     for (const cluster of sorted) {
       const previous = normalizedClusters[normalizedClusters.length - 1];
       if (previous && cluster.timecode - previous.timecode <= overlapToleranceMs) {
@@ -1119,11 +1187,31 @@
         // YouTube commonly timestamps the same boundary at 20000/20001 ms.
         // Keep the later appended copy and discard the near-identical cluster,
         // otherwise MP3 sample timestamp rebuilding adds a full extra segment.
-        normalizedClusters[normalizedClusters.length - 1] = preferDuplicateCluster(cluster, previous);
-        overlapDuplicates += 1;
+        const kept = preferDuplicateCluster(cluster, previous);
+        const dropped = kept === cluster ? previous : cluster;
+        const keptStats = statsForCluster(kept);
+        const droppedStats = statsForCluster(dropped);
+        // ...but discarding is only safe when the survivor actually contains
+        // the other one. A refilled prefix and the original tail share a
+        // cluster timecode while covering different blocks, and dropping one
+        // wholesale tore a hole at the seam that no later refill could close:
+        // the bytes were never missing from the network, only from our copy.
+        if (keptStats.firstBlock <= droppedStats.firstBlock
+          && keptStats.lastBlock >= droppedStats.lastBlock) {
+          normalizedClusters[normalizedClusters.length - 1] = kept;
+          overlapDuplicates += 1;
+        } else {
+          normalizedClusters[normalizedClusters.length - 1] = previous;
+          normalizedClusters.push(cluster);
+          overlapKeptBoth += 1;
+        }
       } else {
         normalizedClusters.push(cluster);
       }
+    }
+    if (overlapKeptBoth) {
+      log('assembly', `webm ${kind}; kept`, overlapKeptBoth,
+        'overlapping cluster(s) that covered different blocks');
     }
     const reordered = normalizedClusters.length !== clusters.length
       || normalizedClusters.some((cluster, index) => cluster !== clusters[index]);
@@ -1133,12 +1221,42 @@
       'reordered=', reordered);
     if (!reordered) return { bytes, container: 'webm', fragments: clusters.length, reordered: false };
 
+    const prefixEnd = clusters[0].offset;
+    const sourceRange = (cluster) => {
+      const sourceIndex = cluster.originalIndex;
+      return {
+        start: cluster.offset,
+        end: sourceIndex + 1 < clusters.length ? clusters[sourceIndex + 1].offset : bytes.length,
+      };
+    };
+    // When the survivors keep their original order — the usual case, where all
+    // that changed is a dropped overlap duplicate — the result is a subsequence
+    // of the input and can be compacted in place. Every write lands at or
+    // before the byte it reads, so nothing unread is overwritten, and dropping
+    // the tail with a zero-copy transfer keeps peak memory flat. The copying
+    // path below needs a second full buffer, which is why it has a ceiling that
+    // used to refuse a 555 MB track outright.
+    const ranges = normalizedClusters.map(sourceRange);
+    const ascending = ranges.every((range, index) => index === 0 || range.start >= ranges[index - 1].end);
+    if (ascending && bytes.byteOffset === 0 && typeof bytes.buffer.transfer === 'function') {
+      let compactOffset = prefixEnd;
+      for (const range of ranges) {
+        if (compactOffset !== range.start) bytes.copyWithin(compactOffset, range.start, range.end);
+        compactOffset += range.end - range.start;
+      }
+      return {
+        bytes: new Uint8Array(bytes.buffer.transfer(compactOffset)),
+        container: 'webm',
+        fragments: normalizedClusters.length,
+        reordered: true,
+        overlapDuplicates,
+      };
+    }
     if (bytes.length > 400_000_000) {
       const error = new Error(`дорожка ${kind} слишком велика для безопасной перестановки WebM-кластеров`);
       error.novaFatal = true;
       throw error;
     }
-    const prefixEnd = clusters[0].offset;
     const fragments = normalizedClusters.map((cluster) => {
       const sourceIndex = cluster.originalIndex;
       const sourceEnd = sourceIndex + 1 < clusters.length ? clusters[sourceIndex + 1].offset : bytes.length;
@@ -1428,8 +1546,36 @@
   }
 
   // ---- player helpers ------------------------------------------------------
-  function player() { return document.getElementById('movie_player'); }
-  function video() { return document.querySelector('video'); }
+  // A Shorts page carries BOTH players: the real #shorts-player inside the
+  // active reel and a leftover, empty #movie_player whose getPlayerResponse()
+  // returns null and whose duration is 0. Picking the wrong one made every
+  // Shorts lookup silently answer "no video".
+  const SHORTS_PATH = /^\/shorts\/[A-Za-z0-9_-]{6,}/;
+  function isShortsPage() { return SHORTS_PATH.test(location.pathname); }
+  function player() {
+    const reel = document.getElementById('shorts-player');
+    const watch = document.getElementById('movie_player');
+    return isShortsPage() ? (reel || watch) : (watch || reel);
+  }
+  // Scoped to the chosen player: the Shorts feed keeps the neighbouring reels'
+  // <video> elements in the DOM, so the first one in document order is often
+  // not the one being watched.
+  function video() {
+    return player()?.querySelector('video') || document.querySelector('video');
+  }
+
+  // YouTube reports `height` as the long edge, so every rung of a portrait
+  // Short is labelled by a number nobody selected: the 1080p rung is
+  // height 1920. qualityLabel is the authoritative name of the rung (and the
+  // only correct one for oddities such as 608x1080 = "480p").
+  function formatQualityHeight(format) {
+    const labelled = Number.parseInt(String(format?.qualityLabel || ''), 10);
+    if (Number.isFinite(labelled) && labelled > 0) return labelled;
+    const width = Number(format?.width) || 0;
+    const height = Number(format?.height) || 0;
+    if (width > 0 && height > 0) return Math.min(width, height);
+    return height;
+  }
   const QUALITY_BY_HEIGHT = { 2160: 'hd2160', 1440: 'hd1440', 1080: 'hd1080', 720: 'hd720', 480: 'large', 360: 'medium', 240: 'small', 144: 'tiny' };
   const HEIGHT_BY_QUALITY = Object.fromEntries(Object.entries(QUALITY_BY_HEIGHT).map(([height, quality]) => [quality, Number(height)]));
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -1542,6 +1688,9 @@
   let defaultQualityAppliedVideoId = null;
   let manuallySelectedQualityVideoId = null;
   let manualQualityRevision = 0;
+  // What the monitor-based default asked for on this video. Applied once per
+  // video, so it is the only record of the quality the viewer should end up on.
+  let recommendedQuality = { videoId: null, quality: null };
 
   function setQualityRaw(q) {
     const p = player();
@@ -1552,13 +1701,30 @@
     const p = player();
     try { p && p.setPlaybackQuality && p.setPlaybackQuality(q); } catch (e) {}
   }
+  // Quality names ordered worst to best, so a restore can only ever raise.
+  const QUALITY_RANK = ['tiny', 'small', 'medium', 'large', 'hd720', 'hd1080',
+    'hd1440', 'hd2160', 'highres'];
+  const qualityRank = (name) => QUALITY_RANK.indexOf(String(name || ''));
+
   function qualitySnapshot() {
     const p = player();
     let range = null;
     try { range = p?.getPlaybackQualityRange?.() || null; } catch (e) {}
     let quality = null;
     try { quality = p?.getPlaybackQuality?.() || null; } catch (e) {}
-    return { quality, range, videoId: vidId(), manualRevision: manualQualityRevision };
+    // getPlaybackQuality() reports the rendition on screen right now, which is
+    // not the same as what the viewer should get back. Two ways it lies: ABR
+    // can be sitting on a lower rung at this instant, and a previous download
+    // on the same page may have left the player pinned to its own low quality
+    // — the recommendation only runs once per video, so nothing raised it back
+    // and the next download would faithfully restore that leftover.
+    const videoId = vidId();
+    const preferred = recommendedQuality.videoId === videoId
+      && manuallySelectedQualityVideoId !== videoId
+      ? recommendedQuality.quality : null;
+    return {
+      quality, range, preferred, videoId, manualRevision: manualQualityRevision,
+    };
   }
   async function restoreQuality(snapshot) {
     const p = player();
@@ -1570,7 +1736,10 @@
       && snapshot.manualRevision === manualQualityRevision
     );
     if (!snapshotIsCurrent()) return false;
-    const desiredQuality = snapshot.quality;
+    // Raise to the recommended default when the snapshot caught something
+    // lower; never lower, so a deliberately modest choice is left alone.
+    const desiredQuality = qualityRank(snapshot.preferred) > qualityRank(snapshot.quality)
+      ? snapshot.preferred : snapshot.quality;
     const applyOriginalRange = () => {
       if (Array.isArray(snapshot.range) && snapshot.range.length >= 2) {
         p.setPlaybackQualityRange?.(snapshot.range[0], snapshot.range[1]);
@@ -1665,6 +1834,7 @@
       if (quality) {
         // A recommendation only: no quality range is pinned, and a later
         // selection in YouTube's own menu always wins.
+        recommendedQuality = { videoId, quality };
         recommendQuality(quality);
         log('quality', 'default recommendation', selected + 'p', 'monitorShortEdge=', monitorDefaultHeight());
       }
@@ -1860,8 +2030,26 @@
       // another init segment. If there is exactly one transport for this kind,
       // its last init is still the decoder configuration used by that buffer.
       selected = withInit[0];
+    } else if (withInit.length > 1) {
+      // A navigation can leave the previous session's transport registered
+      // beside the live one. Giving up here cost a whole download: with two
+      // buffers per kind and neither tagged for this video, the capture started
+      // with no init at all, every primer observed nothing, and the pass ended
+      // in a page reload. The transport that received bytes most recently is
+      // the live one — but only trust that when the timestamps actually differ.
+      const ranked = withInit
+        .filter((sourceBuffer) => Number(sourceBuffer.__novaLastAppendAt) > 0)
+        .sort((left, right) => right.__novaLastAppendAt - left.__novaLastAppendAt);
+      if (ranked.length === 1
+        || (ranked.length > 1 && ranked[0].__novaLastAppendAt > ranked[1].__novaLastAppendAt)) {
+        selected = ranked[0];
+      }
     }
-    if (!selected) return false;
+    if (!selected) {
+      log('capture', 'no adoptable init; kind=', kind, 'buffers=', buffers.length,
+        'withInit=', withInit.length);
+      return false;
+    }
     const init = selected.__novaLastInit;
     store._lastInit[kind] = {
       bytes: init.bytes,
@@ -1949,6 +2137,228 @@
     return null;
   }
 
+  // ---- InnerTube fallback for direct URLs ---------------------------------
+  // The web player has moved to SABR: streamingData now carries adaptiveFormats
+  // with neither `url` nor `signatureCipher`, just a single
+  // serverAbrStreamingUrl, and every media request is a POST to
+  // /videoplayback?sabr=1 whose query has no itag or mime. Both of Nova's
+  // direct-URL sources — the player response and observed player requests —
+  // therefore find nothing on an ordinary watch page, and each download
+  // degraded to the real-time MSE capture (minutes for a long video).
+  //
+  // The mobile player API still answers with plain, range-fetchable URLs that
+  // carry no throttling `n` parameter and stay valid for hours. The request is
+  // deliberately sent WITHOUT cookies: pairing a mobile client with the
+  // signed-in session is what trips YouTube's bot checks. The cost is that
+  // age-restricted and members-only videos keep falling through to the MSE
+  // capture exactly as they do today.
+  const INNERTUBE_CLIENTS = [
+    { label: 'ios', client: { clientName: 'IOS', clientVersion: '20.10.4', deviceModel: 'iPhone16,2' } },
+    { label: 'ios-tablet', client: { clientName: 'IOS', clientVersion: '20.10.4', deviceModel: 'iPad14,3' } },
+    { label: 'android-vr', client: { clientName: 'ANDROID_VR', clientVersion: '1.62.27', deviceModel: 'Quest 3', androidSdkVersion: 32 } },
+  ];
+  // Never begin a long download on a signature that is about to lapse.
+  const INNERTUBE_SAFETY_MS = 60_000;
+  const INNERTUBE_INFLIGHT_MS = 5 * 60_000;
+  const INNERTUBE_FAILURE_MS = 60_000;
+  // A URL googlevideo refuses is a property of the environment, not of the
+  // video: with a split tunnel (VPN/DPI bypass covering googlevideo.com but
+  // not youtube.com) the signature is issued to one address and presented from
+  // another, and every video in the session will be refused the same way.
+  // Stop paying an API call plus a doomed request for each of them.
+  const INNERTUBE_REFUSAL_LIMIT = 2;
+  const INNERTUBE_COOLDOWN_MS = 30 * 60_000;
+
+  function innertubeApiKey() {
+    try {
+      const key = window.ytcfg?.data_?.INNERTUBE_API_KEY;
+      if (typeof key === 'string' && /^[\w-]{20,}$/.test(key)) return key;
+    } catch (e) {}
+    return '';
+  }
+
+  function normalizeInnertubeFormats(payload, videoId) {
+    if (payload?.videoDetails?.videoId && payload.videoDetails.videoId !== videoId) return [];
+    const source = payload?.streamingData?.adaptiveFormats;
+    if (!Array.isArray(source)) return [];
+    return source
+      .filter((format) => typeof format?.url === 'string'
+        && /^(?:audio|video)\//i.test(format.mimeType || ''))
+      .map((format) => ({
+        url: withoutTransientMediaParams(format.url),
+        itag: String(format.itag || ''),
+        mimeType: format.mimeType || '',
+        contentLength: Number(format.contentLength) || 0,
+        approxDurationMs: Number(format.approxDurationMs) || 0,
+        height: formatQualityHeight(format) || null,
+        bitrate: Number(format.bitrate) || 0,
+        audioQuality: format.audioQuality || '',
+        audioTrack: format.audioTrack || null,
+        isDrc: Boolean(format.isDrc),
+        _novaSource: 'innertube',
+      }))
+      .filter((format) => directUrlIsUsable(format.url));
+  }
+
+  async function requestInnertubeFormats(videoId) {
+    const key = innertubeApiKey();
+    if (!key) throw new Error('ключ InnerTube API недоступен');
+    let lastError = null;
+    for (const candidate of INNERTUBE_CLIENTS) {
+      try {
+        // Deliberately the unhooked fetch: this request is Nova's own and has
+        // no business passing through the page-observation wrapper.
+        const response = await (OrigFetch || fetch)(
+          `${location.origin}/youtubei/v1/player?key=${encodeURIComponent(key)}&prettyPrint=false`,
+          {
+            method: 'POST',
+            credentials: 'omit',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              videoId,
+              context: { client: { hl: 'en', gl: 'US', ...candidate.client } },
+              contentCheckOk: true,
+              racyCheckOk: true,
+            }),
+          },
+        );
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const payload = await response.json();
+        const formats = normalizeInnertubeFormats(payload, videoId);
+        if (!formats.length) {
+          const status = payload?.playabilityStatus?.status || 'без форматов';
+          const reason = payload?.playabilityStatus?.reason || '';
+          throw new Error(reason ? `${status}: ${reason}` : status);
+        }
+        const lifetimeSeconds = Number(payload?.streamingData?.expiresInSeconds) || 0;
+        const heights = [...new Set(formats.filter((format) => format.height)
+          .map((format) => format.height))].sort((left, right) => right - left);
+        log('direct-url', 'innertube formats; client=', candidate.label,
+          'count=', formats.length, 'heights=', heights.join(',') || 'none');
+        return {
+          formats,
+          expiresAt: Date.now()
+            + (lifetimeSeconds > 0 ? lifetimeSeconds * 1000 : 30 * 60_000) - INNERTUBE_SAFETY_MS,
+        };
+      } catch (error) {
+        lastError = error;
+        log('direct-url', 'innertube client', candidate.label, 'failed:',
+          String(error?.message || error));
+      }
+    }
+    throw lastError || new Error('InnerTube не вернул форматы');
+  }
+
+  // One request per video, shared by the video and audio halves of a download
+  // and negatively cached for a minute so a blocked video does not re-ask.
+  function ensureInnertubeFormats(videoId) {
+    const cache = store.innertubeFormats;
+    if (cache && cache.videoId === videoId && cache.expiresAt > Date.now()) {
+      return cache.promise || Promise.resolve(cache.formats);
+    }
+    if (!videoId || Date.now() < store.innertubeBlockedUntil) return Promise.resolve([]);
+    const entry = {
+      videoId, formats: [], expiresAt: Date.now() + INNERTUBE_INFLIGHT_MS, promise: null,
+    };
+    entry.promise = requestInnertubeFormats(videoId)
+      .then((result) => {
+        entry.formats = result.formats;
+        entry.expiresAt = result.expiresAt;
+        return entry.formats;
+      })
+      .catch((error) => {
+        entry.formats = [];
+        entry.expiresAt = Date.now() + INNERTUBE_FAILURE_MS;
+        entry.error = String(error?.message || error);
+        return [];
+      })
+      .finally(() => { entry.promise = null; });
+    store.innertubeFormats = entry;
+    return entry.promise;
+  }
+
+  // Every URL in one InnerTube response is signed the same way, so a refusal of
+  // the first one condemns the rest. Park the set as an empty negative-cache
+  // entry: further candidates resolve to nothing instead of re-asking the API.
+  function dropInnertubeFormats() {
+    const cache = store.innertubeFormats;
+    if (cache) {
+      cache.formats = [];
+      cache.expiresAt = Date.now() + INNERTUBE_FAILURE_MS;
+    }
+    store.innertubeRefusals += 1;
+    log('direct-url', 'innertube formats discarded after a refused signature; refusals=',
+      store.innertubeRefusals);
+    if (store.innertubeRefusals < INNERTUBE_REFUSAL_LIMIT) return;
+    store.innertubeBlockedUntil = Date.now() + INNERTUBE_COOLDOWN_MS;
+    log('direct-url', 'fast direct downloads disabled for',
+      Math.round(INNERTUBE_COOLDOWN_MS / 60_000), 'min: googlevideo refuses the signed URLs.',
+      'Usual cause: a VPN/DPI bypass that routes googlevideo.com differently from youtube.com,',
+      'so the signature is issued to one address and presented from another.');
+  }
+
+  function noteInnertubeSuccess(format) {
+    if (format?._novaSource !== 'innertube' || !store.innertubeRefusals) return;
+    store.innertubeRefusals = 0;
+    store.innertubeBlockedUntil = 0;
+  }
+
+  // fetch() reports a rejected connection as a bare TypeError: no status, no
+  // headers. Told apart from a slow or truncated transfer, it means the request
+  // never reached a server willing to answer it.
+  function isNetworkRefusal(error) {
+    return /failed to fetch|networkerror|load failed|network error/i
+      .test(String(error?.message || error));
+  }
+
+  // The parameters googlevideo signs over. A mismatch between the address that
+  // asked for the URL and the one that fetches it (split tunnel, proxy, DPI
+  // bypass) is the usual reason a perfectly fresh URL answers 403.
+  function directUrlDiagnostics(rawUrl) {
+    try {
+      const params = new URL(rawUrl).searchParams;
+      const expiresIn = Math.round((Number(params.get('expire')) * 1000 - Date.now()) / 1000);
+      return `client=${params.get('c') || '?'} itag=${params.get('itag') || '?'}`
+        + ` signedForIp=${params.get('ip') || '?'} expiresInSec=${Number.isFinite(expiresIn) ? expiresIn : '?'}`
+        + ` hasPot=${params.has('pot')}`;
+    } catch (e) { return 'diagnostics unavailable'; }
+  }
+
+  function innertubeFormatsFor(videoId) {
+    const cache = store.innertubeFormats;
+    if (!cache || cache.videoId !== videoId || !Array.isArray(cache.formats)) return [];
+    return cache.formats.filter((format) => directUrlIsUsable(format.url));
+  }
+
+  function selectInnertubeAudioFormat() {
+    const candidates = innertubeFormatsFor(vidId())
+      .filter((format) => /^audio\//i.test(format.mimeType));
+    if (!candidates.length) return null;
+    const score = (format) => ((format.audioTrack?.audioIsDefault === false ? 0 : 1) * 1e12)
+      + (format.isDrc ? 0 : 1e8) + format.bitrate;
+    return { ...candidates.sort((left, right) => score(right) - score(left))[0] };
+  }
+
+  // Exact height first; among equals prefer H.264, which the muxer stream-copies
+  // into MP4 while AV1 would force a slow re-encode. The mobile ladder is
+  // AV1-only above 1080p and can omit a rung entirely, so an unavailable height
+  // steps down to the closest one below it instead of dropping to a 1x capture.
+  function selectInnertubeVideoFormat(requestedHeight) {
+    const candidates = innertubeFormatsFor(vidId())
+      .filter((format) => /^video\//i.test(format.mimeType) && format.height > 0);
+    if (!candidates.length) return null;
+    const score = (format) => (/avc1|h264/i.test(format.mimeType) ? 1e12 : 0) + format.bitrate;
+    const exact = candidates.filter((format) => format.height === requestedHeight)
+      .sort((left, right) => score(right) - score(left))[0];
+    if (exact) return { ...exact };
+    const lower = candidates.filter((format) => format.height < requestedHeight)
+      .sort((left, right) => (right.height - left.height) || (score(right) - score(left)))[0];
+    if (lower) return { ...lower };
+    const higher = candidates
+      .sort((left, right) => (left.height - right.height) || (score(right) - score(left)))[0];
+    return higher ? { ...higher } : null;
+  }
+
   function selectDirectAudioFormat() {
     const formats = playerResponse()?.streamingData?.adaptiveFormats;
     const audioQuality = { AUDIO_QUALITY_LOW: 1, AUDIO_QUALITY_MEDIUM: 2, AUDIO_QUALITY_HIGH: 3 };
@@ -1973,9 +2383,12 @@
     // only the ones the player itself has already used are signed acceptably.
     const observed = observedDirectAudioFormat();
     if (MUSIC_HOST && observed) return observed;
-    return selected
-      ? { ...selected, url: withoutTransientMediaParams(selected.url), _novaSource: 'player-response' }
-      : observed;
+    if (selected) {
+      return { ...selected, url: withoutTransientMediaParams(selected.url), _novaSource: 'player-response' };
+    }
+    // InnerTube last: on Music an observed URL is Opus, which beats the mobile
+    // ladder's AAC. It only fills the hole SABR left on ordinary watch pages.
+    return observed || selectInnertubeAudioFormat();
   }
 
   function selectDirectVideoFormat(height) {
@@ -1983,7 +2396,7 @@
     const formats = playerResponse()?.streamingData?.adaptiveFormats;
     const selected = (Array.isArray(formats) ? formats : [])
       .filter((format) => /^video\//i.test(format?.mimeType || '')
-        && typeof format.url === 'string' && Number(format.height) === requestedHeight)
+        && typeof format.url === 'string' && formatQualityHeight(format) === requestedHeight)
       .filter((format) => {
         try {
           const url = new URL(format.url);
@@ -2031,7 +2444,7 @@
         };
       } catch (e) {}
     }
-    return null;
+    return selectInnertubeVideoFormat(requestedHeight);
   }
 
   function cacheCompletedAudio(audio, duration) {
@@ -2140,9 +2553,70 @@
     return media;
   }
 
+  // Same range, fetched by the service worker instead of the page. googlevideo
+  // refuses the mobile-client URLs asked for by a document — that request
+  // carries Origin/Sec-Fetch headers and is bound by CORS, and the refusal
+  // arrives either as 403 or as a dropped connection. An extension request has
+  // neither, so it is much closer to what the URL was actually issued for.
+  const WORKER_SLICE_BYTES = 8 * 1024 * 1024;
+
+  async function fetchRangeSliceViaWorker(url, start, end) {
+    const parts = [];
+    for (let offset = start; offset <= end; offset += WORKER_SLICE_BYTES) {
+      // A sibling slice may have retired the URL while this loop was waiting.
+      // Carrying on would keep the bridge busy for another 30-second timeout
+      // each, right when the repair passes need it.
+      if (!directUrlIsUsable(url)) {
+        const retired = new Error('ссылка уже отклонена сервером');
+        retired.novaRetiredUrl = true;
+        throw retired;
+      }
+      const sliceEnd = Math.min(end, offset + WORKER_SLICE_BYTES - 1);
+      const response = await sendToBackground({
+        t: 'nova-fetch-media', url, start: offset, end: sliceEnd,
+      });
+      if (!response?.ok) {
+        const error = new Error(response?.error || 'служебный процесс не получил диапазон');
+        if (Number.isFinite(response?.status)) error.novaHttpStatus = response.status;
+        throw error;
+      }
+      const binary = atob(response.b64);
+      const bytes = new Uint8Array(binary.length);
+      for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+      parts.push(bytes);
+    }
+    if (parts.length === 1) return parts[0];
+    const merged = new Uint8Array(parts.reduce((total, part) => total + part.length, 0));
+    let writeOffset = 0;
+    for (const part of parts) {
+      merged.set(part, writeOffset);
+      writeOffset += part.length;
+    }
+    return merged;
+  }
+
   async function fetchDirectRangeSlice(url, start, end, logTag) {
     const wanted = end - start + 1;
     let lastError = null;
+    // Slices run eight at a time. Once one of them has retired the URL there is
+    // nothing left to learn: without this the siblings each repeated the page
+    // fetch and the worker fetch, turning one refusal into sixteen round trips
+    // and a visibly slow start.
+    if (!directUrlIsUsable(url)) {
+      const retired = new Error('ссылка уже отклонена сервером');
+      retired.novaRetiredUrl = true;
+      throw retired;
+    }
+
+    // Once the worker has served a slice, stay with it: the page fetch will go
+    // on being refused for every remaining slice of the same download.
+    if (store.mediaViaWorker) {
+      const media = await fetchRangeSliceViaWorker(url, start, end);
+      if (media.length < wanted) {
+        throw new Error(`диапазон ${start}-${end}: получено ${media.length} из ${wanted} байт`);
+      }
+      return media.length > wanted ? media.subarray(0, wanted) : media;
+    }
     // A range occasionally comes back empty or as a non-media UMP reply
     // (stream-protection/redirect parts); those are transient.
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -2153,7 +2627,10 @@
           { credentials: 'omit' },
         );
         if (!response.ok) {
-          const error = new Error(`HTTP ${response.status}`);
+          // googlevideo explains a refusal in a short plain-text body; without
+          // it a 403 is indistinguishable from an expired signature.
+          const reason = await response.text().then((text) => text.trim().slice(0, 160)).catch(() => '');
+          const error = new Error(`HTTP ${response.status}${reason ? `: ${reason}` : ''}`);
           error.novaHttpStatus = response.status;
           throw error;
         }
@@ -2167,8 +2644,28 @@
         return media.length > wanted ? media.subarray(0, wanted) : media;
       } catch (error) {
         lastError = error;
-        if (error?.novaHttpStatus === 401 || error?.novaHttpStatus === 403
-          || error?.novaHttpStatus === 410) break;
+        const refused = error?.novaHttpStatus === 401 || error?.novaHttpStatus === 403
+          || error?.novaHttpStatus === 410 || isNetworkRefusal(error);
+        if (!refused) continue;
+        // Before giving the URL up, ask the service worker for the same range.
+        try {
+          const media = await fetchRangeSliceViaWorker(url, start, end);
+          if (media.length >= wanted) {
+            store.mediaViaWorker = true;
+            log(logTag, 'page fetch refused, service worker served the range;',
+              String(error?.message || error));
+            return media.length > wanted ? media.subarray(0, wanted) : media;
+          }
+          lastError = new Error(`диапазон ${start}-${end}: служебный процесс отдал`
+            + ` ${media.length} из ${wanted} байт`);
+        } catch (workerError) {
+          log(logTag, 'service worker could not serve the range either:',
+            String(workerError?.message || workerError));
+          // Both routes refused: retire the URL now so the sibling slices stop
+          // instead of repeating the same two failures each.
+          invalidateDirectUrl(url);
+        }
+        break;
       }
     }
     throw lastError || new Error(`диапазон ${start}-${end} не получен`);
@@ -2209,7 +2706,13 @@
 
   async function fetchDirectAudio(onProgress, suppliedFormat = null, mediaKind = 'audio') {
     const requestedVideoId = vidId();
-    const format = suppliedFormat || selectDirectAudioFormat();
+    let format = suppliedFormat || selectDirectAudioFormat();
+    if (!format && !suppliedFormat) {
+      // Nothing signed is on hand: ask the mobile player API before conceding
+      // the download to the real-time capture.
+      await ensureInnertubeFormats(requestedVideoId);
+      format = selectDirectAudioFormat();
+    }
     if (!format) throw new Error(`YouTube не предоставил прямой URL ${mediaKind === 'video' ? 'видео' : 'аудио'}дорожки`);
 
     const directLogTag = mediaKind === 'video' ? 'direct-video' : 'direct-audio';
@@ -2255,6 +2758,10 @@
               || error?.novaHttpStatus === 403 || error?.novaHttpStatus === 410) throw error;
             log(directLogTag, 'parallel range attempt failed with', maxParts, 'parts:',
               String(error?.message || error));
+            // A connection refused at the network layer (CORS rejection, reset
+            // by a tunnel) is not concurrency pushback: retrying with fewer,
+            // larger slices only repeats it nine more times.
+            if (isNetworkRefusal(error)) break;
           }
         }
         if (!assembled) {
@@ -2265,7 +2772,8 @@
           invalidateDirectUrl(format.url);
           const retired = parallelError || new Error('параллельная загрузка не удалась');
           retired.novaRetiredUrl = true;
-          log(directLogTag, 'direct URL retired (no data); trying another candidate');
+          log(directLogTag, 'direct URL retired (no data);', directUrlDiagnostics(format.url));
+          if (format._novaSource === 'innertube') dropInnertubeFormats();
           throw retired;
         }
         if (vidId() !== requestedVideoId) {
@@ -2274,6 +2782,7 @@
           throw navigationError;
         }
         reportProgress(1);
+        noteInnertubeSuccess(format);
         return {
           bytes: assembled,
           mime: responseMime,
@@ -2285,7 +2794,15 @@
         if (error?.novaFatal || error?.novaRetiredUrl) throw error;
         if (error?.novaHttpStatus === 403 || error?.novaHttpStatus === 401
           || error?.novaHttpStatus === 410) {
+          // The signature is refused, not merely unlucky: the sequential path
+          // would spend four more attempts on the very same URL. Retire it,
+          // record why, and let the caller move on.
           invalidateDirectUrl(format.url);
+          log(directLogTag, 'direct URL refused;', String(error?.message || error),
+            directUrlDiagnostics(format.url));
+          if (format._novaSource === 'innertube') dropInnertubeFormats();
+          error.novaRetiredUrl = true;
+          throw error;
         }
         log(directLogTag, 'parallel range download unavailable; falling back to stream:',
           String(error?.message || error));
@@ -2425,6 +2942,16 @@
 
       if (!lastError) break;
       if (lastError.novaStaleDirectUrl) break;
+      // Not a byte arrived and the connection itself was refused: three more
+      // identical attempts cannot end differently.
+      if (received === attemptStart && isNetworkRefusal(lastError)) {
+        invalidateDirectUrl(format.url);
+        log(directLogTag, 'direct URL refused at the network layer;',
+          directUrlDiagnostics(format.url));
+        if (format._novaSource === 'innertube') dropInnertubeFormats();
+        lastError.novaRetiredUrl = true;
+        break;
+      }
       if (received === attemptStart && attempt + 1 >= maxAttempts) break;
       log(directLogTag, 'resume; attempt=', attempt + 2, 'from=', received,
         'expected=', expectedLength || null, 'reason=', lastError.message);
@@ -2459,6 +2986,7 @@
       offset += part.length;
     }
     reportProgress(1);
+    noteInnertubeSuccess(format);
     log(directLogTag, 'complete; bytes=', received, 'parts=', parts.length);
     return {
       bytes,
@@ -2471,6 +2999,12 @@
 
   async function fetchDirectVideo(height, onProgress) {
     let format = selectDirectVideoFormat(height);
+    if (!format) {
+      // Cheaper and far more reliable than the quality-switch probe below,
+      // which cannot work at all while the player speaks SABR.
+      await ensureInnertubeFormats(vidId());
+      format = selectDirectVideoFormat(height);
+    }
     if (!format) {
       const media = video();
       const previous = {
@@ -2495,7 +3029,7 @@
         if (media) {
           if (previous.paused) media.pause();
           try { media.currentTime = previous.time; } catch (e) {}
-          media.muted = previous.muted;
+          restoreMediaMuted(media, previous.muted);
         }
       }
     }
@@ -2680,7 +3214,7 @@
       try { stream?.getTracks?.().forEach((track) => track.stop()); } catch (e) {}
       try { media.playbackRate = previous.rate; } catch (e) {}
       try { media.loop = previous.loop; } catch (e) {}
-      try { media.muted = previous.muted; } catch (e) {}
+      restoreMediaMuted(media, previous.muted);
       try { if ('preservesPitch' in media) media.preservesPitch = previous.preservesPitch; } catch (e) {}
       try { if ('webkitPreservesPitch' in media) media.webkitPreservesPitch = previous.webkitPreservesPitch; } catch (e) {}
       try { media.currentTime = previous.time; } catch (e) {}
@@ -2708,7 +3242,7 @@
     const restorePreviousMediaState = () => {
       try { media.playbackRate = previous.rate; } catch (e) {}
       try { media.loop = previous.loop; } catch (e) {}
-      try { media.muted = previous.muted; } catch (e) {}
+      restoreMediaMuted(media, previous.muted);
       try { if ('preservesPitch' in media) media.preservesPitch = previous.preservesPitch; } catch (e) {}
       try { if ('webkitPreservesPitch' in media) media.webkitPreservesPitch = previous.webkitPreservesPitch; } catch (e) {}
       try { media.currentTime = previous.time; } catch (e) {}
@@ -3031,9 +3565,24 @@
     const forceFreshVideo = needVideo && Boolean(opts.forceFreshVideo);
     const mp3FillerHeight = Number(opts.mp3FillerHeight) || null;
     const capId = vidId();
-    log('capture', 'start; mp3=', isMp3, 'q=', targetQ, 'ctx=', (location.pathname.indexOf('/embed/') === 0 ? 'embed' : 'page'));
+    log('capture', 'start; mp3=', isMp3, 'q=', targetQ, 'ctx=', (isShortsPage() ? 'shorts'
+      : (location.pathname.indexOf('/embed/') === 0 ? 'embed' : 'page')));
     let v = video();
     if (!v) throw new Error('video element not found');
+    // Where the player stands when capture begins. Without this a track that
+    // starts at 26 s is unexplainable after the fact: it could be the playhead
+    // we started from, a buffer YouTube had already evicted, or a looping
+    // Short that wrapped. Cheap to log, and it decides which of those it was.
+    try {
+      const spans = [];
+      for (let index = 0; index < v.buffered.length; index++) {
+        spans.push(`${v.buffered.start(index).toFixed(1)}-${v.buffered.end(index).toFixed(1)}`);
+      }
+      log('capture', 'player position at start; currentTime=', Number(v.currentTime.toFixed(2)),
+        'duration=', Number((v.duration || 0).toFixed(2)), 'loop=', Boolean(v.loop),
+        'paused=', Boolean(v.paused), 'readyState=', v.readyState,
+        'buffered=', spans.join(',') || 'empty');
+    } catch (e) {}
     let dur = v.duration;
     if (!isFinite(dur) || dur <= 0) {
       await new Promise((res) => {
@@ -3484,7 +4033,18 @@
         else break;
 
         const stalledForMs = now - Math.max(lastAdvanceAt, lastMediaAt);
-        if (!playbackDriven && stalledForMs >= CAPTURE_IDLE_ESCALATION_MS) {
+        // Nothing has arrived at all: the paused-seek pattern is not being
+        // served, and every extra second of primers is pure waiting. Once even
+        // one fragment exists the pattern demonstrably works, so a lull there
+        // keeps the full grace period instead of jumping to playback.
+        // One empty track is enough: in the 09:47 log video had two fragments
+        // while audio had none, so the "both empty" test never fired and the
+        // pass sat through the full twenty seconds before escalating.
+        const nothingCaptured = !(store.tracks.audio?.parts?.length)
+          || (needVideo && !(store.tracks.video?.parts?.length));
+        const escalateAfterMs = nothingCaptured && !MUSIC_HOST
+          ? Math.min(CAPTURE_IDLE_ESCALATION_MS, 5_000) : CAPTURE_IDLE_ESCALATION_MS;
+        if (!playbackDriven && stalledForMs >= escalateAfterMs) {
           if (MUSIC_HOST) {
             // Music buffers often materialize seconds AFTER the bootstrap
             // flush ran, already pre-filled — SABR then serves nothing. Flush
@@ -3516,7 +4076,9 @@
           // reliably restarts segment delivery while capture continues.
           playbackDriven = true;
           deliberatePlaybackDepth += 1;
-          log('capture', 'paused seeks idle for 20s; escalating to muted playback-driven capture; cursor=',
+          log('capture', `paused seeks idle for ${Math.round(stalledForMs / 1000)}s`
+            + ` (threshold ${Math.round(escalateAfterMs / 1000)}s, captured=${nothingCaptured ? 'nothing' : 'partial'});`
+            + ' escalating to muted playback-driven capture; cursor=',
             Number(cursor.toFixed(2)), 'target=', Number(capEnd.toFixed(2)));
           seekTo(Math.max(0, Math.min(cursor, capEnd - 1)));
           try { await playWithTimeout(v, 2_000); } catch (e) {}
@@ -3804,7 +4366,7 @@
       throw new Error(`YouTube не отдал начало ${kind === 'audio' ? 'аудио' : 'видео'}дорожки`);
     } finally {
       store.capturing = previousCapturing;
-      try { media.muted = previous.muted; } catch (e) {}
+      restoreMediaMuted(media, previous.muted);
       try { media.playbackRate = previous.rate; } catch (e) {}
       seekTo(previous.time);
       if (previous.paused) {
@@ -3941,7 +4503,7 @@
       throw new Error(`YouTube не отдал конец ${kind === 'audio' ? 'аудио' : 'видео'}дорожки`);
     } finally {
       store.capturing = previousCapturing;
-      try { media.muted = previous.muted; } catch (e) {}
+      restoreMediaMuted(media, previous.muted);
       try { media.playbackRate = previous.rate; } catch (e) {}
       seekTo(previous.time);
       if (previous.paused) {
@@ -3961,7 +4523,12 @@
     const gapStart = (Number(details?.gapStartMs) || 0) / 1000;
     const gapEnd = (Number(details?.gapEndMs) || 0) / 1000;
     if (!(duration > 0 && gapStart >= 0 && gapEnd > gapStart && gapEnd <= duration + 1)) {
-      throw new Error('неверные границы пропущенного медиасегмента');
+      // Deterministic: the same bounds will be rejected on every retry. Marked
+      // so the caller can stop instead of burning its whole attempt budget.
+      const boundsError = new Error('неверные границы пропущенного медиасегмента'
+        + ` (${details?.gapStartMs} → ${details?.gapEndMs} мс при длительности ${duration.toFixed(1)} с)`);
+      boundsError.novaUnrepairable = true;
+      throw boundsError;
     }
 
     const attempt = Math.max(0, Number(options.attempt) || 0);
@@ -4130,7 +4697,7 @@
     } finally {
       store.capturing = previousCapturing;
       store.gapRefillActive = false;
-      try { media.muted = previous.muted; } catch (e) {}
+      restoreMediaMuted(media, previous.muted);
       try { media.playbackRate = previous.rate; } catch (e) {}
       seekTo(previous.time);
       if (previous.paused) {
@@ -4248,7 +4815,7 @@
     const restoreMediaState = () => {
       try { v.playbackRate = previous.rate; } catch (e) {}
       seekTo(previous.time);
-      try { v.muted = previous.muted; } catch (e) {}
+      restoreMediaMuted(v, previous.muted);
       if (previous.paused) {
         try { v.pause(); } catch (e) {}
       } else {
@@ -4302,6 +4869,9 @@
       }
 
       seekTo(0);
+      // Everything below replays the video for this one track; the companion is
+      // already captured and must not grow while it happens.
+      store.singleTrackPass = kind;
       log('capture', 'sequential MSE track pass; kind=', kind, 'cleared=', cleared,
         'buffers=', selectedBuffers.length, 'target=', capEnd);
 
@@ -4368,7 +4938,9 @@
           // delivery when the paused-seek pattern is being ignored.
           playbackDriven = true;
           deliberatePlaybackDepth += 1;
-          log('capture', 'sequential paused seeks idle for 20s; escalating to muted playback-driven capture; kind=',
+          log('capture', `sequential paused seeks idle for ${Math.round(stalledForMs / 1000)}s`
+            + ` (threshold ${Math.round(CAPTURE_IDLE_ESCALATION_MS / 1000)}s);`
+            + ' escalating to muted playback-driven capture; kind=',
             kind, 'cursor=', Number(cursor.toFixed(2)));
           seekTo(Math.max(0, Math.min(cursor, capEnd - 1)));
           try { await playWithTimeout(v, 2_000); } catch (e) {}
@@ -4402,6 +4974,7 @@
         }
       }
       } finally {
+        store.singleTrackPass = null;
         if (playbackDriven) {
           deliberatePlaybackDepth = Math.max(0, deliberatePlaybackDepth - 1);
           try { v.pause(); } catch (e) {}
@@ -4678,7 +5251,7 @@
           }
           if (behind < 12) {
             caughtUp = true;
-            try { media.muted = previousMuted; } catch (e) {}
+            restoreMediaMuted(media, previousMuted);
             log('live', 'backfill caught up with the live edge; behind=', behind.toFixed(1));
           }
         }
@@ -4731,7 +5304,7 @@
       store.liveSession = null;
       store.capturing = true;
       deliberatePlaybackDepth = Math.max(0, deliberatePlaybackDepth - 1);
-      try { media.muted = previousMuted; } catch (e) {}
+      restoreMediaMuted(media, previousMuted);
       await restoreQuality(qualityBeforeLive).catch(() => {});
     }
   }
@@ -5699,7 +6272,9 @@
         let musicVideoType = '';
         try { musicVideoType = String(playerResponse()?.videoDetails?.musicVideoType || ''); } catch (e) {}
         const resp = { ok: true, videoId: vidId(), title: (p && p.getVideoData && p.getVideoData().title) || document.title.replace(/ - YouTube(?: Music)?$/, ''), duration: dur, heights: availableHeights(), isLive, liveRecording: Boolean(store.liveSession), audioSource: bestAudioSource(), musicVideoType };
-        log('info', JSON.stringify({ ctx: (location.pathname.indexOf('/embed/') === 0 ? 'embed' : 'page'), dur, heights: resp.heights, hasPlayer: !!p, isLive }));
+        const ctx = isShortsPage() ? 'shorts'
+          : (location.pathname.indexOf('/embed/') === 0 ? 'embed' : 'page');
+        log('info', JSON.stringify({ ctx, dur, heights: resp.heights, hasPlayer: !!p, isLive }));
         reply(resp);
       } else if (cmd === 'live-start') {
         const result = await captureLiveStream({ from: from === 'start' ? 'start' : 'now' }, (progress) => {
@@ -5744,11 +6319,63 @@
         const wasPlayingAtStart = !!(mediaAtStart && !mediaAtStart.paused);
         store.playbackHold?.release();
         store.playbackHold = holdPlaybackPaused(mediaAtStart);
+        // A Short loops and sits wherever the viewer left it. Measured on
+        // nu2PED3e2LY: the playhead was at 48 s of a 100 s clip when the
+        // download started, and the capture then began there — everything
+        // before the playhead had to be back-filled afterwards, which is
+        // exactly the prefix repair that keeps failing. Rewind to the start and
+        // stop the wrap for the duration of the download.
+        const loopedAtStart = Boolean(mediaAtStart?.loop);
+        if (mediaAtStart) {
+          if (loopedAtStart) try { mediaAtStart.loop = false; } catch (e) {}
+          if ((Number(mediaAtStart.currentTime) || 0) > 0.5) {
+            try { player()?.seekTo?.(0, true); } catch (e) {}
+            try { mediaAtStart.currentTime = 0; } catch (e) {}
+            log('download', 'rewound looping clip to the start before capture; wasAt=',
+              Number((Number(mediaAtStart.currentTime) || 0).toFixed(2)), 'looped=', loopedAtStart);
+          }
+        }
         // The whole download runs silent: primers and refills really play the
         // media and their sound distracted users. Live recording is exempt on
         // purpose — people want to keep hearing the broadcast.
-        const previousDownloadMuted = mediaAtStart ? mediaAtStart.muted : null;
-        if (mediaAtStart) try { mediaAtStart.muted = true; } catch (e) {}
+        // Muting the element once is not enough: a capture switches quality,
+        // and YouTube reconfigures (or replaces) the media element and reapplies
+        // its own volume state on top of element.muted. Hold the mute for the
+        // whole command — through the player API too, which is the only thing
+        // that reliably silences the tab — and re-assert it while work runs.
+        let playerMutedBefore = null;
+        try {
+          playerMutedBefore = Boolean(player()?.isMuted?.());
+          player()?.mute?.();
+        } catch (e) {}
+        // Polling alone left an audible burst after every seek: YouTube
+        // restores its volume immediately and the next tick was up to half a
+        // second away. `volumechange` fires the moment it happens, so the sound
+        // never reaches the speakers; the timer stays only as a backstop and to
+        // follow the element when the player swaps it.
+        // Every media element on the page, not just video(): a watch page keeps
+        // more than one around (miniplayer, ad slot, the next reel), and the one
+        // the user hears during a seek is not always the one being captured.
+        // Their original state is remembered so only what we silenced is undone.
+        const silenced = new Map();
+        const enforceSilence = () => {
+          try { if (player()?.isMuted?.() === false) player().mute(); } catch (e) {}
+          let elements;
+          try { elements = document.querySelectorAll('video, audio'); } catch (e) { return; }
+          for (const element of elements) {
+            try {
+              if (!silenced.has(element)) {
+                silenced.set(element, element.muted);
+                element.addEventListener('volumechange', enforceSilence);
+              }
+              if (!element.muted) element.muted = true;
+            } catch (e) {}
+          }
+        };
+        store.silenceHeld = true;
+        const releaseSilenceClamp = installSilenceClamp();
+        enforceSilence();
+        const silenceTimer = setInterval(enforceSilence, 250);
         const musicHost = MUSIC_HOST;
         // ytmusic auto-advances to the next queue item when a *playing* track
         // ends, and capture seeks touch the end of the track. Pausing through
@@ -5897,12 +6524,52 @@
               const maxTotalAttempts = 16;
               const maxAttemptsPerGap = 3;
 
+              // Prefix boundaries already attempted, per track. A prefix refill
+              // that stops short leaves a gap ending exactly where the track
+              // used to begin, and that gap is then reported as "interior".
+              const attemptedPrefixEnds = new Map();
+
               for (let totalAttempt = 0; totalAttempt < maxTotalAttempts; totalAttempt++) {
-                const details = validationError?.details;
-                const mode = details?.missingInterior === true
+                let details = validationError?.details;
+                let mode = details?.missingInterior === true
                   ? 'interior'
                   : (details?.missingPrefix === true || Number(details?.firstTimecode) > 5_000
                     ? 'prefix' : (details?.missingTail === true ? 'tail' : null));
+                // Two runs of the same video showed it exactly: the track began
+                // at 20001 ms, the prefix refill reached 19361, and the leftover
+                // 640 ms came back as an interior gap ending at 20001; next run,
+                // 10001 / 6681 / gap ending at 10001. The interior refill cannot
+                // fetch that region — three attempts, twenty seconds each, every
+                // time — while the prefix refill demonstrably delivers most of
+                // it. Send it back to the mechanism that works, under the same
+                // attempt key so it still cannot loop forever.
+                // ...but only while the track still lacks its *beginning*. On a
+                // Shorts capture the first refill brought back 0-19981 ms and
+                // left 19981-40001 missing: that gap no longer touches zero, so
+                // re-running the prefix removed nothing and fetched nothing
+                // three times over, where the interior refill at least aims at
+                // the hole itself.
+                if (mode === 'interior' && details && Number(details.gapStartMs) <= 2_000) {
+                  const gapEnd = Math.round(Number(details.gapEndMs) || 0);
+                  if (gapEnd > 0 && attemptedPrefixEnds.get(details.kind)?.has(gapEnd)) {
+                    log('assembly', `webm ${details.kind}; interior gap ends at the former track`
+                      + ` start (${gapEnd} ms) — continuing the prefix refill instead`);
+                    mode = 'prefix';
+                    details = {
+                      ...details,
+                      missingInterior: false,
+                      missingPrefix: true,
+                      firstTimecode: gapEnd,
+                    };
+                  }
+                }
+                if (mode === 'prefix' && details?.kind) {
+                  const boundary = Math.round(Number(details.firstTimecode) || 0);
+                  if (boundary > 0) {
+                    if (!attemptedPrefixEnds.has(details.kind)) attemptedPrefixEnds.set(details.kind, new Set());
+                    attemptedPrefixEnds.get(details.kind).add(boundary);
+                  }
+                }
                 if (details?.container !== 'webm'
                   || (details?.kind !== 'audio' && details?.kind !== 'video')
                   || !mode) {
@@ -6025,14 +6692,21 @@
                 || new Error('локальная докачка WebM не восстановила дорожку');
               const exhaustedDetails = {
                 ...(validationError?.details || {}),
-                reloadRequired: false,
                 reason: 'local-webm-repair-exhausted',
                 repairAttempts: Object.fromEntries(attemptsByGap),
               };
               // A video-only interior hole is still recoverable by the sequential
               // and rendered capture paths, so it must not end the download here.
-              error.novaFatal = !(exhaustedDetails.kind === 'video'
+              const fatal = !(exhaustedDetails.kind === 'video'
                 && exhaustedDetails.missingInterior === true);
+              // For audio there is no path left after the local refills, and
+              // giving up threw away a finished capture over a few seconds of
+              // sound: measured 85 s of failing retries and then nothing.
+              // A reload hands the capture a clean MSE session, which is what
+              // actually closes these holes — the same thing that fixed Shorts.
+              // content_ui bounds this to two reloads and then reports honestly.
+              exhaustedDetails.reloadRequired = fatal;
+              error.novaFatal = fatal;
               error.details = exhaustedDetails;
               throw error;
             };
@@ -6290,10 +6964,20 @@
           store.musicSeekClamp = false;
           store.playbackHold?.release();
           store.playbackHold = null;
-          if (mediaAtStart && previousDownloadMuted !== null && vidId() === videoIdAtStart) {
-            try { mediaAtStart.muted = previousDownloadMuted; } catch (e) {}
+          store.silenceHeld = false;
+          releaseSilenceClamp();
+          if (loopedAtStart && mediaAtStart && vidId() === videoIdAtStart) {
+            try { mediaAtStart.loop = true; } catch (e) {}
           }
-          if (musicHost && musicAppMuted === false) {
+          clearInterval(silenceTimer);
+          for (const [element, wasMuted] of silenced) {
+            try {
+              element.removeEventListener('volumechange', enforceSilence);
+              if (!wasMuted && vidId() === videoIdAtStart) element.muted = false;
+            } catch (e) {}
+          }
+          silenced.clear();
+          if ((musicHost ? musicAppMuted : playerMutedBefore) === false) {
             try { player()?.unMute?.(); } catch (e) {}
           }
           // Give the user back exactly the play state they had.

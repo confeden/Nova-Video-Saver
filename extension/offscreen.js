@@ -12,17 +12,81 @@ const ffmpegMode = 'single-thread';
 let activeJob;
 const ffmpegLogs = [];
 
+// ---- service worker messaging -------------------------------------------
+// This document keeps working for minutes at a time while the MV3 service
+// worker may be idle-terminated or already shutting down. A message that
+// lands in that window fails with "Could not establish connection. Receiving
+// end does not exist." even though the worker restarts moments later — that
+// race silently threw away finished downloads. Every call therefore retries,
+// and a heartbeat keeps the worker awake for as long as a job is running.
+const WORKER_RETRY_DELAYS = [150, 400, 1_000, 2_000, 4_000, 6_000, 8_000, 8_000];
+const KEEPALIVE_INTERVAL_MS = 20_000;
+let keepAliveTimer;
+
+const wait = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+
+function isWorkerAsleep(error) {
+  return /could not establish connection|receiving end does not exist|message port closed/i
+    .test(String(error?.message || error));
+}
+
+async function sendToWorker(message, { retries = 0 } = {}) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await chrome.runtime.sendMessage(message);
+    } catch (error) {
+      if (attempt >= retries || !isWorkerAsleep(error)) throw error;
+      await wait(WORKER_RETRY_DELAYS[Math.min(attempt, WORKER_RETRY_DELAYS.length - 1)]);
+    }
+  }
+}
+
+// Diagnostics and progress: never allowed to fail a job, but a single retry
+// keeps the journal readable — a lost log line is exactly what hides the real
+// cause in an error report.
+function notifyWorker(message, retries = 1) {
+  return sendToWorker(message, { retries }).catch(() => null);
+}
+
+function logToWorker(tag, text) {
+  return notifyWorker({ t: 'nova-log', tag, text });
+}
+
+let busyFinalizers = 0;
+
+function jobsActive() {
+  return Boolean(activeJob) || liveJobs.size > 0 || busyFinalizers > 0;
+}
+
+function updateKeepAlive() {
+  if (jobsActive()) {
+    if (keepAliveTimer) return;
+    notifyWorker({ t: 'nova-ping' }, 0);
+    keepAliveTimer = setInterval(() => {
+      if (!jobsActive()) {
+        clearInterval(keepAliveTimer);
+        keepAliveTimer = undefined;
+        return;
+      }
+      notifyWorker({ t: 'nova-ping' }, 0);
+    }, KEEPALIVE_INTERVAL_MS);
+  } else if (keepAliveTimer) {
+    clearInterval(keepAliveTimer);
+    keepAliveTimer = undefined;
+  }
+}
+
 function sendProgress(value, status, percent = value * 100) {
   if (!activeJob) return;
   const progress = Number.isFinite(value) ? value : 0;
-  chrome.runtime.sendMessage({
+  notifyWorker({
     t: 'nova-progress',
     tabId: activeJob.tabId,
     jobId: activeJob.id,
     value: Math.max(0, Math.min(1, progress)),
     percent: Math.max(0, Math.min(100, Number(percent) || 0)),
     ...(status ? { status } : {}),
-  }).catch(() => {});
+  }, 0);
 }
 
 function processingStatus(job) {
@@ -330,7 +394,30 @@ function extensionFor(mime) {
   return 'bin';
 }
 
+// A track the assembler had to resync and rebuild keeps a valid ftyp and moov,
+// but the bytes between them can hold a partially captured box whose size field
+// stops a strict chain walk dead. Look for the box header directly in that case:
+// a plausible size in front of the type is enough to tell a real header from the
+// four ASCII bytes appearing inside media data.
+function scanForMp4Box(bytes, expected, limit) {
+  const end = Math.min(bytes.length - 8, limit);
+  const [a, b, c, d] = [...expected].map((character) => character.charCodeAt(0));
+  for (let offset = 4; offset <= end; offset += 4) {
+    if (bytes[offset + 4] !== a || bytes[offset + 5] !== b
+      || bytes[offset + 6] !== c || bytes[offset + 7] !== d) continue;
+    const size = (bytes[offset] * 0x1000000) + (bytes[offset + 1] << 16)
+      + (bytes[offset + 2] << 8) + bytes[offset + 3];
+    if (size >= 8 && size <= bytes.length - offset) return true;
+  }
+  return false;
+}
+
 function hasMp4Box(bytes, expected) {
+  if (scanForMp4BoxChain(bytes, expected)) return true;
+  return scanForMp4Box(bytes, expected, 16 * 1024 * 1024);
+}
+
+function scanForMp4BoxChain(bytes, expected) {
   for (let offset = 0; offset + 8 <= bytes.length;) {
     const size = (bytes[offset] * 0x1000000)
       + (bytes[offset + 1] << 16)
@@ -398,6 +485,10 @@ function beginJob(message) {
     audioMime: message.audioMime || '',
     filename: message.filename || 'video.mp4',
     transcode: Boolean(message.transcode),
+    // One already-muxed stream instead of separate tracks: HLS sites hand over
+    // MPEG-TS with audio and video interleaved. It arrives on the video track
+    // and there is no companion audio to wait for.
+    muxed: Boolean(message.muxed),
     format: message.format || 'mp4',
     audioFormat: ['original', 'mp3', 'm4a', 'aac', 'flac', 'wav'].includes(message.audioFormat)
       ? message.audioFormat : 'mp3',
@@ -408,7 +499,12 @@ function beginJob(message) {
     audioCaptureRate: Math.min(4, Math.max(1, Number(message.audioCaptureRate) || 1)),
     lastProgress: 0,
     lastProgressAt: 0,
+    stage: 'receiving',
   };
+  // Diagnostics must describe this job only: the tail of a previous run's
+  // ffmpeg output otherwise ends up in this job's error report.
+  ffmpegLogs.length = 0;
+  updateKeepAlive();
   getFFmpeg().catch(() => {}); // warm up while chunks arrive
   return { ok: true };
 }
@@ -433,12 +529,30 @@ function abortJob(message) {
     activeJob.videoPrefix.length = 0;
     activeJob.audio.length = 0;
     activeJob = undefined;
+    updateKeepAlive();
   }
   return { ok: true };
 }
 
 function buildRuns(job, videoName, audioName, videoPrefixName, coverName) {
   const progressOutput = ['-progress', 'pipe:1', '-nostats'];
+  // Already-muxed input (HLS MPEG-TS): both tracks are in one file and are
+  // H.264/AAC, so the whole job is a stream copy into MP4. The retry rebuilds
+  // timestamps, which a playlist assembled from separate segments can need.
+  if (job.muxed) {
+    return [
+      {
+        out: 'out.mp4', type: 'video/mp4', extension: '.mp4',
+        args: [...progressOutput, '-i', videoName, '-c', 'copy',
+          '-movflags', '+faststart', 'out.mp4'],
+      },
+      {
+        out: 'repaired.mp4', type: 'video/mp4', extension: '.mp4',
+        args: [...progressOutput, '-fflags', '+genpts+igndts', '-i', videoName,
+          '-c', 'copy', '-movflags', '+faststart', 'repaired.mp4'],
+      },
+    ];
+  }
   const audioInput = ['-i', audioName];
   if (job.format === 'mp3') {
     const tempoFilters = [];
@@ -611,10 +725,107 @@ function buildRuns(job, videoName, audioName, videoPrefixName, coverName) {
 // Duration of a finished MP4/WebM, read straight from the container. A stream
 // copy can silently stop at a bad fragment boundary and produce a short file
 // with exit code 0 — that must not reach the user as "готово".
+// EBML numbers are variable width: the leading zero bits of the first byte give
+// the total length. IDs keep their marker bit so they compare against the
+// spec's constants; sizes have it stripped.
+function readEbmlNumber(bytes, offset, stripMarker) {
+  const first = bytes[offset];
+  if (first === undefined || first === 0) return null;
+  let length = 1;
+  let mask = 0x80;
+  while (length <= 8 && !(first & mask)) {
+    mask >>= 1;
+    length += 1;
+  }
+  if (length > 8 || offset + length > bytes.length) return null;
+  let value = stripMarker ? (first & (mask - 1)) : first;
+  for (let index = 1; index < length; index++) value = (value * 256) + bytes[offset + index];
+  return { value, length };
+}
+
+// Matroska keeps the playable length in Segment > Info > Duration, expressed in
+// TimecodeScale units. A captured stream often declares Segment with unknown
+// size, which simply means "to the end of the file".
+function webmDurationSeconds(bytes) {
+  const SEGMENT = 0x18538067;
+  const INFO = 0x1549a966;
+  const TIMECODE_SCALE = 0x2ad7b1;
+  const DURATION = 0x4489;
+  let scale = 1_000_000;
+  let duration = null;
+
+  const walk = (start, end, depth) => {
+    let offset = start;
+    while (offset < end && duration === null) {
+      const id = readEbmlNumber(bytes, offset, false);
+      if (!id) return;
+      const size = readEbmlNumber(bytes, offset + id.length, true);
+      if (!size) return;
+      const contentStart = offset + id.length + size.length;
+      const contentEnd = Math.min(end, contentStart + size.value);
+      if (contentEnd <= offset) return;
+      if (id.value === SEGMENT || id.value === INFO) {
+        if (depth >= 3) return;
+        walk(contentStart, contentEnd, depth + 1);
+      } else if (id.value === TIMECODE_SCALE) {
+        let raw = 0;
+        for (let index = contentStart; index < contentEnd; index++) raw = (raw * 256) + bytes[index];
+        if (raw > 0) scale = raw;
+      } else if (id.value === DURATION) {
+        const view = new DataView(bytes.buffer, bytes.byteOffset + contentStart, contentEnd - contentStart);
+        if (size.value === 4) duration = view.getFloat32(0);
+        else if (size.value === 8) duration = view.getFloat64(0);
+      }
+      offset = contentEnd;
+    }
+  };
+
+  walk(0, bytes.length, 0);
+  return duration > 0 ? (duration * scale) / 1e9 : null;
+}
+
+function findBytes(haystack, needle, from, limit) {
+  const end = Math.min(haystack.length - needle.length, limit);
+  for (let index = from; index <= end; index++) {
+    let matched = true;
+    for (let offset = 0; offset < needle.length; offset++) {
+      if (haystack[index + offset] !== needle[offset]) { matched = false; break; }
+    }
+    if (matched) return index;
+  }
+  return -1;
+}
+
+// Ogg carries the length only as the granule position of the final page. Opus
+// counts granules at 48 kHz regardless of the source rate, and the ID header's
+// pre-skip is decoder priming rather than playable audio.
+function oggDurationSeconds(bytes) {
+  const CAPTURE = [0x4f, 0x67, 0x67, 0x53]; // "OggS"
+  const opusHead = findBytes(bytes, [0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64], 0, 65_536);
+  if (opusHead < 0 || opusHead + 12 > bytes.length) return null; // Vorbis: rate not read here
+  const preSkip = bytes[opusHead + 10] + (bytes[opusHead + 11] * 256);
+  let pageStart = -1;
+  for (let index = bytes.length - 4; index >= 0; index--) {
+    if (bytes[index] === CAPTURE[0] && bytes[index + 1] === CAPTURE[1]
+      && bytes[index + 2] === CAPTURE[2] && bytes[index + 3] === CAPTURE[3]) {
+      pageStart = index;
+      break;
+    }
+  }
+  if (pageStart < 0 || pageStart + 14 > bytes.length) return null;
+  let granule = 0;
+  for (let index = 7; index >= 0; index--) granule = (granule * 256) + bytes[pageStart + 6 + index];
+  const samples = granule - preSkip;
+  return samples > 0 ? samples / 48_000 : null;
+}
+
 function containerDurationSeconds(bytes) {
   try {
     if (bytes[0] === 0x1a && bytes[1] === 0x45 && bytes[2] === 0xdf && bytes[3] === 0xa3) {
-      return null; // WebM duration lives in a float element; not parsed here
+      return webmDurationSeconds(bytes);
+    }
+    if (bytes[0] === 0x4f && bytes[1] === 0x67 && bytes[2] === 0x67 && bytes[3] === 0x53) {
+      return oggDurationSeconds(bytes);
     }
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     const walk = (start, end, depth) => {
@@ -685,6 +896,141 @@ function mp3LengthMismatch(job, bytes) {
     + ' — часть аудиодорожки не была захвачена';
 }
 
+// ---- recovery store ------------------------------------------------------
+// A finished file must never be lost because the browser end of the pipe was
+// momentarily unavailable. When chrome.downloads cannot be reached, the
+// output is parked in OPFS and handed over on the next flush — automatic at
+// the start of every session, or on demand from the popup.
+const RECOVERY_DIR = 'nvs-recovered';
+const RECOVERY_KEY = 'nova_recovered';
+const RECOVERY_KEEP_MS = 10 * 60_000;
+const RECOVERY_MAX_AGE_MS = 7 * 24 * 60 * 60_000;
+const RECOVERY_MAX_BYTES = 4 * 1024 * 1024 * 1024;
+
+async function recoveryDirectory() {
+  const root = await navigator.storage.getDirectory();
+  return root.getDirectoryHandle(RECOVERY_DIR, { create: true });
+}
+
+async function readRecoveryIndex() {
+  const stored = await chrome.storage.local.get(RECOVERY_KEY).catch(() => ({}));
+  return Array.isArray(stored[RECOVERY_KEY]) ? stored[RECOVERY_KEY] : [];
+}
+
+async function writeRecoveryIndex(entries) {
+  await chrome.storage.local.set({ [RECOVERY_KEY]: entries }).catch(() => {});
+}
+
+async function stashForRecovery(blob, filename) {
+  const dir = await recoveryDirectory();
+  const id = `${Date.now()}-${Math.round(Math.random() * 1e9).toString(36)}.bin`;
+  const handle = await dir.getFileHandle(id, { create: true });
+  const writable = await handle.createWritable();
+  try {
+    await writable.write(blob);
+    await writable.close();
+  } catch (error) {
+    await writable.abort?.().catch(() => {});
+    await dir.removeEntry(id).catch(() => {});
+    throw error;
+  }
+  const entries = await readRecoveryIndex();
+  entries.push({
+    id, filename, type: blob.type || '', bytes: blob.size, createdAt: Date.now(), savedAt: 0,
+  });
+  await writeRecoveryIndex(entries);
+  logToWorker('recovery', `parked finished file for later saving; file=${filename} bytes=${blob.size}`);
+  return id;
+}
+
+// Hands every parked file to chrome.downloads and prunes what is already
+// gone. Entries handed over stay listed for RECOVERY_KEEP_MS: chrome.downloads
+// reads the object URL asynchronously, so deleting the OPFS file immediately
+// would break the download it just accepted.
+let recoveryFlush = Promise.resolve();
+
+// Creating this document starts a flush on its own, and the worker asks for
+// one right after: overlapping passes would read the same index and hand the
+// same file to chrome.downloads twice.
+function flushRecoveredFiles() {
+  recoveryFlush = recoveryFlush.catch(() => {}).then(() => runRecoveryFlush());
+  return recoveryFlush;
+}
+
+async function runRecoveryFlush() {
+  const entries = await readRecoveryIndex();
+  if (!entries.length) return { ok: true, saved: 0, pending: 0 };
+  let dir;
+  try {
+    dir = await recoveryDirectory();
+  } catch (error) {
+    return { ok: false, saved: 0, pending: entries.length, error: String(error?.message || error) };
+  }
+  const remaining = [];
+  let saved = 0;
+  let failed = '';
+  for (const entry of entries) {
+    const expired = Date.now() - Number(entry.createdAt || 0) > RECOVERY_MAX_AGE_MS;
+    const handedOver = entry.savedAt && Date.now() - Number(entry.savedAt) > RECOVERY_KEEP_MS;
+    if (expired || handedOver) {
+      await dir.removeEntry(entry.id).catch(() => {});
+      continue;
+    }
+    if (entry.savedAt) {
+      remaining.push(entry);
+      continue;
+    }
+    let file;
+    try {
+      file = await (await dir.getFileHandle(entry.id)).getFile();
+    } catch (error) {
+      // The parked file is gone (storage cleared, profile reset): drop the
+      // entry rather than advertising a file that can never be saved.
+      logToWorker('recovery', `parked file missing, dropping entry; file=${entry.filename}`);
+      continue;
+    }
+    try {
+      if (!file.size) throw new Error('файл восстановления пуст');
+      await saveBlob(file, entry.filename);
+      saved++;
+      remaining.push({ ...entry, savedAt: Date.now() });
+      logToWorker('recovery', `saved parked file; file=${entry.filename} bytes=${file.size}`);
+    } catch (error) {
+      failed = String(error?.message || error);
+      remaining.push(entry);
+    }
+  }
+  await writeRecoveryIndex(remaining);
+  const pending = remaining.filter((entry) => !entry.savedAt).length;
+  return { ok: !pending, saved, pending, ...(failed ? { error: failed } : {}) };
+}
+
+// Single exit for every finished file: retry the handover, and only if the
+// browser stays unreachable park the result instead of discarding it.
+async function deliverOutput(blob, filename) {
+  try {
+    await saveBlob(blob, filename);
+    return;
+  } catch (error) {
+    // Parking duplicates the file on disk, so multi-gigabyte live recordings
+    // are reported instead: their source tracks are still in OPFS.
+    if (!isWorkerAsleep(error) || blob.size > RECOVERY_MAX_BYTES) throw error;
+    let parked = false;
+    try {
+      await stashForRecovery(blob, filename);
+      parked = true;
+    } catch (stashError) {
+      logToWorker('recovery', `could not park finished file: ${String(stashError?.message || stashError)}`);
+    }
+    if (!parked) throw error;
+    const failure = new Error('браузер не принял файл на сохранение (служебный процесс расширения был'
+      + ' перезапущен). Готовый файл сохранён во временном хранилище — откройте значок NVS и нажмите'
+      + ' «Сохранить готовый файл».');
+    failure.recovered = true;
+    throw failure;
+  }
+}
+
 async function finalizeJob(message) {
   if (!activeJob || activeJob.phase !== 'receiving' || message.jobId !== activeJob.id) {
     throw new Error('задание загрузки не найдено');
@@ -692,6 +1038,7 @@ async function finalizeJob(message) {
 
   const job = activeJob;
   job.phase = 'processing';
+  job.stage = 'engine';
   const files = new Set();
   let instance;
 
@@ -699,19 +1046,32 @@ async function finalizeJob(message) {
     sendProgress(0.02, 'Инициализация движка кодирования…');
     instance = await getFFmpeg();
 
+    job.stage = 'buffers';
     sendProgress(0.06, 'Подготовка буферов дорожек…');
     const inputs = [];
-    const audioName = `audio.${extensionFor(job.audioMime)}`;
-    const audioBytes = concatParts(job.audio);
-    if (!audioBytes.length) throw new Error('пустые данные аудио');
-    assertContainerHeader(audioBytes, job.audioMime, 'audio');
-    inputs.push({ name: audioName, bytes: audioBytes });
-    files.add(audioName);
+    // A muxed job carries everything on the video track; there is no separate
+    // audio buffer to validate or hand to ffmpeg.
+    const audioName = job.muxed ? null : `audio.${extensionFor(job.audioMime)}`;
+    const audioBytes = job.muxed ? null : concatParts(job.audio);
+    if (!job.muxed) {
+      if (!audioBytes.length) throw new Error('пустые данные аудио');
+      assertContainerHeader(audioBytes, job.audioMime, 'audio');
+      inputs.push({ name: audioName, bytes: audioBytes });
+      files.add(audioName);
+    }
 
     let videoName;
     let videoPrefixName;
     let videoBytes = null;
-    if (job.format !== 'mp3') {
+    if (job.muxed) {
+      videoName = 'input.ts';
+      videoBytes = concatParts(job.video);
+      if (!videoBytes.length) throw new Error('пустые данные потока');
+      // MPEG-TS has no ftyp/EBML header to check; its packets start with 0x47.
+      if (videoBytes[0] !== 0x47) throw new Error('поток не является MPEG-TS');
+      inputs.push({ name: videoName, bytes: videoBytes });
+      files.add(videoName);
+    } else if (job.format !== 'mp3') {
       videoName = `video.${extensionFor(job.videoMime)}`;
       videoBytes = concatParts(job.video);
       if (!videoBytes.length) throw new Error('пустые данные видео');
@@ -734,7 +1094,7 @@ async function finalizeJob(message) {
     if (job.format === 'mp3' && job.videoId
       && ['original', 'mp3', 'm4a'].includes(job.audioFormat)) {
       sendProgress(0.07, 'Загрузка обложки…');
-      const cover = await chrome.runtime.sendMessage({ t: 'nova-fetch-cover', videoId: job.videoId })
+      const cover = await sendToWorker({ t: 'nova-fetch-cover', videoId: job.videoId }, { retries: 3 })
         .catch(() => null);
       if (cover?.ok && cover.b64) {
         try {
@@ -751,6 +1111,7 @@ async function finalizeJob(message) {
     // Hardware path first: only for plain transcode jobs (no prefix concat,
     // no downscale — those still need ffmpeg's filter graph).
     if (job.format !== 'mp3' && job.transcode && !videoPrefixName && !job.scaleHeight && videoBytes) {
+      job.stage = 'webcodecs';
       sendProgress(0.08, 'Запуск аппаратного перекодирования…');
       try {
         output = await tryWebcodecsTranscode(job, videoBytes, audioBytes);
@@ -759,42 +1120,41 @@ async function finalizeJob(message) {
         selectedRun = { out: 'webcodecs.mp4', type: 'video/mp4', extension: '.mp4' };
       } catch (error) {
         output = undefined;
-        chrome.runtime.sendMessage({
-          t: 'nova-log',
-          tag: 'webcodecs',
-          text: `hardware transcode unavailable, falling back to ffmpeg: ${String(error?.message || error)}`,
-        }).catch(() => {});
+        logToWorker('webcodecs',
+          `hardware transcode unavailable, falling back to ffmpeg: ${String(error?.message || error)}`);
       }
     }
 
     // Plain (non-transcoding) mux of a captured video: Mediabunny first. Its
     // fragment-aware copy avoids the truncated files ffmpeg's stream copy
     // produces for fMP4 video paired with WebM audio.
+    // Mediabunny reads fMP4 and WebM, not MPEG-TS: a muxed job goes straight to
+    // ffmpeg rather than paying for a parse that cannot succeed.
     if (!selectedRun && job.format !== 'mp3' && !job.transcode && !videoPrefixName
-      && !job.scaleHeight && videoBytes) {
+      && !job.scaleHeight && !job.muxed && videoBytes) {
+      job.stage = 'mediabunny';
       sendProgress(0.08, 'Сборка дорожек…');
       try {
         output = await muxVodWithMediabunny(job, videoBytes, audioBytes);
         selectedRun = { out: 'mediabunny.mp4', type: 'video/mp4', extension: '.mp4' };
-        chrome.runtime.sendMessage({
-          t: 'nova-log', tag: 'mux',
-          text: `mediabunny copy-remux ok; bytes=${output.length} duration=${(containerDurationSeconds(output) || 0).toFixed(1)}`,
-        }).catch(() => {});
+        logToWorker('mux', `mediabunny copy-remux ok; bytes=${output.length}`
+          + ` duration=${(containerDurationSeconds(output) || 0).toFixed(1)}`);
       } catch (error) {
         output = undefined;
-        chrome.runtime.sendMessage({
-          t: 'nova-log', tag: 'mux',
-          text: `mediabunny copy-remux unavailable, using ffmpeg: ${String(error?.message || error)}`,
-        }).catch(() => {});
+        logToWorker('mux', `mediabunny copy-remux unavailable, using ffmpeg: ${String(error?.message || error)}`);
       }
     }
 
-    if (!selectedRun) await writeInputFiles(instance, inputs);
+    if (!selectedRun) {
+      job.stage = 'ffmpeg-write';
+      await writeInputFiles(instance, inputs);
+    }
     for (const run of selectedRun ? [] : buildRuns(job, videoName, audioName, videoPrefixName, coverName)) {
       ffmpegLogs.length = 0;
       job.integrityError = '';
       job.lastProgress = 0;
       job.lastProgressAt = Date.now();
+      job.stage = `ffmpeg:${run.out}`;
       sendProgress(0, processingStatus(job), 0);
       files.add(run.out);
       const exitCode = await execWithProgressWatchdog(instance, run.args, job, SINGLE_THREAD_STALL_MS);
@@ -809,11 +1169,7 @@ async function finalizeJob(message) {
             selectedRun = run;
             break;
           }
-          chrome.runtime.sendMessage({
-            t: 'nova-log',
-            tag: 'ffmpeg',
-            text: `run ${run.out} rejected: ${lengthError}`,
-          }).catch(() => {});
+          logToWorker('ffmpeg', `run ${run.out} rejected: ${lengthError}`);
         }
       }
       lastError = integrityError || lengthError
@@ -821,37 +1177,31 @@ async function finalizeJob(message) {
     }
 
     if (!selectedRun) throw new Error(lastError || 'ffmpeg не собрал файл');
-    chrome.runtime.sendMessage({
-      t: 'nova-log', tag: 'mux',
-      text: `output ready; run=${selectedRun.out} bytes=${output.length}`
-        + ` duration=${(containerDurationSeconds(output) || 0).toFixed(1)} expected=${(job.duration || 0).toFixed(1)}`
-        + ` file=${job.filename}`,
-    }).catch(() => {});
+    logToWorker('mux', `output ready; run=${selectedRun.out} bytes=${output.length}`
+      + ` duration=${(containerDurationSeconds(output) || 0).toFixed(1)} expected=${(job.duration || 0).toFixed(1)}`
+      + ` file=${job.filename}`);
+    job.stage = 'saving';
     sendProgress(0.97, 'Подготовка файла к сохранению…', 97);
 
     const filename = job.filename.replace(/\.(mp4|webm|mp3|m4a|aac|flac|wav|ogg|opus)$/i, '') + selectedRun.extension;
-    const url = URL.createObjectURL(new Blob([output], { type: selectedRun.type }));
-    let downloadAccepted = false;
-    try {
-      const response = await chrome.runtime.sendMessage({ t: 'nova-save', url, filename });
-      if (!response?.ok) throw new Error(response?.error || 'не удалось сохранить файл');
-      downloadAccepted = true;
-      sendProgress(1, 'Файл передан браузеру…', 100);
-    } finally {
-      // chrome.downloads reads the object URL asynchronously after accepting it.
-      if (downloadAccepted) setTimeout(() => URL.revokeObjectURL(url), 60_000);
-      else URL.revokeObjectURL(url);
-    }
+    await deliverOutput(new Blob([output], { type: selectedRun.type }), filename);
+    job.stage = 'saved';
+    sendProgress(1, 'Файл передан браузеру…', 100);
     return { ok: true, filename };
   } catch (error) {
     error.details = {
+      stage: job.stage,
       format: job.format,
       transcode: job.transcode,
       scaleHeight: job.scaleHeight,
       audioMime: job.audioMime,
       videoMime: job.videoMime,
-      ffmpegLogs: ffmpegLogs.slice(-10),
+      // Only meaningful once an ffmpeg run has actually started; the array is
+      // cleared per job so a previous job's tail can no longer masquerade as
+      // the cause of this failure.
+      ffmpegLogs: String(job.stage || '').startsWith('ffmpeg') ? ffmpegLogs.slice(-10) : [],
       ffmpegMode,
+      ...(error?.recovered ? { recovered: true } : {}),
     };
     throw error;
   } finally {
@@ -864,6 +1214,7 @@ async function finalizeJob(message) {
     job.videoPrefix.length = 0;
     job.audio.length = 0;
     if (activeJob === job) activeJob = undefined;
+    updateKeepAlive();
   }
 }
 
@@ -925,6 +1276,7 @@ function beginLiveJob(message) {
     mimes: {},
     bytes: { video: 0, audio: 0 },
   });
+  updateKeepAlive();
   getFFmpeg().catch(() => {});
   return { ok: true };
 }
@@ -986,16 +1338,21 @@ async function abortLiveJob(message) {
   const job = liveJobs.get(message.jobId);
   if (!job) return { ok: true };
   liveJobs.delete(message.jobId);
+  updateKeepAlive();
   await closeLiveWriters(job).catch(() => {});
   await removeLiveFiles(job);
   return { ok: true };
 }
 
+// The service worker owns chrome.downloads, so this is the one hop a finished
+// file cannot avoid. It is also the hop that used to lose entire downloads to
+// a worker restart, hence the retry budget.
 async function saveBlob(blob, filename) {
   const url = URL.createObjectURL(blob);
   let accepted = false;
   try {
-    const response = await chrome.runtime.sendMessage({ t: 'nova-save', url, filename });
+    const response = await sendToWorker({ t: 'nova-save', url, filename },
+      { retries: WORKER_RETRY_DELAYS.length });
     if (!response?.ok) throw new Error(response?.error || 'не удалось сохранить файл');
     accepted = true;
   } finally {
@@ -1012,14 +1369,14 @@ function liveContainerExtension(mime) {
 // slot, so it reports with its own tab/job ids.
 function sendLiveProgress(job, value, status) {
   const progress = Math.max(0, Math.min(1, Number(value) || 0));
-  chrome.runtime.sendMessage({
+  notifyWorker({
     t: 'nova-progress',
     tabId: job.tabId,
     jobId: job.id,
     value: progress,
     percent: progress * 100,
     ...(status ? { status } : {}),
-  }).catch(() => {});
+  }, 0);
 }
 
 // Primary live mux: Mediabunny stream-copies both OPFS track files into one
@@ -1119,14 +1476,11 @@ async function muxLiveWithMediabunny(job, tracks, baseName) {
     await dir.removeEntry(`${job.id}-out${extension}`).catch(() => {});
     throw new Error(`склейка записала подозрительно мало данных (${outFile.size} из ${inputBytes} байт)`);
   }
-  chrome.runtime.sendMessage({
-    t: 'nova-log',
-    tag: 'live',
-    text: `mediabunny mux ok; out=${extension} bytes=${outFile.size} video=${tracks.video.size} audio=${tracks.audio.size}`,
-  }).catch(() => {});
+  logToWorker('live', `mediabunny mux ok; out=${extension} bytes=${outFile.size}`
+    + ` video=${tracks.video.size} audio=${tracks.audio.size}`);
   const filename = `${baseName}${extension}`;
   sendLiveProgress(job, 0.97, 'Подготовка файла к сохранению…');
-  await saveBlob(outFile, filename);
+  await deliverOutput(outFile, filename);
   sendLiveProgress(job, 1, 'Файл передан браузеру…');
   return filename;
 }
@@ -1135,6 +1489,10 @@ async function finalizeLiveJob(message) {
   const job = liveJobs.get(message.jobId);
   if (!job) throw new Error('запись эфира не найдена');
   liveJobs.delete(message.jobId);
+  // The job left the registry, but muxing an hours-long recording still needs
+  // the service worker awake to accept the finished file.
+  busyFinalizers++;
+  updateKeepAlive();
   const baseName = String(message.filename || 'live.mp4').replace(/\.(mp4|webm|mp3|m4a|mkv)$/i, '');
   try {
     await closeLiveWriters(job);
@@ -1152,7 +1510,7 @@ async function finalizeLiveJob(message) {
       const track = tracks.video ? 'video' : 'audio';
       const extension = liveContainerExtension(job.mimes[track]);
       const filename = `${baseName}.${track === 'audio' ? 'audio' : 'video'}.${extension}`;
-      await saveBlob(tracks[track], filename);
+      await deliverOutput(tracks[track], filename);
       return { ok: true, filename, singleTrack: track };
     }
 
@@ -1163,11 +1521,10 @@ async function finalizeLiveJob(message) {
       await removeLiveFiles(job);
       return { ok: true, filename };
     } catch (error) {
-      await chrome.runtime.sendMessage({
-        t: 'nova-log',
-        tag: 'live',
-        text: `mediabunny mux failed, trying ffmpeg: ${String(error?.message || error)}`,
-      }).catch(() => {});
+      // A refused handover is not a mux failure: the file is already parked
+      // for recovery and re-muxing it would only duplicate the work.
+      if (error?.recovered) throw error;
+      await logToWorker('live', `mediabunny mux failed, trying ffmpeg: ${String(error?.message || error)}`);
     }
 
     const totalBytes = tracks.video.size + tracks.audio.size;
@@ -1191,32 +1548,36 @@ async function finalizeLiveJob(message) {
         await removeLiveFiles(job);
         return { ok: true, filename };
       } catch (error) {
+        if (error?.recovered) throw error;
         // Fall through to the split-file path: the recording itself is intact.
-        await chrome.runtime.sendMessage({
-          t: 'nova-log',
-          tag: 'live',
-          text: `mux failed, saving split files: ${String(error?.message || error)}`,
-        }).catch(() => {});
+        await logToWorker('live', `mux failed, saving split files: ${String(error?.message || error)}`);
       }
     }
 
     const videoName = `${baseName}.video.${liveContainerExtension(job.mimes.video)}`;
     const audioName = `${baseName}.audio.${liveContainerExtension(job.mimes.audio)}`;
-    await saveBlob(tracks.video, videoName);
-    await saveBlob(tracks.audio, audioName);
+    await deliverOutput(tracks.video, videoName);
+    await deliverOutput(tracks.audio, audioName);
     // The object URLs above read straight from OPFS-backed files; deleting the
     // files immediately could break the pending downloads, so cleanup happens
     // on the next live recording / offscreen start instead.
     return { ok: true, split: true, filename: videoName };
   } catch (error) {
-    await removeLiveFiles(job).catch(() => {});
+    // A parked recording still lives in OPFS; wiping the source files here
+    // would be harmless, but the user is told the file survived, so keep the
+    // storage footprint honest and only clear what is no longer referenced.
+    if (!error?.recovered) await removeLiveFiles(job).catch(() => {});
     error.details = {
       live: true,
       bytes: job.bytes,
       mimes: job.mimes,
       ffmpegLogs: ffmpegLogs.slice(-10),
+      ...(error?.recovered ? { recovered: true } : {}),
     };
     throw error;
+  } finally {
+    busyFinalizers = Math.max(0, busyFinalizers - 1);
+    updateKeepAlive();
   }
 }
 
@@ -1288,7 +1649,7 @@ async function muxLiveTracks(job, tracks, baseName) {
     if (!selectedRun) throw new Error(lastError || 'ffmpeg не собрал запись эфира');
     sendProgress(0.97, 'Подготовка файла к сохранению…', 97);
     const filename = `${baseName}${selectedRun.extension}`;
-    await saveBlob(new Blob([output], { type: selectedRun.type }), filename);
+    await deliverOutput(new Blob([output], { type: selectedRun.type }), filename);
     sendProgress(1, 'Файл передан браузеру…', 100);
     return filename;
   } finally {
@@ -1304,14 +1665,18 @@ async function muxLiveTracks(job, tracks, baseName) {
 }
 
 async function reportError(error) {
-  const detail = String(error?.stack || error?.message || error);
-  await chrome.runtime.sendMessage({
+  // A recovered job already carries a human-readable explanation; the raw
+  // stack would only bury it in the toast.
+  const detail = error?.recovered
+    ? String(error.message)
+    : String(error?.stack || error?.message || error);
+  await sendToWorker({
     t: 'nova-error',
     context: 'offscreen/finalize',
     error: detail,
     details: error?.details,
-  }).catch(() => {});
-  return { ok: false, error: detail, logged: true };
+  }, { retries: 4 }).catch(() => {});
+  return { ok: false, error: detail, logged: true, ...(error?.recovered ? { recovered: true } : {}) };
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -1356,5 +1721,15 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     finalizeLiveJob(message).then(sendResponse).catch(async (error) => sendResponse(await reportError(error)));
     return true;
   }
+  if (message.t === 'nova-flush') {
+    flushRecoveredFiles()
+      .then(sendResponse)
+      .catch((error) => sendResponse({ ok: false, error: String(error?.message || error) }));
+    return true;
+  }
   return false;
 });
+
+// Files parked by an earlier session are handed over as soon as this document
+// exists again — the service worker that created it is alive by definition.
+flushRecoveredFiles().catch(() => {});

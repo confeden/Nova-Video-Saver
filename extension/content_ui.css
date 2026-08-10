@@ -44,6 +44,55 @@
   shape-rendering: geometricPrecision;
 }
 
+/* Reel action column on Shorts: a round tonal button with a caption, matching
+   the shape and 78px rhythm of «Нравится» and its neighbours below it. */
+.nova-shorts-btn {
+  width: 48px;
+  height: 78px;
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.nova-shorts-circle {
+  width: 48px;
+  height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, .1);
+  transition: background .1s ease-in-out;
+}
+
+.nova-shorts-btn:hover .nova-shorts-circle { background: rgba(255, 255, 255, .2); }
+
+/* Centred by the circle's own flexbox — never absolutely positioned against
+   the taller button, which would drop the icon towards the caption. */
+.nova-shorts-circle svg {
+  position: static;
+  width: 26px;
+  height: 26px;
+  display: block;
+  transform: none;
+  shape-rendering: geometricPrecision;
+}
+
+.nova-shorts-label {
+  color: #f1f1f1;
+  font-size: 12px;
+  line-height: 1;
+  font-weight: 500;
+  letter-spacing: .3px;
+}
+
 /* «Доступно обновление» — bold green with a soft lemon-vanilla glow */
 .nova-brand-head a.nova-update-link {
   margin-left: 8px;

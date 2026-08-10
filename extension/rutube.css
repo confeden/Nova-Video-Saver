@@ -1,0 +1,145 @@
+/* Rutube adapter UI. Kept separate from content_ui.css, which is injected only
+   on YouTube and carries player-specific rules that do not apply here. */
+
+[hidden] { display: none !important; }
+
+.nova-rt-btn {
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+}
+
+/* Overlay variant: bottom-right corner of the player. */
+.nova-rt-overlay {
+  position: absolute;
+  right: 14px;
+  bottom: 62px;
+  width: 40px;
+  height: 40px;
+  z-index: 60;
+  opacity: 0.92;
+  filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.6));
+}
+
+.nova-rt-overlay:hover { opacity: 1; }
+
+.nova-rt-overlay svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+  shape-rendering: geometricPrecision;
+}
+
+/* Shorts variant: sits above the like counter, in the rhythm of its siblings. */
+.nova-rt-shorts {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+
+.nova-rt-circle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.12);
+  transition: background 0.15s ease;
+}
+
+.nova-rt-shorts:hover .nova-rt-circle { background: rgba(255, 255, 255, 0.22); }
+
+.nova-rt-circle svg {
+  position: static;
+  width: 26px;
+  height: 26px;
+  display: block;
+  transform: none;
+  shape-rendering: geometricPrecision;
+}
+
+.nova-rt-label {
+  font-size: 12px;
+  line-height: 1;
+  font-weight: 500;
+  color: #fff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+}
+
+/* ---- menu ---------------------------------------------------------------- */
+
+.nova-rt-menu {
+  position: fixed;
+  z-index: 2147483000;
+  width: 260px;
+  max-height: 70vh;
+  overflow-y: auto;
+  padding: 6px;
+  border: 1px solid #3c4043;
+  border-radius: 10px;
+  background: #181a1c;
+  color: #f1f1f1;
+  font: 13px/1.4 "Segoe UI", Roboto, Arial, sans-serif;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
+}
+
+.nova-rt-head {
+  padding: 7px 10px;
+  color: #9aa0a6;
+  font-size: 12px;
+}
+
+.nova-rt-item {
+  padding: 9px 10px;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.nova-rt-item:hover { background: #23262a; }
+
+.nova-rt-muted {
+  color: #9aa0a6;
+  cursor: default;
+}
+
+.nova-rt-muted:hover { background: transparent; }
+
+/* ---- toast --------------------------------------------------------------- */
+
+.nova-rt-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 28px;
+  transform: translateX(-50%);
+  z-index: 2147483000;
+  min-width: 280px;
+  max-width: 70vw;
+  padding: 11px 14px 13px;
+  border: 1px solid #3c4043;
+  border-radius: 10px;
+  background: #181a1c;
+  color: #f1f1f1;
+  font: 13px/1.4 "Segoe UI", Roboto, Arial, sans-serif;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
+}
+
+.nova-rt-toast::after {
+  content: "";
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  bottom: 6px;
+  height: 3px;
+  border-radius: 2px;
+  background: linear-gradient(
+    to right,
+    #35d477 var(--nova-rt-progress, 0%),
+    rgba(255, 255, 255, 0.14) var(--nova-rt-progress, 0%)
+  );
+}

@@ -1,3 +1,7 @@
+/* An explicit `display` in an author rule beats the user agent's [hidden],
+   so .export-log and .release-link stayed visible when hidden was set. */
+[hidden] { display: none !important; }
+
 body {
   width: 280px;
   margin: 0;
@@ -26,6 +30,19 @@ body {
   color: #9aa0a6;
   font-size: 12px;
 }
+
+.subtitle {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.subtitle a {
+  color: #8ab4f8;
+  text-decoration: none;
+}
+
+.subtitle a:hover { text-decoration: underline; }
 
 .status {
   margin: 12px 0 0;
@@ -64,11 +81,11 @@ body {
 .footer {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   margin-top: 12px;
 }
 
 .footer button {
+  flex: 1;
   padding: 6px 10px;
   border: 1px solid #3c4043;
   border-radius: 7px;

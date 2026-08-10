@@ -2,11 +2,16 @@
 (() => {
   const BUTTON_ID = 'nova-download-btn';
   const IS_MUSIC = location.hostname === 'music.youtube.com';
+  // Evaluated per call: YouTube moves between /watch and /shorts without a
+  // page load, and the reel feed rewrites the URL on every swipe.
+  const SHORTS_PATH = /^\/shorts\/[A-Za-z0-9_-]{6,}/;
+  const IS_SHORTS = () => !IS_MUSIC && SHORTS_PATH.test(location.pathname);
+  const IS_DOWNLOADABLE_PAGE = () => location.pathname === '/watch' || IS_SHORTS();
   const TO_HOOK = '__nova_to_hook';
   const FROM_HOOK = '__nova_from_hook';
   const TO_UI = '__nova_to_ui';
   const FROM_UI = '__nova_from_ui';
-  const RELAYED_MESSAGES = new Set(['nova-log', 'nova-fetch-caption']);
+  const RELAYED_MESSAGES = new Set(['nova-log', 'nova-fetch-caption', 'nova-fetch-media']);
   const TRANSFER_CHUNK_SIZE = 4 * 1024 * 1024;
 
   let requestSequence = 1;
@@ -19,6 +24,17 @@
 
   function postToPage(payload) {
     window.postMessage(payload, location.origin);
+  }
+
+  // Mirrors the page hook's element resolution. A Shorts page holds both an
+  // empty leftover #movie_player and the reel's real #shorts-player, and the
+  // feed keeps neighbouring reels mounted, so the first <video> in document
+  // order is not reliably the one being watched.
+  function activeMediaElement() {
+    const reel = document.getElementById('shorts-player');
+    const watch = document.getElementById('movie_player');
+    const host = IS_SHORTS() ? (reel || watch) : (watch || reel);
+    return host?.querySelector('video') || document.querySelector('video');
   }
 
   window.addEventListener('message', (event) => {
@@ -83,7 +99,7 @@
   async function reportError(context, error, details) {
     const text = String(error?.stack || error?.message || error);
     console.error('[Nova Video Saver]', error);
-    return chrome.runtime.sendMessage({ t: 'nova-error', context, error: text, details }).catch(() => null);
+    return sendWorkerMessage({ t: 'nova-error', context, error: text, details }, 30_000).catch(() => null);
   }
 
   function sendRuntimeMessage(message, timeoutMs) {
@@ -93,6 +109,28 @@
       timer = setTimeout(() => reject(new Error(`extension message timed out (${message.t})`)), timeoutMs);
     });
     return Promise.race([chrome.runtime.sendMessage(message), timeout]).finally(() => clearTimeout(timer));
+  }
+
+  // The MV3 service worker can be mid-shutdown when a message arrives; the
+  // send then fails even though the worker is back a moment later. Only
+  // idempotent worker-side requests may be retried — a repeated nova-chunk
+  // would duplicate track data.
+  const WORKER_RETRY_DELAYS = [150, 400, 1_000, 2_500];
+
+  function isWorkerAsleep(error) {
+    return /could not establish connection|receiving end does not exist|message port closed/i
+      .test(String(error?.message || error));
+  }
+
+  async function sendWorkerMessage(message, timeoutMs) {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await sendRuntimeMessage(message, timeoutMs);
+      } catch (error) {
+        if (attempt >= WORKER_RETRY_DELAYS.length || !isWorkerAsleep(error)) throw error;
+        await new Promise((resolve) => { setTimeout(resolve, WORKER_RETRY_DELAYS[attempt]); });
+      }
+    }
   }
 
   function createElement(tag, className, text) {
@@ -124,32 +162,93 @@
     return svg;
   }
 
-  function createButton() {
-    const button = createElement('button', IS_MUSIC
-      ? 'nova-download-btn nova-music-btn'
-      : 'ytp-button nova-download-btn');
+  // The Shorts variant deliberately does not share .nova-download-btn: that
+  // class absolutely-centres the icon on the whole button, which for a button
+  // with a caption underneath pushes the icon below the middle of its circle.
+  const VARIANT_CLASS = {
+    player: 'ytp-button nova-download-btn',
+    music: 'nova-download-btn nova-music-btn',
+    shorts: 'nova-shorts-btn',
+  };
+
+  function createButton(variant) {
+    const button = createElement('button', VARIANT_CLASS[variant] || VARIANT_CLASS.player);
     button.id = BUTTON_ID;
     button.type = 'button';
+    button.dataset.novaVariant = variant;
     button.title = 'NVS (Nova Video Saver)';
     button.setAttribute('aria-label', button.title);
-    button.append(createCircleIcon());
+    if (variant === 'shorts') {
+      // Matches the shape of its neighbours in the reel action column: a round
+      // tonal button with a caption underneath.
+      const circle = createElement('span', 'nova-shorts-circle');
+      circle.append(createCircleIcon());
+      button.append(circle, createElement('span', 'nova-shorts-label', 'NVS'));
+    } else {
+      button.append(createCircleIcon());
+    }
     button.addEventListener('click', openMenu);
     return button;
   }
 
-  function ensureButton() {
-    if (location.pathname !== '/watch' || document.getElementById(BUTTON_ID)) return;
+  // Where the button belongs on the current page. One entry per surface: adding
+  // another site later means adding a case here and the matching element lookup
+  // in the page hook — nothing else in the UI is site-aware.
+  function mountTarget() {
     if (IS_MUSIC) {
       // The Music player bar keeps its right-hand controls (volume, repeat…)
       // in ytmusic-player-bar; the button sits immediately left of the volume.
       const bar = document.querySelector('ytmusic-player-bar');
       const volume = bar?.querySelector('tp-yt-paper-icon-button.volume, #volume-slider ~ tp-yt-paper-icon-button, .volume');
-      if (volume?.parentElement) volume.parentElement.insertBefore(createButton(), volume);
-      else if (bar?.querySelector('.right-controls-buttons')) bar.querySelector('.right-controls-buttons').prepend(createButton());
-      return;
+      if (volume?.parentElement) return { parent: volume.parentElement, anchor: volume, variant: 'music' };
+      const rightControls = bar?.querySelector('.right-controls-buttons');
+      return rightControls ? { parent: rightControls, anchor: null, variant: 'music' } : null;
+    }
+    if (IS_SHORTS()) {
+      // Right-hand action column of the reel that currently owns the player —
+      // the feed keeps neighbouring reels mounted, and only the watched one
+      // holds #shorts-player. The button goes above «Нравится».
+      const reel = document.getElementById('shorts-player')?.closest('ytd-reel-video-renderer');
+      const actions = reel?.querySelector('reel-action-bar-view-model')
+        || document.querySelector('reel-action-bar-view-model');
+      return actions ? { parent: actions, anchor: null, variant: 'shorts' } : null;
     }
     const controls = document.querySelector('.ytp-right-controls');
-    if (controls) controls.prepend(createButton());
+    return controls ? { parent: controls, anchor: null, variant: 'player' } : null;
+  }
+
+  let mountedVideoId = null;
+
+  function ensureButton() {
+    // Swiping the Shorts feed replaces the video without a navigation event; an
+    // open menu would keep offering the previous reel's qualities.
+    const currentVideoId = videoIdFromLocation();
+    if (currentVideoId !== mountedVideoId) {
+      mountedVideoId = currentVideoId;
+      if (menu) closeMenu();
+    }
+    let button = document.getElementById(BUTTON_ID);
+    if (!IS_DOWNLOADABLE_PAGE()) {
+      button?.remove();
+      return;
+    }
+    const target = mountTarget();
+    if (!target) return;
+    // anchor null means "first in the container"; already-correct placement
+    // must not re-insert on every mutation tick.
+    const placed = button
+      && button.dataset.novaVariant === target.variant
+      && button.parentElement === target.parent
+      && (target.anchor ? button.nextElementSibling === target.anchor
+        : target.parent.firstElementChild === button);
+    if (placed) return;
+    if (button && button.dataset.novaVariant !== target.variant) {
+      button.remove();
+      button = null;
+    }
+    if (!button) button = createButton(target.variant);
+    if (target.anchor) target.parent.insertBefore(button, target.anchor);
+    else target.parent.prepend(button);
   }
 
   function scheduleButton() {
@@ -374,7 +473,15 @@
       const buttonRect = document.getElementById(BUTTON_ID)?.getBoundingClientRect();
       if (buttonRect) {
         menu.style.right = `${Math.max(8, window.innerWidth - buttonRect.right)}px`;
-        menu.style.bottom = `${window.innerHeight - buttonRect.top + 8}px`;
+        // Upward from the button is the default — that is where the anchor sits
+        // in the player control bar. The Shorts action column is mid-screen, so
+        // fall back to dropping the menu downward when there is no room above.
+        const height = menu.getBoundingClientRect().height;
+        if (buttonRect.top - height - 8 >= 8) {
+          menu.style.bottom = `${window.innerHeight - buttonRect.top + 8}px`;
+        } else {
+          menu.style.top = `${Math.max(8, Math.min(buttonRect.bottom + 8, window.innerHeight - height - 8))}px`;
+        }
       }
       setTimeout(() => document.addEventListener('click', closeMenuOnOutsideClick, true));
     } catch (error) {
@@ -534,7 +641,7 @@
       const content = output.timed ? buildTimedSubtitles(response.cues, output.extension) : response.text;
       const filename = `${safeFilename(info.title)} [${language}].${output.extension}`;
       const url = `data:${output.mime};charset=utf-8,${encodeURIComponent(`\uFEFF${content}`)}`;
-      const saved = await chrome.runtime.sendMessage({ t: 'nova-save', url, filename });
+      const saved = await sendWorkerMessage({ t: 'nova-save', url, filename }, 30_000);
       if (!saved?.ok) throw new Error(saved?.error || 'не удалось сохранить субтитры');
       notification.set(`Готово: ${filename}`, 1);
       notification.hide(4000);
@@ -556,7 +663,7 @@
     if (!options.freshPageResume) await clearReloadGuard();
 
     const isMp3 = format === 'mp3';
-    const primedMedia = document.querySelector('video');
+    const primedMedia = activeMediaElement();
     const requestedMediaState = options.restoreMediaState;
     const primedState = primedMedia ? {
       paused: typeof requestedMediaState?.paused === 'boolean'
@@ -708,6 +815,7 @@
       if (!result?.ok) {
         const error = new Error(result?.error || 'не удалось собрать файл');
         error.logged = Boolean(result?.logged);
+        error.recovered = Boolean(result?.recovered);
         throw error;
       }
       notification.stage('engine', 1, 'done');
@@ -789,8 +897,12 @@
       }
       await clearReloadGuard();
       const detail = String(error?.stack || error?.message || error);
-      notification.set(`Ошибка: ${detail.split('\n').slice(0, 3).join(' ').slice(0, 280)}`, 1);
-      notification.hide(9000);
+      // The file itself survived — this is a "finish the save" notice, not a
+      // failed download, and it needs long enough on screen to be read.
+      notification.set(error?.recovered
+        ? detail
+        : `Ошибка: ${detail.split('\n').slice(0, 3).join(' ').slice(0, 280)}`, 1);
+      notification.hide(error?.recovered ? 25_000 : 9000);
       if (!error?.logged) await reportError('ui/download', error, {
         format, height, videoId: info.videoId,
         ...(error?.details ? { capture: error.details } : {}),
@@ -814,7 +926,7 @@
   }
 
   async function warmupMediaProcessor() {
-    const ensured = await sendRuntimeMessage({ t: 'nova-ensure' }, 30_000);
+    const ensured = await sendWorkerMessage({ t: 'nova-ensure' }, 30_000);
     if (!ensured?.ok) throw new Error(ensured?.error || 'не удалось запустить обработчик медиа');
     const warmed = await sendRuntimeMessage({ t: 'nova-warmup' }, 120_000);
     if (!warmed?.ok) throw new Error(warmed?.error || 'не удалось загрузить медиадвижок');
@@ -824,7 +936,7 @@
     const jobId = job.jobId;
     let begun = false;
     try {
-      const ensured = await sendRuntimeMessage({ t: 'nova-ensure' }, 30_000);
+      const ensured = await sendWorkerMessage({ t: 'nova-ensure' }, 30_000);
       if (!ensured?.ok) throw new Error(ensured?.error || 'не удалось запустить обработчик медиа');
 
       const registration = await sendRuntimeMessage({ t: 'nova-register-job', jobId }, 10_000);
@@ -902,9 +1014,23 @@
 
   async function resumeReloadedVideoDownload() {
     let pending;
+    // Probe first, and let it fail in silence. It runs on every page load,
+    // when the service worker is usually cold, and virtually never finds
+    // anything to resume — a red toast plus an auto-downloaded debug report
+    // for a routine slow start is far worse than a missed resume.
+    let response;
     try {
-      const response = await sendRuntimeMessage({ t: 'nova-get-reload-download' }, 10_000);
-      if (!response?.ok || !response.pending) return;
+      response = await sendWorkerMessage({ t: 'nova-get-reload-download' }, 20_000);
+    } catch (error) {
+      void sendRuntimeMessage({
+        t: 'nova-log', tag: 'resume',
+        text: `pending-download probe skipped: ${String(error?.message || error)}`,
+      }).catch(() => {});
+      return;
+    }
+    if (!response?.ok || !response.pending) return;
+
+    try {
       pending = response.pending;
 
       const age = Date.now() - Number(pending.createdAt);
@@ -955,7 +1081,7 @@
         : 'Страница обновлена — продолжаю загрузку видео…', 0);
 
       const holdReloadedMediaAtStart = () => {
-        const media = document.querySelector('video');
+        const media = activeMediaElement();
         if (!media) return;
         try { media.muted = true; } catch (error) {}
         // On Music a player paused at zero never builds its MSE buffers, so
@@ -970,8 +1096,27 @@
       // spend that wait building a fresh SourceBuffer beginning at the saved
       // playback position, forcing a complete second download at 99%.
       holdReloadedMediaAtStart();
+      // Nova's own reload can land in a tab the user is not looking at, and
+      // YouTube does not build its player in a hidden tab. The readiness poll
+      // would then spend its whole budget on a page that was never going to be
+      // ready, and the resume — a one-shot — is lost for good. Wait to be shown
+      // before starting the clock; the toast already explains what is going on.
+      if (document.visibilityState === 'hidden') {
+        await new Promise((resolve) => {
+          let settle = () => {
+            settle = () => {};
+            document.removeEventListener('visibilitychange', onVisible);
+            resolve();
+          };
+          const onVisible = () => { if (document.visibilityState === 'visible') settle(); };
+          document.addEventListener('visibilitychange', onVisible);
+          setTimeout(() => settle(), 10 * 60_000);
+        });
+        holdReloadedMediaAtStart();
+      }
       let info = null;
-      const readyDeadline = Date.now() + 20_000;
+      // A cold player on a heavy page routinely needs more than twenty seconds.
+      const readyDeadline = Date.now() + 45_000;
       while (Date.now() < readyDeadline) {
         holdReloadedMediaAtStart();
         const candidate = await callHook('info').catch(() => null);
@@ -1109,7 +1254,7 @@
     chrome.runtime.onMessage.addListener(onFfmpegProgress);
     try {
       notification.set('Подготовка записи эфира…', 0.05);
-      const ensured = await sendRuntimeMessage({ t: 'nova-ensure' }, 30_000);
+      const ensured = await sendWorkerMessage({ t: 'nova-ensure' }, 30_000);
       if (!ensured?.ok) throw new Error(ensured?.error || 'не удалось запустить обработчик медиа');
       const registration = await sendRuntimeMessage({ t: 'nova-register-job', jobId }, 10_000);
       if (!registration?.ok || !Number.isInteger(registration.tabId)) {
@@ -1141,7 +1286,12 @@
         videoMime: result.videoMime || '',
         audioMime: result.audioMime || '',
       }, 60 * 60_000);
-      if (!finalized?.ok) throw new Error(finalized?.error || 'не удалось собрать запись эфира');
+      if (!finalized?.ok) {
+        const failure = new Error(finalized?.error || 'не удалось собрать запись эфира');
+        failure.recovered = Boolean(finalized?.recovered);
+        failure.logged = Boolean(finalized?.logged);
+        throw failure;
+      }
       notification.set(finalized.split
         ? 'Готово: запись сохранена двумя файлами (видео + звук): она слишком велика для склейки в браузере'
         : (finalized.singleTrack
@@ -1153,9 +1303,9 @@
       removeLivePanel();
       await sendRuntimeMessage({ t: 'nova-live-abort', jobId }, 10_000).catch(() => {});
       const detail = String(error?.message || error);
-      notification.set(`Ошибка записи эфира: ${detail.slice(0, 240)}`, 1);
-      notification.hide(9000);
-      await reportError('ui/live', error, { videoId: info.videoId, from });
+      notification.set(error?.recovered ? detail : `Ошибка записи эфира: ${detail.slice(0, 240)}`, 1);
+      notification.hide(error?.recovered ? 25_000 : 9000);
+      if (!error?.logged) await reportError('ui/live', error, { videoId: info.videoId, from });
       return false;
     } finally {
       window.removeEventListener('message', onLiveChunk);
@@ -1388,7 +1538,7 @@
   // at zero so YouTube builds its MSE session from the opening segments. Queue
   // items that skipped this occasionally landed in a wedged SABR session.
   function holdQueueMediaAtStart() {
-    const media = document.querySelector('video');
+    const media = activeMediaElement();
     if (!media) return;
     try { media.muted = true; } catch (error) {}
     // Music player: muted playback instead of a pause — paused at zero it
@@ -1459,7 +1609,7 @@
           if (IS_MUSIC) {
             // The queue kept the tab silent; give the sound back at the end.
             void callHook('music-mute', { mute: false }).catch(() => {});
-            try { document.querySelector('video').muted = false; } catch (error) {}
+            try { activeMediaElement().muted = false; } catch (error) {}
           }
           break;
         }
