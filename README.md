@@ -1,7 +1,5 @@
 # Nova Video Saver
 
-*(ранее — Nova Youtube Downloader)*
-
 Расширение Chromium для скачивания видео и аудио с YouTube, YouTube Shorts, YouTube Music и Rutube, субтитров (SRT, TXT), плейлистов целиком, а также записи прямых трансляций YouTube и Twitch — без внешних сервисов, программ, рекламы и аналитики.
 
 ## Возможности
