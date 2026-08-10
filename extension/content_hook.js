@@ -145,7 +145,6 @@
     innertubeFormats: null,
     innertubeRefusals: 0,
     innertubeBlockedUntil: 0,
-    mediaViaWorker: false,
     // Set to 'audio'/'video' while a sequential pass rebuilds that one track.
     singleTrackPass: null,
     // True for the whole of a download: capture helpers must not un-silence.
@@ -2553,48 +2552,6 @@
     return media;
   }
 
-  // Same range, fetched by the service worker instead of the page. googlevideo
-  // refuses the mobile-client URLs asked for by a document — that request
-  // carries Origin/Sec-Fetch headers and is bound by CORS, and the refusal
-  // arrives either as 403 or as a dropped connection. An extension request has
-  // neither, so it is much closer to what the URL was actually issued for.
-  const WORKER_SLICE_BYTES = 8 * 1024 * 1024;
-
-  async function fetchRangeSliceViaWorker(url, start, end) {
-    const parts = [];
-    for (let offset = start; offset <= end; offset += WORKER_SLICE_BYTES) {
-      // A sibling slice may have retired the URL while this loop was waiting.
-      // Carrying on would keep the bridge busy for another 30-second timeout
-      // each, right when the repair passes need it.
-      if (!directUrlIsUsable(url)) {
-        const retired = new Error('ссылка уже отклонена сервером');
-        retired.novaRetiredUrl = true;
-        throw retired;
-      }
-      const sliceEnd = Math.min(end, offset + WORKER_SLICE_BYTES - 1);
-      const response = await sendToBackground({
-        t: 'nova-fetch-media', url, start: offset, end: sliceEnd,
-      });
-      if (!response?.ok) {
-        const error = new Error(response?.error || 'служебный процесс не получил диапазон');
-        if (Number.isFinite(response?.status)) error.novaHttpStatus = response.status;
-        throw error;
-      }
-      const binary = atob(response.b64);
-      const bytes = new Uint8Array(binary.length);
-      for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
-      parts.push(bytes);
-    }
-    if (parts.length === 1) return parts[0];
-    const merged = new Uint8Array(parts.reduce((total, part) => total + part.length, 0));
-    let writeOffset = 0;
-    for (const part of parts) {
-      merged.set(part, writeOffset);
-      writeOffset += part.length;
-    }
-    return merged;
-  }
-
   async function fetchDirectRangeSlice(url, start, end, logTag) {
     const wanted = end - start + 1;
     let lastError = null;
@@ -2608,17 +2565,6 @@
       throw retired;
     }
 
-    // Once the worker has served a slice, stay with it: the page fetch will go
-    // on being refused for every remaining slice of the same download.
-    if (store.mediaViaWorker) {
-      const media = await fetchRangeSliceViaWorker(url, start, end);
-      if (media.length < wanted) {
-        throw new Error(`диапазон ${start}-${end}: получено ${media.length} из ${wanted} байт`);
-      }
-      return media.length > wanted ? media.subarray(0, wanted) : media;
-    }
-    // A range occasionally comes back empty or as a non-media UMP reply
-    // (stream-protection/redirect parts); those are transient.
     for (let attempt = 0; attempt < 3; attempt++) {
       if (attempt) await sleep(200 * attempt);
       try {
@@ -2647,24 +2593,8 @@
         const refused = error?.novaHttpStatus === 401 || error?.novaHttpStatus === 403
           || error?.novaHttpStatus === 410 || isNetworkRefusal(error);
         if (!refused) continue;
-        // Before giving the URL up, ask the service worker for the same range.
-        try {
-          const media = await fetchRangeSliceViaWorker(url, start, end);
-          if (media.length >= wanted) {
-            store.mediaViaWorker = true;
-            log(logTag, 'page fetch refused, service worker served the range;',
-              String(error?.message || error));
-            return media.length > wanted ? media.subarray(0, wanted) : media;
-          }
-          lastError = new Error(`диапазон ${start}-${end}: служебный процесс отдал`
-            + ` ${media.length} из ${wanted} байт`);
-        } catch (workerError) {
-          log(logTag, 'service worker could not serve the range either:',
-            String(workerError?.message || workerError));
-          // Both routes refused: retire the URL now so the sibling slices stop
-          // instead of repeating the same two failures each.
-          invalidateDirectUrl(url);
-        }
+        // Retire the URL so the sibling slices stop repeating the same failure.
+        invalidateDirectUrl(url);
         break;
       }
     }

@@ -11,7 +11,7 @@
   const FROM_HOOK = '__nova_from_hook';
   const TO_UI = '__nova_to_ui';
   const FROM_UI = '__nova_from_ui';
-  const RELAYED_MESSAGES = new Set(['nova-log', 'nova-fetch-caption', 'nova-fetch-media']);
+  const RELAYED_MESSAGES = new Set(['nova-log', 'nova-fetch-caption']);
   const TRANSFER_CHUNK_SIZE = 4 * 1024 * 1024;
 
   let requestSequence = 1;

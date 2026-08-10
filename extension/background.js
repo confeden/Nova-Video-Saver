@@ -33,9 +33,7 @@ const HANDLED_MESSAGES = new Set([
   'nova-clear-reload-guard',
   'nova-ping',
   'nova-flush-recovered',
-  'nova-fetch-media',
 ]);
-const MEDIA_SLICE_LIMIT = 8 * 1024 * 1024;
 const RECOVERY_KEY = 'nova_recovered';
 
 let offscreenCreation;
@@ -349,40 +347,82 @@ async function handleMessage(message, sender) {
       return { ok: true, id };
     }
 
-    // Range-fetch a media slice on the page's behalf. googlevideo refuses the
-    // mobile-client URLs when a page asks for them — the request carries the
-    // browser's Origin/Sec-Fetch headers and is bound by CORS. Here there is
-    // neither: the host permission makes this an ordinary extension request,
-    // which is much closer to what the URL was issued for.
-    case 'nova-fetch-media': {
+    case 'nova-check-update':
+      return checkForUpdates();
+
+    // Cover art for audio downloads. Fetched here because content pages are
+    // bound by page CORS and the offscreen document by its COEP; the service
+    // worker with the i.ytimg.com host permission has neither restriction.
+    case 'nova-fetch-cover': {
+      const videoId = String(message.videoId || '');
+      if (!/^[A-Za-z0-9_-]{6,}$/.test(videoId)) throw new Error('некорректный идентификатор видео');
+      for (const name of ['maxresdefault', 'hqdefault']) {
+        try {
+          const response = await fetch(`https://i.ytimg.com/vi/${videoId}/${name}.jpg`, { cache: 'no-store' });
+          if (!response.ok) continue;
+          const buffer = new Uint8Array(await response.arrayBuffer());
+          // A real JPEG only: ffmpeg embeds it as the ID3/covr picture as-is.
+          if (buffer.length < 2_000 || buffer[0] !== 0xFF || buffer[1] !== 0xD8) continue;
+          let binary = '';
+          const step = 0x8000;
+          for (let offset = 0; offset < buffer.length; offset += step) {
+            binary += String.fromCharCode(...buffer.subarray(offset, Math.min(offset + step, buffer.length)));
+          }
+          return { ok: true, b64: btoa(binary), source: name };
+        } catch (error) { /* try the next thumbnail size */ }
+      }
+      return { ok: false, error: 'обложка недоступна' };
+    }
+
+    // YouTube's SPA router can intercept page-initiated location.reload()/
+    // assign() and keep a wedged media session alive. Browser-level tab
+    // reloads/navigations (what a manual F5 does) cannot be intercepted.
+    case 'nova-reload-tab': {
+      if (!Number.isInteger(sender?.tab?.id)) throw new Error('вкладка не определена');
+      await chrome.tabs.reload(sender.tab.id);
+      return { ok: true };
+    }
+
+    case 'nova-navigate-tab': {
+      if (!Number.isInteger(sender?.tab?.id)) throw new Error('вкладка не определена');
       const url = new URL(String(message.url || ''));
-      if (url.protocol !== 'https:' || !url.hostname.endsWith('.googlevideo.com')) {
-        throw new Error('media URL is not allowed');
+      const allowedOrigins = ['https://www.youtube.com', 'https://music.youtube.com'];
+      if (!allowedOrigins.includes(url.origin) || url.pathname !== '/watch') {
+        throw new Error('навигация разрешена только на страницы просмотра YouTube');
       }
-      const start = Math.max(0, Number(message.start) || 0);
-      const end = Number(message.end);
-      if (!Number.isFinite(end) || end < start) throw new Error('media range is invalid');
-      if (end - start + 1 > MEDIA_SLICE_LIMIT) throw new Error('media range is too large');
-      // Without a deadline a refused slice can hold the bridge for its full
-      // 30 s timeout, and eight of them at once starve the repair work that
-      // follows the failed direct attempt.
-      const response = await fetch(url.href, {
-        credentials: 'omit',
-        cache: 'no-store',
-        headers: { Range: `bytes=${start}-${end}` },
-        signal: AbortSignal.timeout(15_000),
+      await chrome.tabs.update(sender.tab.id, { url: url.href });
+      return { ok: true };
+    }
+
+    case 'nova-log':
+      await appendLog({
+        ts: Date.now(),
+        tag: message.tag,
+        text: truncate(message.text, LOG_ENTRY_LIMIT),
+        tab: sender?.tab?.id,
+        frame: sender?.frameId,
       });
-      if (!response.ok) {
-        const reason = await response.text().then((text) => text.trim().slice(0, 160)).catch(() => '');
-        return { ok: false, status: response.status, error: reason || `HTTP ${response.status}` };
-      }
-      const bytes = new Uint8Array(await response.arrayBuffer());
-      let binary = '';
-      const step = 0x8000;
-      for (let offset = 0; offset < bytes.length; offset += step) {
-        binary += String.fromCharCode(...bytes.subarray(offset, Math.min(offset + step, bytes.length)));
-      }
-      return { ok: true, status: response.status, b64: btoa(binary) };
+      return { ok: true };
+
+    case 'nova-error':
+      return downloadErrorLog(message, sender);
+
+    case 'nova-ensure':
+      await ensureOffscreen();
+      return { ok: true };
+
+    // Heartbeat from the offscreen document. Receiving it resets this
+    // worker's idle timer, so a long mux can no longer outlive the worker
+    // that has to accept its result.
+    case 'nova-ping':
+      return { ok: true };
+
+    case 'nova-flush-recovered':
+      return flushRecoveredFiles();
+
+    case 'nova-save': {
+      const id = await saveDownload(message.url, message.filename);
+      return { ok: true, id };
     }
 
     case 'nova-fetch-caption': {
