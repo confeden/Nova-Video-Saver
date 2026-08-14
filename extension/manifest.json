@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Nova Video Saver",
-  "version": "1.4",
+  "version": "1.5",
   "description": "Скачивание видео/аудио/субтитров YouTube, запись трансляций YouTube и Twitch — без внешних сервисов",
   "permissions": ["downloads", "offscreen", "storage", "alarms"],
   "host_permissions": [
@@ -45,7 +45,7 @@
       "all_frames": false
     },
     {
-      "matches": ["https://www.twitch.tv/*"],
+      "matches": ["https://www.twitch.tv/*", "https://clips.twitch.tv/*"],
       "js": ["twitch_ui.js"],
       "css": ["twitch_ui.css"],
       "run_at": "document_idle",

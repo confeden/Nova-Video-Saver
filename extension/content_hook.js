@@ -49,6 +49,17 @@
     } catch (e) {}
   }
 
+  // Routine, high-frequency events: worth seeing in the live console, pure
+  // noise in the exported report. The quality recommendation fires on every
+  // navigation, and in the reports of 2026-08-13 it took 75 % / 55 % of the
+  // 400-entry ring — pushing the failing download out of the file entirely.
+  function logLocal(tag, ...args) {
+    try {
+      const text = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+      console.log('[NOVA ' + tag + '] ' + text);
+    } catch (e) {}
+  }
+
   const MAX_CAPTURE_TRACK_BYTES = 750_000_000;
   const AUDIO_ITAGS = new Set(['139', '140', '141', '249', '250', '251', '256', '258', '325', '328', '338', '599', '600', '774']);
   const VIDEO_ITAG_HEIGHT = new Map([
@@ -145,6 +156,11 @@
     innertubeFormats: null,
     innertubeRefusals: 0,
     innertubeBlockedUntil: 0,
+    // How much of each track has already been shipped to the muxer while the
+    // capture was still running. `track` is the object identity we shipped
+    // from: a sequential pass replaces it, and everything shipped before that
+    // belongs to a track that no longer exists.
+    shipped: { audio: { track: null, count: 0, invalid: false }, video: { track: null, count: 0, invalid: false } },
     // Set to 'audio'/'video' while a sequential pass rebuilds that one track.
     singleTrackPass: null,
     // True for the whole of a download: capture helpers must not un-silence.
@@ -175,7 +191,58 @@
     } catch (e) {}
     return null;
   }
+  // Was everything we shipped during the capture, in that exact order, the
+  // finished track byte for byte? Assembly may reorder clusters, drop
+  // duplicates or splice in repaired ranges, and then the shipped stream is a
+  // different file. Verified rather than assumed: a wrong answer here means a
+  // corrupted download, and the comparison costs one pass over the bytes.
+  function shippedMatchesTrack(kind, finalBytes) {
+    const state = store.shipped[kind];
+    const track = store.tracks[kind];
+    if (!state || state.invalid || !track?.parts?.length || !finalBytes?.length) return false;
+    // Nothing shipped yet means there is nothing to save by staging.
+    if (!state.count || state.track !== track) return false;
+    let offset = 0;
+    for (const part of track.parts) {
+      if (offset + part.length > finalBytes.length) return false;
+      for (let index = 0; index < part.length; index++) {
+        if (part[index] !== finalBytes[offset + index]) return false;
+      }
+      offset += part.length;
+    }
+    return offset === finalBytes.length;
+  }
+
+  // Everything captured for this track that has not been handed over yet,
+  // merged into one buffer and marked as shipped.
+  function drainShippedParts(kind) {
+    const state = store.shipped[kind];
+    const track = store.tracks[kind];
+    if (!state || !track?.parts?.length) return null;
+    if (state.track && state.track !== track) {
+      // A sequential pass replaced the track; everything shipped so far
+      // belongs to the old one and can no longer be part of the file.
+      state.invalid = true;
+    }
+    if (state.invalid) return null;
+    if (state.track !== track) { state.track = track; state.count = 0; }
+    const fresh = track.parts.slice(state.count);
+    if (!fresh.length) return null;
+    const merged = new Uint8Array(fresh.reduce((sum, part) => sum + part.length, 0));
+    let offset = 0;
+    for (const part of fresh) { merged.set(part, offset); offset += part.length; }
+    state.count += fresh.length;
+    return merged;
+  }
+
+  function resetShipped() {
+    for (const kind of ['audio', 'video']) {
+      store.shipped[kind] = { track: null, count: 0, invalid: false };
+    }
+  }
+
   function resetCapture() {
+    resetShipped();
     store.tracks = Object.create(null);
     store._lastInit = Object.create(null);
     store._pendingInit = Object.create(null);
@@ -1835,7 +1902,7 @@
         // selection in YouTube's own menu always wins.
         recommendedQuality = { videoId, quality };
         recommendQuality(quality);
-        log('quality', 'default recommendation', selected + 'p', 'monitorShortEdge=', monitorDefaultHeight());
+        logLocal('quality', 'default recommendation', selected + 'p', 'monitorShortEdge=', monitorDefaultHeight());
       }
     })();
   }
@@ -1907,18 +1974,28 @@
   async function removeTrackRangeForCapture(kind, startSeconds, endSeconds, currentVideoOnly = true) {
     let removed = await removeWorkerTrackRange(kind, startSeconds, endSeconds);
     for (const sourceBuffer of liveSourceBuffers(kind, currentVideoOnly)) {
-      try {
-        await waitForUpdateEnd(sourceBuffer);
-        for (let index = sourceBuffer.buffered.length - 1; index >= 0; index--) {
-          const start = Math.max(sourceBuffer.buffered.start(index), Math.max(0, startSeconds));
-          const end = Math.min(sourceBuffer.buffered.end(index), endSeconds);
-          if (start >= end || end <= 0) continue;
-          sourceBuffer.remove(start, end);
+      // The player can start an append between the wait and the call, and then
+      // `remove` throws "still processing". Seen in the field losing a whole
+      // head drop, so the race gets one honest retry instead of a log line.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
           await waitForUpdateEnd(sourceBuffer);
-          removed = true;
+          for (let index = sourceBuffer.buffered.length - 1; index >= 0; index--) {
+            const start = Math.max(sourceBuffer.buffered.start(index), Math.max(0, startSeconds));
+            const end = Math.min(sourceBuffer.buffered.end(index), endSeconds);
+            if (start >= end || end <= 0) continue;
+            sourceBuffer.remove(start, end);
+            await waitForUpdateEnd(sourceBuffer);
+            removed = true;
+          }
+          break;
+        } catch (error) {
+          if (attempt) {
+            log('capture', `could not remove ${kind} range:`, error?.message || error);
+            break;
+          }
+          await sleep(150);
         }
-      } catch (error) {
-        log('capture', `could not remove ${kind} range:`, error?.message || error);
       }
     }
     return removed;
@@ -3648,11 +3725,63 @@
       }
     }
 
+    // Extend from the current capture cursor through any touching buffered
+    // ranges. YouTube evicts old ranges on long videos, so measuring strictly
+    // from zero would make progress jump back to 0 and restart the seek pass.
+    const bufferedEndFrom = (position) => {
+      let end = Math.max(0, Number(position) || 0);
+      for (let i = 0; i < v.buffered.length; i++) {
+        if (v.buffered.start(i) <= end + 0.75 && v.buffered.end(i) > end) {
+          end = v.buffered.end(i);
+        }
+      }
+      return end;
+    };
+
+    // `v.buffered` is the INTERSECTION of the SourceBuffers, so it follows
+    // whichever track holds less. That is useless for deciding how much of a
+    // track to drop: after the video representation switch the video buffer
+    // shrinks and the intersection follows it, while the audio buffer still
+    // holds its original head. Log 59: the intersection said 4.8 s, audio
+    // really had ~21 s, only a third of the audio head was dropped, and the
+    // untouched remainder became a 2 s hole (7941→10001) that nothing could
+    // repair — the interior refill could not even remove that range any more.
+    const bufferedHeadForKind = (kind) => {
+      let edge = 0;
+      for (const sourceBuffer of liveSourceBuffers(kind, false)) {
+        try {
+          for (let index = 0; index < sourceBuffer.buffered.length; index++) {
+            if (sourceBuffer.buffered.start(index) <= edge + 0.75
+              && sourceBuffer.buffered.end(index) > edge) {
+              edge = sourceBuffer.buffered.end(index);
+            }
+          }
+        } catch (e) {}
+      }
+      return edge;
+    };
+
+    // Nothing captured yet while the player already holds part of the clip.
+    // That is the normal state of a watched Short (the feed prefetched it while
+    // the previous reel was still the current video, so the bytes went through
+    // the hook under another id) and it dooms the pass below, which seeds its
+    // cursor from the buffered edge and therefore skips exactly that head.
+    // Switching the representation is the ONE thing measured to make YouTube
+    // deliver the clip again: in log 53 both successful Shorts went through it
+    // (player on 2160p, request 1080p → `qualityRestarted`), and every failing
+    // run had target == current, so no switch happened. Dropping the buffered
+    // ranges instead was measured NOT to work (`appendsResumed= false`); it
+    // stays only as a cheap fallback below.
+    const preBufferedDeadEnd = needVideo && !MUSIC_HOST
+      && (!capturedTrackHasMedia('audio') || !capturedTrackHasMedia('video'))
+      && bufferedEndFrom(0) >= 2;
+    const wantsFreshRepresentation = forceFreshVideo || preBufferedDeadEnd;
+
     // Request target quality so the captured track is the desired one.
     if (needVideo) {
       try { if (!v.paused) v.pause(); } catch (e) {}
       const requestedHeight = Number(opts.height) || 0;
-      if (requestedHeight > 0 && (forceFreshVideo
+      if (requestedHeight > 0 && (wantsFreshRepresentation
         || (previousHeight && previousHeight !== requestedHeight))) {
         // Discard only our bytes from the disposable MP3 video representation.
         // Do not touch SourceBuffer: the quality switch below will naturally
@@ -3661,21 +3790,50 @@
         delete store._pendingInit.video;
         store.lastAppendAt.video = 0;
       }
-      if (forceFreshVideo && requestedHeight > 0) {
+      if (wantsFreshRepresentation && requestedHeight > 0) {
         const heights = availableHeights().sort((left, right) => left - right);
+        // The rung next to the target, not the bottom one. Going 480p → 144p
+        // and back is a long excursion, and SABR does not always come back:
+        // measured `requested 480p but player is on 144p (SABR ignored
+        // request)`, after which the capture had no init at all and spent
+        // three minutes recording nothing.
+        const position = heights.indexOf(requestedHeight);
+        const neighbour = position > 0
+          ? heights[position - 1]
+          : (position === 0 ? heights[1] : null);
         const alternateHeight = mp3FillerHeight !== requestedHeight
           && QUALITY_BY_HEIGHT[mp3FillerHeight]
           ? mp3FillerHeight
-          : (heights.find((candidate) => candidate !== requestedHeight) || null);
+          : (neighbour || heights.find((candidate) => candidate !== requestedHeight) || null);
         const alternateQuality = QUALITY_BY_HEIGHT[alternateHeight] || null;
         if (alternateQuality) {
+          // Wait for a real append, not for the reported quality. `currentQuality()`
+          // flips the moment the request is accepted, long before the player
+          // rebuilds anything: in log 56 both switches went through in 200 ms,
+          // the player kept its buffered 1080p and fetched nothing at all, and
+          // the whole cycle became a no-op that cost a page reload. The very
+          // next attempt spent 2 s here — and worked.
+          const appendBefore = Math.max(store.lastAppendAt.audio || 0, store.lastAppendAt.video || 0);
           setQualityRaw(alternateQuality);
-          for (let attempt = 0; attempt < 20; attempt++) {
-            if (currentQuality() === alternateHeight) break;
+          let appendSeen = false;
+          const alternateDeadline = Date.now() + 2_500;
+          while (Date.now() < alternateDeadline) {
             await sleep(100);
+            throwIfDownloadCancelled();
+            if (Math.max(store.lastAppendAt.audio || 0, store.lastAppendAt.video || 0) > appendBefore) {
+              appendSeen = true;
+              break;
+            }
           }
-          log('capture', 'cycling away from restored quality after MP3; alternate=',
-            alternateHeight + 'p', 'requested=', requestedHeight + 'p');
+          log('capture', 'cycling the representation to force a fresh fetch; alternate=',
+            alternateHeight + 'p', 'requested=', requestedHeight + 'p',
+            'reason=', forceFreshVideo ? 'mp3-isolation' : 'pre-buffered',
+            'appendSeen=', appendSeen, 'reported=', currentQuality() + 'p');
+          // Whatever arrived here belongs to the alternate rung; the target
+          // representation is requested next and must not be mixed with it.
+          delete store.tracks.video;
+          delete store._pendingInit.video;
+          store.lastAppendAt.video = 0;
         }
       }
       setQualityRaw(targetQ);
@@ -3692,7 +3850,7 @@
       if (got && got !== opts.height) {
         log('capture', 'requested ' + opts.height + 'p but player is on ' + got + 'p (SABR ignored request)');
       }
-      if (got && (got !== previousHeight || forceFreshVideo)) {
+      if (got && (got !== previousHeight || wantsFreshRepresentation)) {
         // Ask the new representation for its first segment without removing the
         // attached SourceBuffer. Current YouTube SABR sessions often never
         // recover after SourceBuffer.remove().
@@ -3795,25 +3953,160 @@
     // element buffers normally, but the page SourceBuffer hook sees no bytes.
     // The paused-seek pass below remains attached to the observable stream.
 
-    // Extend from the current capture cursor through any touching buffered
-    // ranges. YouTube evicts old ranges on long videos, so measuring strictly
-    // from zero would make progress jump back to 0 and restart the seek pass.
-    const bufferedEndFrom = (position) => {
-      let end = Math.max(0, Number(position) || 0);
-      for (let i = 0; i < v.buffered.length; i++) {
-        if (v.buffered.start(i) <= end + 0.75 && v.buffered.end(i) > end) {
-          end = v.buffered.end(i);
-        }
-      }
-      return end;
-    };
-
     // Already fully buffered up to the capture end? Nothing to fetch -> no seek.
-    const initialBufferedEnd = bufferedEndFrom(0);
+    let initialBufferedEnd = bufferedEndFrom(0);
     // Do not declare completion one whole YouTube segment early. The previous
     // tolerance reached almost six seconds on ordinary videos, so assembly
     // correctly rejected the absent tail at 99% and forced a full second pass.
     const endTolerance = Math.min(0.15, capEnd * 0.001);
+
+    // Nothing captured, and the pass below cannot fix that by itself: it seeds
+    // its cursor from the buffered edge, so it skips exactly the head the player
+    // already holds. Fully buffered clip (log 51): the cursor starts at the END
+    // and every seek, primer and escalation lands on the last frame — 145 s of
+    // guaranteed failure. Partially buffered (log 52): only the tail is
+    // captured and `получен только конечный фрагмент видеодорожки` fires.
+    // The representation cycle above is the real rescue; this is the verdict on
+    // whether it worked, and an escape hatch that costs seconds instead of
+    // minutes when it did not.
+    const requiredTracksEmpty = () => !capturedTrackHasMedia('audio')
+      || (needVideo && !capturedTrackHasMedia('video'));
+    // Per kind, never "any append": in log 54 the audio side happily delivered
+    // 52 parts while the video SourceBuffer had no adoptable init and produced
+    // `videoParts= 0` for the entire pass. An audio-only revival looked like
+    // success here and cost 145 s before the stall guard noticed.
+    // Recorded fragments, not raw appends. A representation cycle can leave the
+    // player appending into buffers whose init we never saw, and then every
+    // fragment is dropped: measured `appendsResumed= true` while both tracks
+    // stayed at zero parts, followed by three minutes of recording nothing.
+    // Raw appends are still reported, because "player silent" and "player
+    // talking but unusable" need different fixes.
+    const waitForAppends = async (windowMs) => {
+      const before = {};
+      for (const kind of requiredKinds) before[kind] = store.lastAppendAt[kind] || 0;
+      const appended = () => requiredKinds.filter((kind) => (store.lastAppendAt[kind] || 0) > before[kind]);
+      const captured = () => requiredKinds.filter((kind) => capturedTrackHasMedia(kind));
+      const deadline = Date.now() + windowMs;
+      let resumedKinds = [];
+      while (Date.now() < deadline) {
+        await sleep(250);
+        throwIfDownloadCancelled();
+        if (store.captureError) throw store.captureError;
+        resumedKinds = captured();
+        if (resumedKinds.length === requiredKinds.length) break;
+      }
+      return { resumedKinds, appendedKinds: appended() };
+    };
+    if (!MUSIC_HOST && requiredTracksEmpty()
+      && (initialBufferedEnd >= 2 || wantsFreshRepresentation)) {
+      // The cycle above rebuilds VIDEO from zero, but audio keeps its itag, so
+      // the player keeps the audio it already holds and re-serves it only from
+      // its own buffered edge. That is the whole reason the captured audio
+      // always starts at 10001/20001 ms and needs the prefix repair afterwards
+      // — a repair that succeeds only about half the time and, when it fails,
+      // costs a page reload. Measured across logs 55-57: the missing audio head
+      // tracks the pre-buffered length (17.6 s buffered → track starts at
+      // 20001, 10.8 → 10001, 6.8 → no hole at all).
+      // So take that head away now, while the player is already rebuilding,
+      // instead of asking for it later when it refuses. Both kinds go together:
+      // SABR treats a range as served while the companion still covers it.
+      // Only while nothing is arriving: cutting an in-flight delivery is how
+      // the prefix repair loses half its refills.
+      if (wantsFreshRepresentation && requiredTracksEmpty()) {
+        // One boundary for both tracks, never per track: SABR treats a range as
+        // served while the companion still covers it. Log 61 showed the price
+        // of the per-track version — audio's head was dropped alone
+        // (`dropped= audio:5.0`), video kept its own, and the capture came back
+        // with the video track starting at 6.0 s and a hole no refill could
+        // close: prefix, nudge and interior all failed, then a page reload.
+        let head = 0;
+        for (const kind of requiredKinds) head = Math.max(head, bufferedHeadForKind(kind));
+        if (head >= 2) {
+          const headEnd = Math.min(capEnd, head + 1);
+          const dropped = [];
+          for (const kind of requiredKinds) {
+            try {
+              if (await removeTrackPrefixForCapture(kind, headEnd, false)) dropped.push(kind);
+            } catch (e) {}
+          }
+          if (dropped.length) seekTo(0);
+          log('capture', 'dropped the pre-buffered head so the player fetches it again; end=',
+            Number(headEnd.toFixed(2)), 'dropped=', dropped.join(',') || 'none');
+        }
+      }
+      // A fresh representation was just requested, or the player may simply be
+      // mid-delivery: either way the appends settle it, and this window ends the
+      // moment every required track has produced one.
+      let { resumedKinds, appendedKinds } = await waitForAppends(wantsFreshRepresentation ? 4_000 : 1_200);
+      let resumed = resumedKinds.length === requiredKinds.length;
+      let flushedAny = false;
+      if (!resumed) {
+        // Fallback: drop the buffered ranges so SABR has to serve them again.
+        // Measured once as ineffective (log 53: `removedRanges= true` but
+        // `appendsResumed= false`), kept only because it costs two seconds and
+        // the alternative is a full page reload.
+        const flushEnd = (Number(v.duration) || capEnd || 0) + 5;
+        // Not `currentVideoOnly`: on Shorts no SourceBuffer carries the current
+        // video id (that is the same prefetch that caused this state), so the
+        // current-video filter would remove nothing at all.
+        for (const kind of ['audio', 'video']) {
+          try {
+            const removed = await removeTrackPrefixForCapture(kind, flushEnd, false);
+            flushedAny = flushedAny || removed;
+          } catch (e) {}
+        }
+        seekTo(0);
+        try { await playWithTimeout(v, 750); } catch (e) {}
+        ({ resumedKinds, appendedKinds } = await waitForAppends(3_000));
+        resumed = resumedKinds.length === requiredKinds.length;
+        pauseForCapture(v);
+        // The first append after the flush can be the one that finally tells the
+        // hook the reel changed, and that reset drops the init we adopted during
+        // the bootstrap. Re-adopt it before the pass starts recording fragments.
+        for (const kind of (needVideo ? ['audio', 'video'] : ['audio'])) {
+          if (store._lastInit[kind]) continue;
+          const attached = liveSourceBuffers(kind, false);
+          if (attached.length) adoptAttachedInitForCapture(kind, attached, vidId());
+        }
+      }
+      initialBufferedEnd = bufferedEndFrom(0);
+      log('capture', 'pre-buffered rescue verdict; freshRepresentation=', wantsFreshRepresentation,
+        'removedRanges=', flushedAny, 'captureResumed=', resumed,
+        'capturedKinds=', resumedKinds.join(',') || 'none',
+        'appendedKinds=', appendedKinds.join(',') || 'none',
+        'quality=', currentQuality() + 'p',
+        'bufferedEnd=', Number(initialBufferedEnd.toFixed(2)));
+      if (!resumed) {
+        // A reload is not a guess here: in both logs where this state occurred
+        // the capture after the automatic reload produced data within seconds.
+        const completedReloads = Math.max(0, Number(opts.reloadCount) || 0);
+        if (completedReloads < 2) {
+          const retry = new Error('плеер не отдаёт сегменты уже показанного ролика; страница будет обновлена, загрузка продолжится автоматически');
+          retry.novaFatal = true;
+          retry.details = {
+            reloadRequired: true,
+            reason: 'prebuffered-no-capture',
+            videoId: capId,
+            reloadCount: completedReloads,
+            bufferedEnd: Number(initialBufferedEnd.toFixed(3)),
+            target: Number(capEnd.toFixed(3)),
+            freshRepresentation: wantsFreshRepresentation,
+            removedRanges: flushedAny,
+            capturedKinds: resumedKinds.join(',') || 'none',
+            appendedKinds: appendedKinds.join(',') || 'none',
+            quality: currentQuality() || null,
+            // A kind without an init is the "invisible pipeline" case: the
+            // SourceBuffer exists but never showed us an init segment, so no
+            // fragment of it can be recorded no matter how long we wait.
+            initsKnown: requiredKinds.filter((kind) => store._lastInit[kind]).join(',') || 'none',
+          };
+          log('capture', 'requesting automatic page reload; the pre-buffered clip cannot be re-served',
+            JSON.stringify(retry.details));
+          throw retry;
+        }
+        log('capture', 'pre-buffered clip stayed silent, but the reload budget is spent; continuing with seeks');
+      }
+    }
     const reachedCaptureEnd = (edge) => edge >= capEnd - endTolerance;
     if (!qualityRestarted && capturedTrackHasMedia('audio')
       && (!needVideo || capturedTrackHasMedia('video'))
@@ -4010,7 +4303,11 @@
             + ` (threshold ${Math.round(escalateAfterMs / 1000)}s, captured=${nothingCaptured ? 'nothing' : 'partial'});`
             + ' escalating to muted playback-driven capture; cursor=',
             Number(cursor.toFixed(2)), 'target=', Number(capEnd.toFixed(2)));
-          seekTo(Math.max(0, Math.min(cursor, capEnd - 1)));
+          // With nothing captured the cursor carries no information: it was
+          // seeded from the player's buffered edge, which on a pre-buffered clip
+          // is the last frame. Playing there records nothing at all, so start
+          // the rescue where the data is actually missing.
+          seekTo(nothingCaptured ? 0 : Math.max(0, Math.min(cursor, capEnd - 1)));
           try { await playWithTimeout(v, 2_000); } catch (e) {}
           lastAdvanceAt = Date.now();
           lastMediaAt = Date.now();
@@ -4167,7 +4464,15 @@
     let observedAppendAt = appendBefore;
     let cursor = 0;
     let lastActivityAt = Date.now();
+    // Asking again is useless, and that is measured, not assumed: repeated
+    // paired nudges and re-primers were tried in log 57 and produced
+    // `appendObserved= false` twelve times out of twelve across three runs (the
+    // second nudge even found nothing left to remove — the player had not
+    // re-fetched the companion range either). Once this delivery stops
+    // mid-prefix, it never resumes in that session, so the loop keeps a single
+    // nudge and gives up quickly instead of spending half a minute.
     let companionNudged = pairCompanion && companionRemoved;
+    const idleGiveUpMs = 8_000;
     const deadline = Date.now() + 45_000;
     const primePrefixRequest = async (label, position = 0) => {
       seekTo(Math.max(0, Math.min(position, prefixEnd - 0.1)));
@@ -4291,7 +4596,7 @@
           await primePrefixRequest('paired');
           continue;
         }
-        if (Date.now() - lastActivityAt >= 20_000) break;
+        if (Date.now() - lastActivityAt >= idleGiveUpMs) break;
       }
       throw new Error(`YouTube не отдал начало ${kind === 'audio' ? 'аудио' : 'видео'}дорожки`);
     } finally {
@@ -4782,6 +5087,13 @@
       });
 
       let cleared = false;
+      let companionCleared = false;
+      const companion = kind === 'audio' ? 'video' : 'audio';
+      // Everything below replays the video for this one track; the companion is
+      // already captured and must not grow while it happens. Set before any
+      // buffer is touched — clearing the companion below makes the player fetch
+      // it again, and those fragments must not land in the finished track.
+      store.singleTrackPass = kind;
       store.capturing = false;
       try {
         cleared = await resetTrackBufferForCapture(kind);
@@ -4791,18 +5103,33 @@
         if (hadBufferedData && !cleared) {
           throw new Error(`не удалось подготовить ${kind === 'audio' ? 'аудио' : 'видео'}буфер для прохода от начала`);
         }
+        // SABR treats a range as served while the COMPANION buffer still covers
+        // it. Measured across logs 51 and 52: three passes that cleared only
+        // audio got nothing for 80 s each, while every targeted refill that
+        // removed both (`companionRemoved= true`) was answered within a second.
+        // The companion's captured bytes live in store.tracks and are not
+        // touched here — only the player-side range goes away.
+        try {
+          companionCleared = await removeTrackRangeForCapture(
+            companion, 0, (Number(v.duration) || capEnd || 0) + 5, false,
+          );
+        } catch (e) {}
         delete store.tracks[kind];
         delete store._pendingInit[kind];
         store.lastAppendAt[kind] = 0;
+      } catch (error) {
+        // The flag is normally cleared by the capture loop's `finally`, which
+        // this throw never reaches — leaving it set would silently drop the
+        // companion track for the rest of the session.
+        store.singleTrackPass = null;
+        throw error;
       } finally {
         store.capturing = true;
       }
 
       seekTo(0);
-      // Everything below replays the video for this one track; the companion is
-      // already captured and must not grow while it happens.
-      store.singleTrackPass = kind;
       log('capture', 'sequential MSE track pass; kind=', kind, 'cleared=', cleared,
+        'companionCleared=', companionCleared,
         'buffers=', selectedBuffers.length, 'target=', capEnd);
 
       let cursor = 0;
@@ -6192,6 +6519,23 @@
       window.postMessage({ [FROM_HOOK]: true, reqId, ...payload }, location.origin, transfer || []);
     };
     try {
+      // Hands over whatever has been captured but not shipped yet, so the
+      // muxer receives the bulk of the track while the capture is still
+      // running instead of afterwards. The parts stay here: assembly may still
+      // reorder or drop some of them, and only the byte-exact comparison in
+      // `shippedMatchesTrack()` decides whether what we shipped is the file.
+      if (cmd === 'drain-captured') {
+        const tracks = {};
+        const transfers = [];
+        for (const kind of ['audio', 'video']) {
+          const merged = drainShippedParts(kind);
+          if (!merged) continue;
+          tracks[kind] = merged.buffer;
+          transfers.push(merged.buffer);
+        }
+        reply({ ok: true, tracks }, transfers);
+        return;
+      }
       if (cmd === 'info') {
         const p = player();
         const rawDuration = video() && video().duration;
@@ -6236,6 +6580,9 @@
           throw new Error('это прямая трансляция — используйте пункт «Запись эфира» в меню');
         }
         store.cancelRequested = false;
+        // Shipping starts from scratch for every download: the previous one
+        // left its own counters, and its track objects are already gone.
+        resetShipped();
         const isMp3 = format === 'mp3';
         const targetQ = isMp3 ? 'medium' : (QUALITY_BY_HEIGHT[height] || 'hd720');
         const previousQuality = qualitySnapshot();
@@ -6577,6 +6924,20 @@
                         || nextDetails?.missingTail === true
                         || Number(nextDetails?.firstTimecode) > 5_000);
                     if (!repairable) throw nextValidationError;
+                    // The very same hole after the attempt means nothing usable
+                    // arrived: measured four times in a row on Shorts, where
+                    // `blocks=` stayed identical (2903, 2904) through three
+                    // interior retries at ~21 s each. Spend those 42 seconds on
+                    // the page reload that actually closes these holes instead.
+                    const sameHole = nextDetails.kind === details.kind
+                      && Math.round(Number(nextDetails.gapStartMs) || 0) === Math.round(Number(details.gapStartMs) || 0)
+                      && Math.round(Number(nextDetails.gapEndMs) || 0) === Math.round(Number(details.gapEndMs) || 0)
+                      && Math.round(Number(nextDetails.firstTimecode) || 0) === Math.round(Number(details.firstTimecode) || 0);
+                    if (sameHole) {
+                      attemptsByGap.set(repairKey, maxAttemptsPerGap);
+                      log('assembly', `webm ${details.kind}; ${mode} refill changed nothing`
+                        + ' — skipping the remaining attempts for this hole');
+                    }
                     validationError = nextValidationError;
                   }
 
@@ -6867,7 +7228,28 @@
             duration: cap && cap.duration,
             forceTranscode: Boolean(result.forceTranscode),
           };
+          const matchStartedAt = Date.now();
+          payload.staged = {
+            audio: shippedMatchesTrack('audio', aud.bytes),
+            video: false,
+          };
+          if (!isMp3 && result.video?.bytes) {
+            payload.staged.video = shippedMatchesTrack('video', result.video.bytes);
+          }
           const transfers = [aud.bytes.buffer];
+          // Whatever was captured after the last drain: the shipped stream is
+          // only the finished track once this tail follows it.
+          for (const [kind, key] of [['audio', '_tailA'], ['video', '_tailV']]) {
+            if (!payload.staged[kind]) continue;
+            const tail = drainShippedParts(kind);
+            if (!tail) continue;
+            payload[key] = tail.buffer;
+            transfers.push(tail.buffer);
+          }
+          log('transfer', 'staged tracks verified; audio=', payload.staged.audio,
+            'video=', payload.staged.video,
+            'tailBytes=', (payload._tailA?.byteLength || 0) + (payload._tailV?.byteLength || 0),
+            'seconds=', Number(((Date.now() - matchStartedAt) / 1000).toFixed(2)));
           payload._a = aud.bytes.buffer;
           if (!isMp3) {
             const vid = result.video;
@@ -6888,6 +7270,29 @@
             }
           }
           reply(payload, transfers);
+          // The assembled buffers have just been transferred away, and the mux
+          // that follows runs for a minute on a long video (measured: 73 s for
+          // 164 MB). Until now the raw capture stayed in memory for all of it —
+          // 2547 parts, another 152 MB — on top of the copy offscreen already
+          // holds and the muxer output being built there. Nothing reads these
+          // parts after assembly: every repair and re-assembly path runs
+          // before this point. Let them go so the wait is not spent under
+          // memory pressure.
+          // Whole track, not just its parts: a stripped track would still look
+          // present to the "reuse the completed audio" check and would be
+          // assembled into nothing.
+          const releasedParts = [];
+          for (const kind of ['audio', 'video']) {
+            const track = store.tracks[kind];
+            if (!track?.parts?.length) continue;
+            if (kind === 'audio' && store.completedAudioCache) continue;
+            releasedParts.push(`${kind}:${track.parts.length}`);
+            delete store.tracks[kind];
+            delete store._pendingInit[kind];
+          }
+          if (releasedParts.length) {
+            log('capture', 'released captured parts after handover;', releasedParts.join(' '));
+          }
         } finally {
           store.cancelRequested = false;
           store.capturing = true;

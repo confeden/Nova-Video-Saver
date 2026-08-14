@@ -256,13 +256,13 @@ async function tryWebcodecsTranscode(job, videoBytes, audioBytes) {
 // through a fragmented MP4 assembled from captured segments (exit code 0, a few
 // seconds of output); Mediabunny parses the fragment index itself and either
 // produces the whole track or fails loudly.
-async function muxVodWithMediabunny(job, videoBytes, audioBytes) {
+async function muxVodWithMediabunny(job, videoSource, audioSource) {
   const {
-    Input, Output, Conversion, ALL_FORMATS, BlobSource, BufferTarget, Mp4OutputFormat,
+    Input, Output, Conversion, ALL_FORMATS, BufferTarget, Mp4OutputFormat,
   } = await getMediabunny();
   const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
-  const videoInput = new Input({ formats: ALL_FORMATS, source: new BlobSource(new Blob([videoBytes])) });
-  const audioInput = new Input({ formats: ALL_FORMATS, source: new BlobSource(new Blob([audioBytes])) });
+  const videoInput = new Input({ formats: ALL_FORMATS, source: videoSource });
+  const audioInput = new Input({ formats: ALL_FORMATS, source: audioSource });
   const videoConversion = await Conversion.init({
     input: videoInput, output, composable: true, audio: { discard: true },
   });
@@ -315,6 +315,113 @@ async function muxVodWithMediabunny(job, videoBytes, audioBytes) {
   const short = outputDurationMismatch(job, bytes);
   if (short) throw new Error(short);
   return bytes;
+}
+
+// Kicks off the mux while the tracks are still being transferred, on a worker
+// thread so this document keeps answering messages. Eligibility is decided from
+// the begin message alone, so nothing here waits for bytes: the parser blocks
+// on its first read until the first chunks land.
+function startStreamingMux(job) {
+  if (job.format === 'mp3' || job.transcode || job.muxed) return;
+  if (job.scaleHeight || job.videoPrefixBoundary > 0) return;
+  if (!(job.streams.video.expected > 0) || !(job.streams.audio.expected > 0)) return;
+
+  let worker;
+  try {
+    worker = new Worker('mux_worker.js', { type: 'module' });
+  } catch (error) {
+    logToWorker('mux', `mux worker unavailable: ${String(error?.message || error)}`);
+    return;
+  }
+  // Until the worker reports `ready` it has not imported mediabunny yet and may
+  // still bow out; nothing is transferred to it before that, so the document
+  // can fall back with every byte intact.
+  const bridge = { worker, ready: false, queue: [], lastTick: Date.now(), settled: false };
+  job.muxWorker = bridge;
+  job.stage = 'mediabunny-stream';
+
+  job.streamMux = new Promise((resolve, reject) => {
+    const settle = (fn, value) => {
+      if (bridge.settled) return;
+      bridge.settled = true;
+      job.muxWorker = null;
+      try { worker.terminate(); } catch (e) {}
+      fn(value);
+    };
+    worker.onmessage = (event) => {
+      const message = event.data || {};
+      bridge.lastTick = Date.now();
+      if (message.t === 'ready') {
+        bridge.ready = true;
+        for (const queued of bridge.queue) {
+          worker.postMessage({ t: 'chunk', track: queued.track, bytes: queued.bytes.buffer },
+            [queued.bytes.buffer]);
+        }
+        bridge.queue.length = 0;
+        return;
+      }
+      if (message.t === 'progress') {
+        if (activeJob === job) {
+          job.lastProgressAt = Date.now();
+          sendProgress(0.1 + message.value * 0.85, 'Сборка дорожек…');
+        }
+        return;
+      }
+      if (message.t === 'tick') return;
+      if (message.t === 'unavailable') {
+        logToWorker('mux', `mux worker could not load mediabunny: ${message.message}`);
+        settle(reject, new Error(message.message || 'worker не загрузил mediabunny'));
+        return;
+      }
+      if (message.t === 'done') {
+        bridge.consumed = message.consumed || null;
+        settle(resolve, new Uint8Array(message.bytes));
+        return;
+      }
+      if (message.t === 'error') {
+        // The worker hands its bytes back with the failure, so the buffered
+        // path below still has something to work with.
+        for (const [track, buffers] of [['video', message.video], ['audio', message.audio]]) {
+          if (!Array.isArray(buffers)) continue;
+          job[track] = buffers.map((buffer) => new Uint8Array(buffer));
+        }
+        settle(reject, new Error(message.message || 'сборка в worker не удалась'));
+      }
+    };
+    worker.onerror = (event) => {
+      settle(reject, new Error(`worker сборки завершился аварийно: ${event?.message || 'без сообщения'}`));
+    };
+    worker.onmessageerror = () => {
+      settle(reject, new Error('worker сборки не смог принять данные'));
+    };
+  });
+  job.streamMux.catch(() => {});
+
+  worker.postMessage({
+    t: 'start',
+    videoSize: job.streams.video.expected,
+    audioSize: job.streams.audio.expected,
+  });
+
+  // Adopted staged tracks are already here; hand them over as the first chunks.
+  for (const track of ['video', 'audio']) {
+    if (!job[track].length) continue;
+    for (const bytes of job[track]) bridge.queue.push({ track, bytes });
+    job[track] = [];
+  }
+}
+
+// Feeds one received chunk to the mux worker, or keeps it here when there is
+// no worker (mp3, transcode, prefix concat and every fallback path).
+function routeChunkToWorker(job, track, bytes) {
+  const bridge = job.muxWorker;
+  if (!bridge || (track !== 'video' && track !== 'audio')) return false;
+  if (bridge.ready) {
+    bridge.worker.postMessage({ t: 'chunk', track, bytes: bytes.buffer }, [bytes.buffer]);
+  } else {
+    bridge.queue.push({ track, bytes });
+  }
+  return true;
 }
 
 async function loadSingleThreadFFmpeg() {
@@ -376,6 +483,31 @@ function decodeBase64(value) {
   const bytes = new Uint8Array(binary.length);
   for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
   return bytes;
+}
+
+// ---- track bookkeeping ---------------------------------------------------
+// How much of each track has arrived and how much is expected. The bytes
+// themselves live in the mux worker while it runs (`mux_worker.js` owns the
+// reader), so nothing here needs to address them.
+function createTrackStream(chunks, expectedSize) {
+  return {
+    chunks,
+    starts: [],
+    received: 0,
+    expected: Math.max(0, Number(expectedSize) || 0),
+    complete: false,
+    failure: null,
+  };
+}
+
+function completeTrackStream(stream) {
+  if (!stream) return;
+  stream.complete = true;
+}
+
+function failTrackStream(stream, error) {
+  if (!stream) return;
+  stream.failure = error instanceof Error ? error : new Error(String(error));
 }
 
 function concatParts(parts) {
@@ -501,11 +633,46 @@ function beginJob(message) {
     lastProgressAt: 0,
     stage: 'receiving',
   };
+  // Adopt what the page shipped during the capture, per track and only where
+  // it said the bytes are the finished file. A size mismatch means something
+  // was lost on the way, so that track is transferred again instead.
+  const adopt = { audio: false, video: false };
+  if (staging && staging.id === message.jobId && Date.now() - staging.at < STAGING_TTL_MS) {
+    for (const track of ['audio', 'video']) {
+      const declared = Number(track === 'audio' ? message.audioSize : message.videoSize) || 0;
+      if (!message.staged?.[track] || !declared) continue;
+      if (stagedBytesFor(track) !== declared) continue;
+      activeJob[track] = staging[track];
+      adopt[track] = true;
+    }
+  }
+  dropStaging();
+  activeJob.staged = adopt;
+  activeJob.streams = {
+    video: createTrackStream(activeJob.video, message.videoSize),
+    audio: createTrackStream(activeJob.audio, message.audioSize),
+  };
+  for (const track of ['audio', 'video']) {
+    if (!adopt[track]) continue;
+    const stream = activeJob.streams[track];
+    for (const part of activeJob[track]) {
+      stream.starts.push(stream.received);
+      stream.received += part.length;
+    }
+    completeTrackStream(stream);
+  }
+  if (adopt.audio || adopt.video) {
+    const adoptedBytes = (adopt.audio ? activeJob.streams.audio.received : 0)
+      + (adopt.video ? activeJob.streams.video.received : 0);
+    logToWorker('transfer', `adopted staged tracks; audio=${adopt.audio}`
+      + ` video=${adopt.video} bytes=${adoptedBytes}`);
+  }
   // Diagnostics must describe this job only: the tail of a previous run's
   // ffmpeg output otherwise ends up in this job's error report.
   ffmpegLogs.length = 0;
   updateKeepAlive();
   getFFmpeg().catch(() => {}); // warm up while chunks arrive
+  startStreamingMux(activeJob);
   return { ok: true };
 }
 
@@ -518,13 +685,68 @@ function appendChunk(message) {
     return { ok: false, error: 'неизвестный тип дорожки' };
   }
   const target = message.track === 'video-prefix' ? 'videoPrefix' : message.track;
-  activeJob[target].push(decodeBase64(message.b64));
+  const bytes = decodeBase64(message.b64);
+  const length = bytes.length;
+  // Straight to the worker when there is one: it owns the bytes from then on,
+  // which is what keeps a single copy in memory. Read the length first — the
+  // transfer neuters the view.
+  if (!routeChunkToWorker(activeJob, target, bytes)) activeJob[target].push(bytes);
+  const stream = activeJob.streams?.[target];
+  if (stream) {
+    stream.received += length;
+    stream.starts.push(stream.received - length);
+  }
   activeJob.lastActivity = Date.now();
   return { ok: true };
 }
 
+// ---- staging: track bytes that arrive while the capture still runs --------
+// The page ships captured parts as they appear, long before it knows whether
+// the finished track will be exactly that stream (assembly can still reorder
+// or drop parts). Nothing here is trusted: `nova-begin` adopts the staged
+// bytes only for the tracks the page verified byte for byte, and the rest is
+// transferred the normal way.
+const STAGING_TTL_MS = 20 * 60_000;
+let staging;
+
+function openStaging(message) {
+  if (typeof message.jobId !== 'string' || !message.jobId) {
+    return { ok: false, error: 'идентификатор задания отсутствует' };
+  }
+  staging = { id: message.jobId, video: [], audio: [], bytes: 0, at: Date.now() };
+  return { ok: true };
+}
+
+function stageChunk(message) {
+  if (!staging || staging.id !== message.jobId) return { ok: false, error: 'нет области приёма' };
+  if (message.track !== 'video' && message.track !== 'audio') {
+    return { ok: false, error: 'неизвестный тип дорожки' };
+  }
+  const bytes = decodeBase64(message.b64);
+  staging[message.track].push(bytes);
+  staging.bytes += bytes.length;
+  staging.at = Date.now();
+  return { ok: true };
+}
+
+function dropStaging() {
+  staging = undefined;
+}
+
+function stagedBytesFor(track) {
+  if (!staging) return 0;
+  return staging[track].reduce((total, part) => total + part.length, 0);
+}
+
 function abortJob(message) {
+  if (staging?.id === message.jobId) dropStaging();
   if (activeJob?.id === message.jobId && activeJob.phase === 'receiving') {
+    // Release the streaming mux first: its reads are waiting for bytes that
+    // will now never arrive, and an abandoned conversion would hold the whole
+    // job alive.
+    const aborted = new Error('загрузка отменена');
+    failTrackStream(activeJob.streams?.video, aborted);
+    failTrackStream(activeJob.streams?.audio, aborted);
     activeJob.video.length = 0;
     activeJob.videoPrefix.length = 0;
     activeJob.audio.length = 0;
@@ -1048,66 +1270,138 @@ async function finalizeJob(message) {
 
     job.stage = 'buffers';
     sendProgress(0.06, 'Подготовка буферов дорожек…');
-    const inputs = [];
-    // A muxed job carries everything on the video track; there is no separate
-    // audio buffer to validate or hand to ffmpeg.
-    const audioName = job.muxed ? null : `audio.${extensionFor(job.audioMime)}`;
-    const audioBytes = job.muxed ? null : concatParts(job.audio);
-    if (!job.muxed) {
-      if (!audioBytes.length) throw new Error('пустые данные аудио');
-      assertContainerHeader(audioBytes, job.audioMime, 'audio');
-      inputs.push({ name: audioName, bytes: audioBytes });
-      files.add(audioName);
-    }
-
-    let videoName;
-    let videoPrefixName;
-    let videoBytes = null;
-    if (job.muxed) {
-      videoName = 'input.ts';
-      videoBytes = concatParts(job.video);
-      if (!videoBytes.length) throw new Error('пустые данные потока');
-      // MPEG-TS has no ftyp/EBML header to check; its packets start with 0x47.
-      if (videoBytes[0] !== 0x47) throw new Error('поток не является MPEG-TS');
-      inputs.push({ name: videoName, bytes: videoBytes });
-      files.add(videoName);
-    } else if (job.format !== 'mp3') {
-      videoName = `video.${extensionFor(job.videoMime)}`;
-      videoBytes = concatParts(job.video);
-      if (!videoBytes.length) throw new Error('пустые данные видео');
-      assertContainerHeader(videoBytes, job.videoMime, 'video');
-      inputs.push({ name: videoName, bytes: videoBytes });
-      files.add(videoName);
-      if (job.videoPrefixBoundary > 0) {
-        const videoPrefixBytes = concatParts(job.videoPrefix);
-        if (!videoPrefixBytes.length) throw new Error('пустые данные префикса видео');
-        videoPrefixName = `video-prefix.${extensionFor(job.videoPrefixMime)}`;
-        assertContainerHeader(videoPrefixBytes, job.videoPrefixMime, 'video-prefix');
-        inputs.push({ name: videoPrefixName, bytes: videoPrefixBytes });
-        files.add(videoPrefixName);
-      }
-    }
-
-    // Thumbnail as embedded cover art for audio outputs that support pictures.
-    // Best effort: any failure just means a coverless file.
-    let coverName = null;
-    if (job.format === 'mp3' && job.videoId
-      && ['original', 'mp3', 'm4a'].includes(job.audioFormat)) {
-      sendProgress(0.07, 'Загрузка обложки…');
-      const cover = await sendToWorker({ t: 'nova-fetch-cover', videoId: job.videoId }, { retries: 3 })
-        .catch(() => null);
-      if (cover?.ok && cover.b64) {
-        try {
-          inputs.push({ name: 'cover.jpg', bytes: decodeBase64(cover.b64) });
-          files.add('cover.jpg');
-          coverName = 'cover.jpg';
-        } catch (error) { coverName = null; }
-      }
-    }
 
     let output;
     let selectedRun;
     let lastError = '';
+
+    // The streaming mux has been running since the first chunks arrived, so by
+    // now it is usually all but finished. Telling it the tracks are complete is
+    // the last thing it waits for. Everything below — concatenation, header
+    // checks, ffmpeg inputs — exists only for the paths it cannot take, and is
+    // skipped entirely when it succeeds: that is a full copy of each track not
+    // allocated.
+    if (job.streamMux) {
+      completeTrackStream(job.streams.video);
+      completeTrackStream(job.streams.audio);
+      for (const track of ['video', 'audio']) {
+        try {
+          job.muxWorker?.worker.postMessage({
+            t: 'complete', track, sent: job.streams[track].received,
+          });
+        } catch (e) {}
+      }
+      const startedWaitingAt = Date.now();
+      // A wedged conversion must not hold the download forever: the worker
+      // reports progress for both tracks, so silence is the signal.
+      let stallTimer;
+      const stallGuard = new Promise((_, rejectStall) => {
+        const check = () => {
+          if (Date.now() - (job.muxWorker?.lastTick || startedWaitingAt) > 120_000) {
+            rejectStall(new Error('сборка не показывает прогресс более 120 секунд'));
+            return;
+          }
+          stallTimer = setTimeout(check, 5_000);
+        };
+        stallTimer = setTimeout(check, 5_000);
+      });
+      const bridgeAtStart = job.muxWorker;
+      try {
+        output = await Promise.race([job.streamMux, stallGuard]);
+        const short = outputDurationMismatch(job, output);
+        if (short) throw new Error(short);
+        // A copy remux writes out what it read, give or take container
+        // overhead. Measured failure: 62.8 MB of tracks came back as a 14.4 MB
+        // file whose header still claimed the full 700 s, so the duration check
+        // waved it through and the user got a video missing most of its frames.
+        const inputBytes = job.streams.video.received + job.streams.audio.received;
+        const consumed = bridgeAtStart?.consumed;
+        if (inputBytes > 0 && output.length < inputBytes * 0.8) {
+          throw new Error(`сборка вернула ${output.length} байт из ${inputBytes}`
+            + ` (прочитано video=${consumed?.video ?? '?'} audio=${consumed?.audio ?? '?'})`);
+        }
+        selectedRun = { out: 'mediabunny.mp4', type: 'video/mp4', extension: '.mp4' };
+        logToWorker('mux', `mediabunny worker-remux ok; bytes=${output.length}`
+          + ` input=${inputBytes} consumed=${consumed?.video ?? '?'}+${consumed?.audio ?? '?'}`
+          + ` duration=${(containerDurationSeconds(output) || 0).toFixed(1)}`
+          + ` muxAfterTransfer=${((Date.now() - startedWaitingAt) / 1000).toFixed(1)}s`);
+      } catch (error) {
+        output = undefined;
+        try { job.muxWorker?.worker.postMessage({ t: 'cancel' }); } catch (e) {}
+        logToWorker('mux', `stream remux unavailable, falling back: ${String(error?.message || error)}`);
+      } finally {
+        clearTimeout(stallTimer);
+      }
+    }
+
+    const inputs = [];
+    let audioName = null;
+    let audioBytes = null;
+    let videoName;
+    let videoPrefixName;
+    let videoBytes = null;
+    let coverName = null;
+    if (!selectedRun) {
+      // A muxed job carries everything on the video track; there is no separate
+      // audio buffer to validate or hand to ffmpeg.
+      audioName = job.muxed ? null : `audio.${extensionFor(job.audioMime)}`;
+      audioBytes = job.muxed ? null : concatParts(job.audio);
+      if (!job.muxed) {
+        if (!audioBytes.length) throw new Error('пустые данные аудио');
+        assertContainerHeader(audioBytes, job.audioMime, 'audio');
+        inputs.push({ name: audioName, bytes: audioBytes });
+        files.add(audioName);
+      }
+
+      if (job.muxed) {
+        videoName = 'input.ts';
+        videoBytes = concatParts(job.video);
+        if (!videoBytes.length) throw new Error('пустые данные потока');
+        // MPEG-TS has no ftyp/EBML header to check; its packets start with 0x47.
+        if (videoBytes[0] !== 0x47) throw new Error('поток не является MPEG-TS');
+        inputs.push({ name: videoName, bytes: videoBytes });
+        files.add(videoName);
+      } else if (job.format !== 'mp3') {
+        videoName = `video.${extensionFor(job.videoMime)}`;
+        videoBytes = concatParts(job.video);
+        if (!videoBytes.length) throw new Error('пустые данные видео');
+        assertContainerHeader(videoBytes, job.videoMime, 'video');
+        inputs.push({ name: videoName, bytes: videoBytes });
+        files.add(videoName);
+        if (job.videoPrefixBoundary > 0) {
+          const videoPrefixBytes = concatParts(job.videoPrefix);
+          if (!videoPrefixBytes.length) throw new Error('пустые данные префикса видео');
+          videoPrefixName = `video-prefix.${extensionFor(job.videoPrefixMime)}`;
+          assertContainerHeader(videoPrefixBytes, job.videoPrefixMime, 'video-prefix');
+          inputs.push({ name: videoPrefixName, bytes: videoPrefixBytes });
+          files.add(videoPrefixName);
+        }
+      }
+
+      // The chunks have just been concatenated into one buffer per track and
+      // nothing reads them again — every path below works from
+      // `videoBytes`/`audioBytes`. Holding both copies doubled this document's
+      // footprint on a long video.
+      job.video.length = 0;
+      job.videoPrefix.length = 0;
+      job.audio.length = 0;
+
+      // Thumbnail as embedded cover art for audio outputs that support pictures.
+      // Best effort: any failure just means a coverless file.
+      if (job.format === 'mp3' && job.videoId
+        && ['original', 'mp3', 'm4a'].includes(job.audioFormat)) {
+        sendProgress(0.07, 'Загрузка обложки…');
+        const cover = await sendToWorker({ t: 'nova-fetch-cover', videoId: job.videoId }, { retries: 3 })
+          .catch(() => null);
+        if (cover?.ok && cover.b64) {
+          try {
+            inputs.push({ name: 'cover.jpg', bytes: decodeBase64(cover.b64) });
+            files.add('cover.jpg');
+            coverName = 'cover.jpg';
+          } catch (error) { coverName = null; }
+        }
+      }
+    }
     // Hardware path first: only for plain transcode jobs (no prefix concat,
     // no downscale — those still need ffmpeg's filter graph).
     if (job.format !== 'mp3' && job.transcode && !videoPrefixName && !job.scaleHeight && videoBytes) {
@@ -1135,7 +1429,15 @@ async function finalizeJob(message) {
       job.stage = 'mediabunny';
       sendProgress(0.08, 'Сборка дорожек…');
       try {
-        output = await muxVodWithMediabunny(job, videoBytes, audioBytes);
+        // In memory, not through a Blob: a Blob-backed source answers every one
+        // of mediabunny's tens of thousands of reads asynchronously, and the
+        // Blob is one more full copy of the track.
+        const { BufferSource } = await getMediabunny();
+        output = await muxVodWithMediabunny(
+          job,
+          new BufferSource(videoBytes.buffer),
+          new BufferSource(audioBytes.buffer),
+        );
         selectedRun = { out: 'mediabunny.mp4', type: 'video/mp4', extension: '.mp4' };
         logToWorker('mux', `mediabunny copy-remux ok; bytes=${output.length}`
           + ` duration=${(containerDurationSeconds(output) || 0).toFixed(1)}`);
@@ -1209,6 +1511,12 @@ async function finalizeJob(message) {
       for (const name of files) {
         try { await instance.deleteFile(name); } catch (e) {}
       }
+    }
+    // A worker still parsing (or waiting for bytes that will never come) would
+    // otherwise outlive its job and keep its copy of the track.
+    if (job.muxWorker) {
+      try { job.muxWorker.worker.terminate(); } catch (e) {}
+      job.muxWorker = null;
     }
     job.video.length = 0;
     job.videoPrefix.length = 0;
@@ -1691,6 +1999,15 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       .then(() => sendResponse({ ok: true, mode: ffmpegMode }))
       .catch((error) => sendResponse({ ok: false, error: String(error?.stack || error) }));
     return true;
+  }
+  if (message.t === 'nova-stage-open') {
+    sendResponse(openStaging(message));
+    return false;
+  }
+  if (message.t === 'nova-stage') {
+    try { sendResponse(stageChunk(message)); }
+    catch (error) { sendResponse({ ok: false, error: String(error) }); }
+    return false;
   }
   if (message.t === 'nova-chunk') {
     try { sendResponse(appendChunk(message)); }

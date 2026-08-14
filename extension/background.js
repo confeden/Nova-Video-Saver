@@ -55,6 +55,30 @@ function formatTimestamp(value) {
   return Number.isNaN(date.getTime()) ? 'unknown time' : date.toISOString();
 }
 
+// A report is read top to bottom by a human looking for one failing download.
+// Repeats are folded into a counter and long idle stretches are marked, so the
+// boundaries between separate attempts are visible instead of having to be
+// reconstructed from timestamps.
+const LOG_GAP_MARKER_MS = 2 * 60_000;
+
+function formatLogLines(logs) {
+  const lines = [];
+  let previousTs = 0;
+  for (const entry of logs) {
+    const ts = Number(entry?.ts) || 0;
+    if (previousTs && ts - previousTs >= LOG_GAP_MARKER_MS) {
+      const minutes = Math.round((ts - previousTs) / 60_000);
+      lines.push('', `--- пауза ${minutes} мин ---`, '');
+    }
+    const repeat = Number(entry?.repeat) || 1;
+    const lastTs = Number(entry?.lastTs) || ts;
+    const suffix = repeat > 1 ? ` (×${repeat}, последний ${formatTimestamp(lastTs)})` : '';
+    lines.push(`[${formatTimestamp(ts)}] [${entry?.tag || 'log'}] ${entry?.text || ''}${suffix}`);
+    previousTs = lastTs;
+  }
+  return lines;
+}
+
 function appendLog(entry) {
   // Serialize read-modify-write operations so concurrent content-script logs
   // cannot overwrite one another in chrome.storage.local.
@@ -63,7 +87,16 @@ function appendLog(entry) {
     .then(async () => {
       const stored = await chrome.storage.local.get(LOG_KEY);
       const logs = Array.isArray(stored[LOG_KEY]) ? stored[LOG_KEY] : [];
-      logs.push(entry);
+      // A retried operation writes the same line over and over (primers,
+      // refill attempts, bridge timeouts). Counting them keeps the fact and
+      // its cadence while spending one slot of the ring instead of dozens.
+      const last = logs[logs.length - 1];
+      if (last && last.tag === entry.tag && last.text === entry.text) {
+        last.repeat = (Number(last.repeat) || 1) + 1;
+        last.lastTs = entry.ts;
+      } else {
+        logs.push(entry);
+      }
       await chrome.storage.local.set({ [LOG_KEY]: logs.slice(-LOG_LIMIT) });
     });
   return logWrite;
@@ -133,9 +166,7 @@ async function downloadErrorLog(message, sender) {
     truncate(message.error || 'Unknown error', ERROR_DETAIL_LIMIT),
     message.details ? `\nDetails:\n${truncate(message.details, ERROR_DETAIL_LIMIT)}` : '',
     `\nState:\n${truncate(state, ERROR_DETAIL_LIMIT)}`,
-    logs.length ? `\nRecent logs:\n${logs.map((entry) =>
-      `[${formatTimestamp(entry?.ts)}] [${entry?.tag || 'log'}] ${entry?.text || ''}`
-    ).join('\n')}` : '',
+    logs.length ? `\nRecent logs:\n${formatLogLines(logs).join('\n')}` : '',
   ].filter(Boolean).join('\n');
 
   const url = `data:text/plain;charset=utf-8,${encodeURIComponent(`\uFEFF${report}\n`)}`;

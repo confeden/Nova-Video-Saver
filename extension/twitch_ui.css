@@ -57,3 +57,35 @@
   pointer-events: none;
 }
 #nvs-twitch-toast.show { opacity: 1; transform: translateY(0); }
+
+/* Quality menu for clips and VODs; anchored above the player button. */
+#nvs-twitch-menu {
+  position: fixed;
+  z-index: 2147483647;
+  min-width: 168px;
+  padding: 6px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(20, 20, 20, 0.97);
+  color: #fff;
+  font: 13px/1.4 Inter, Roobert, "Helvetica Neue", Helvetica, Arial, sans-serif;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
+}
+.nvs-twitch-menu-title {
+  padding: 6px 10px 8px;
+  opacity: 0.62;
+  font-size: 12px;
+}
+.nvs-twitch-menu-item {
+  display: block;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.nvs-twitch-menu-item:hover { background: rgba(255, 255, 255, 0.12); }

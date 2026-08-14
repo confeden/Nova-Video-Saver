@@ -711,6 +711,8 @@
     notification.stage('engine', null, 'active');
     let scaleDown = false;
     const jobId = crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`;
+    // Declared out here so every exit path can stop the capture-time shipper.
+    let staging = null;
 
     let cancelRequested = false;
     notification.setCancel(() => {
@@ -744,6 +746,10 @@
         () => notification.stage('engine', null, 'queued', 'Повторный запуск медиадвижка'),
       );
       const { transcode = false } = await chrome.storage.local.get(['transcode']);
+      // Runs alongside the capture and hands over what has already been
+      // captured; stopped in every exit path below.
+      staging = isMp3 ? null : startTrackStaging(jobId);
+      let stagingReport = { failed: true, shippedBytes: 0 };
       const captured = await callHook('download', {
         height,
         format,
@@ -763,6 +769,7 @@
         else if (message.phase === 'mse-sequential-video') captureLabel = 'Проверка непрерывности видео';
         notification.stage('capture', message.progress, message.progress >= 1 ? 'done' : 'active', captureLabel);
       });
+      if (staging) stagingReport = await staging.stop();
       restorePrimedMedia();
       // The hook may have finished a phase without a cancellation checkpoint;
       // never save a file the user has already cancelled.
@@ -791,7 +798,18 @@
       const extension = isMp3 ? audioMeta.extension : '.mp4';
       const filename = `${safeFilename(info.title)}${isMp3 ? '' : ` [${outputHeight}p]`}${extension}`;
       notification.stage('transfer', 0, 'active', 'Передача и сборка');
-      const result = await muxViaOffscreen({
+      // A track counts as staged only if the hook verified the shipped stream
+      // against the finished file AND the tail captured after the last drain
+      // reached offscreen too.
+      const staged = { audio: false, video: false };
+      if (!stagingReport.failed) {
+        for (const [track, key] of [['audio', '_tailA'], ['video', '_tailV']]) {
+          if (!captured.staged?.[track]) continue;
+          const tail = captured[key];
+          staged[track] = tail?.byteLength ? await stageBuffer(jobId, track, tail) : true;
+        }
+      }
+      const job = {
         jobId,
         format,
         audioFormat: isMp3 ? audioFormat : null,
@@ -809,7 +827,16 @@
         transcode: shouldTranscode,
         scaleHeight: scaleDown ? height : 0,
         duration: Number(captured.duration) || Number(info.duration) || 0,
-      }, (stage, fraction, state, stageLabel) => {
+        staged,
+      };
+      // The job object is now the only holder of the captured bytes; the
+      // transfer releases them as soon as offscreen has them. Keeping a second
+      // full copy alive here for the whole mux is what makes a long download
+      // feel like the browser froze — a 700 s video is ~164 MB per copy.
+      captured._v = null;
+      captured._vp = null;
+      captured._a = null;
+      const result = await muxViaOffscreen(job, (stage, fraction, state, stageLabel) => {
         notification.stage(stage, fraction, state, stageLabel);
       });
       if (!result?.ok) {
@@ -832,6 +859,18 @@
         return false;
       }
       const reloadCount = Math.max(0, Number(options.reloadCount) || 0);
+      // Whether the automatic reload ran is invisible in reports otherwise: in
+      // the log of 2026-08-13 a download died after four exhausted refills and
+      // no reload followed, and nothing said whether it was refused, never
+      // requested, or failed while being scheduled.
+      if (error?.details?.reloadRequired || error?.details?.reason) {
+        void sendRuntimeMessage({
+          t: 'nova-log', tag: 'download',
+          text: `download failed; reloadRequired= ${Boolean(error?.details?.reloadRequired)}`
+            + ` reason= ${error?.details?.reason || 'unknown'} reloadCount= ${reloadCount}`
+            + ` willReload= ${Boolean(error?.details?.reloadRequired) && reloadCount < 2}`,
+        }).catch(() => {});
+      }
       if (error?.details?.reloadRequired && reloadCount < 2) {
         try {
           const queued = await sendRuntimeMessage({
@@ -892,6 +931,10 @@
           }, 100);
           return 'reload';
         } catch (reloadError) {
+          void sendRuntimeMessage({
+            t: 'nova-log', tag: 'download',
+            text: `automatic reload could not be scheduled: ${String(reloadError?.message || reloadError)}`,
+          }).catch(() => {});
           error = reloadError;
         }
       }
@@ -909,11 +952,90 @@
       });
       return false;
     } finally {
+      // Also on the error paths: the pump keeps polling the hook otherwise.
+      if (staging) await staging.stop().catch(() => {});
       notification.setCancel(null);
       if (!reloadScheduled) restorePrimedMedia();
       chrome.runtime.onMessage.removeListener(onFfmpegProgress);
       downloadInProgress = false;
     }
+  }
+
+  // Ships captured bytes to the muxer while the capture is still running, so
+  // the transfer no longer starts only after the last fragment. Everything sent
+  // here is provisional: assembly may still reorder or drop parts, so the hook
+  // re-checks at the end whether the finished track is exactly this stream, and
+  // offscreen adopts it only for the tracks it confirmed.
+  const STAGING_POLL_MS = 700;
+
+  async function stageBuffer(jobId, track, buffer) {
+    const bytes = new Uint8Array(buffer);
+    for (let offset = 0; offset < bytes.length; offset += TRANSFER_CHUNK_SIZE) {
+      const chunk = bytes.subarray(offset, Math.min(offset + TRANSFER_CHUNK_SIZE, bytes.length));
+      const response = await sendRuntimeMessage({
+        t: 'nova-stage', jobId, track, b64: encodeBase64(chunk),
+      }, 60_000).catch(() => null);
+      if (!response?.ok) return false;
+    }
+    return true;
+  }
+
+  function startTrackStaging(jobId) {
+    let stopped = false;
+    let failed = false;
+    let shippedBytes = 0;
+    let drains = 0;
+    let reason = '';
+    const openedAt = Date.now();
+    const give = (why) => { failed = true; reason = why; };
+    const pump = (async () => {
+      try {
+        const ensured = await sendWorkerMessage({ t: 'nova-ensure' }, 30_000);
+        if (!ensured?.ok) { give(`offscreen unavailable: ${ensured?.error || 'no answer'}`); return; }
+        // `nova-ensure` resolves as soon as the document is created, and the
+        // document registers its message listener only after ffmpeg.js and
+        // offscreen.js have both parsed. A request sent into that window is
+        // answered by nobody — the service worker sees an unknown type and
+        // returns nothing, so the send resolves with `undefined` instead of
+        // failing. That is exactly what killed staging in the field
+        // (`stage-open refused: no answer`), so wait the document out.
+        let opened = null;
+        for (let attempt = 0; attempt < 6 && !opened?.ok && !stopped; attempt++) {
+          if (attempt) await new Promise((resolve) => setTimeout(resolve, 300 * attempt));
+          opened = await sendRuntimeMessage({ t: 'nova-stage-open', jobId }, 10_000).catch(() => null);
+        }
+        if (!opened?.ok) { give(`stage-open refused: ${opened?.error || 'no answer'}`); return; }
+      } catch (error) { give(`setup failed: ${String(error?.message || error)}`); return; }
+      while (!stopped) {
+        await new Promise((resolve) => setTimeout(resolve, STAGING_POLL_MS));
+        if (stopped) return;
+        let drained;
+        try { drained = await callHook('drain-captured'); }
+        catch (error) { give(`drain failed: ${String(error?.message || error)}`); return; }
+        drains += 1;
+        for (const track of ['audio', 'video']) {
+          const buffer = drained?.tracks?.[track];
+          if (!buffer?.byteLength) continue;
+          if (!await stageBuffer(jobId, track, buffer)) { give(`stage chunk refused (${track})`); return; }
+          shippedBytes += buffer.byteLength;
+        }
+      }
+    })();
+    return {
+      async stop() {
+        stopped = true;
+        await pump.catch(() => {});
+        // Without this line a silent staging failure is invisible: the report
+        // only shows that nothing was staged, never why.
+        void sendRuntimeMessage({
+          t: 'nova-log', tag: 'transfer',
+          text: `staging stopped; shippedBytes= ${shippedBytes} drains= ${drains}`
+            + ` seconds= ${((Date.now() - openedAt) / 1000).toFixed(1)}`
+            + `${failed ? ` failed= ${reason}` : ''}`,
+        }).catch(() => {});
+        return { failed, shippedBytes };
+      },
+    };
   }
 
   function encodeBase64(bytes) {
@@ -949,6 +1071,12 @@
         filename: job.filename, format: job.format,
         audioFormat: job.audioFormat, audioQuality: job.audioQuality,
         videoId: job.videoId || '',
+        // Exact track sizes: the offscreen muxer starts before the transfer
+        // finishes and has to know where each file ends to parse it.
+        videoSize: job.video?.byteLength || 0,
+        audioSize: job.audio?.byteLength || 0,
+        // Which tracks offscreen already holds from the capture-time staging.
+        staged: job.staged || null,
         videoMime: job.videoMime, audioMime: job.audioMime,
         videoPrefixMime: job.videoPrefixMime,
         videoPrefixBoundary: job.videoPrefixBoundary,
@@ -979,11 +1107,28 @@
 
       // Track order is preserved inside each sender while audio/video transfers
       // overlap. Offscreen keeps separate part arrays, so interleaving is safe.
+      const transferStartedAt = Date.now();
+      // A staged track is already in offscreen, byte for byte — sending it
+      // again would be the whole transfer done twice.
       await Promise.all([
-        sendTrack('video', job.video),
+        job.staged?.video ? null : sendTrack('video', job.video),
         sendTrack('video-prefix', job.videoPrefix),
-        sendTrack('audio', job.audio),
+        job.staged?.audio ? null : sendTrack('audio', job.audio),
       ]);
+      // The offscreen document now owns every byte, and the mux that follows
+      // can run for minutes. Holding a second copy here for all that time is
+      // what makes a big download feel like the browser froze: a 700 s video
+      // meant ~164 MB in the page, the same again in offscreen, and the muxer
+      // output on top. Let the page copy go before the wait starts.
+      job.video = null;
+      job.videoPrefix = null;
+      job.audio = null;
+      void sendRuntimeMessage({
+        t: 'nova-log', tag: 'transfer',
+        text: `tracks handed to offscreen; bytes= ${totalBytes}`
+          + ` staged= ${job.staged?.audio ? 'audio' : ''}${job.staged?.video ? '+video' : ''}`
+          + ` seconds= ${((Date.now() - transferStartedAt) / 1000).toFixed(1)}`,
+      }).catch(() => {});
       onStage?.('transfer', 1, 'done', 'Передача и сборка');
       onStage?.('process', 0, 'active');
       return await sendRuntimeMessage({ t: 'nova-finalize', jobId }, 2 * 60 * 60_000);
