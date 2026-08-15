@@ -335,7 +335,14 @@ function startStreamingMux(job) {
   }
   // Until the worker reports `ready` it has not imported mediabunny yet and may
   // still bow out; nothing is transferred to it before that, so the document
-  // can fall back with every byte intact.
+  // can fall back with every byte intact. Everything bound for the worker goes
+  // through one queue — chunks AND the completion notices. Sending `complete`
+  // directly while chunks were still queued is what made an adopted (staged)
+  // job fail every time: begin and finalize are milliseconds apart there, so
+  // the worker saw `complete` first, compared 0 received bytes against the
+  // announced size and gave up, and the chunks it never got were also gone
+  // from `job[track]`, leaving the fallback with nothing ("пустые данные
+  // аудио").
   const bridge = { worker, ready: false, queue: [], lastTick: Date.now(), settled: false };
   job.muxWorker = bridge;
   job.stage = 'mediabunny-stream';
@@ -353,10 +360,7 @@ function startStreamingMux(job) {
       bridge.lastTick = Date.now();
       if (message.t === 'ready') {
         bridge.ready = true;
-        for (const queued of bridge.queue) {
-          worker.postMessage({ t: 'chunk', track: queued.track, bytes: queued.bytes.buffer },
-            [queued.bytes.buffer]);
-        }
+        for (const queued of bridge.queue) worker.postMessage(queued.message, queued.transfer);
         bridge.queue.length = 0;
         return;
       }
@@ -379,19 +383,23 @@ function startStreamingMux(job) {
         return;
       }
       if (message.t === 'error') {
-        // The worker hands its bytes back with the failure, so the buffered
-        // path below still has something to work with.
+        // The worker hands back what it received; whatever never left this
+        // document is still in the queue. Both are needed, and in this order:
+        // the worker's chunks came first, the queued ones follow.
         for (const [track, buffers] of [['video', message.video], ['audio', message.audio]]) {
           if (!Array.isArray(buffers)) continue;
           job[track] = buffers.map((buffer) => new Uint8Array(buffer));
         }
+        restoreQueuedChunks(job, bridge);
         settle(reject, new Error(message.message || 'сборка в worker не удалась'));
       }
     };
     worker.onerror = (event) => {
+      restoreQueuedChunks(job, bridge);
       settle(reject, new Error(`worker сборки завершился аварийно: ${event?.message || 'без сообщения'}`));
     };
     worker.onmessageerror = () => {
+      restoreQueuedChunks(job, bridge);
       settle(reject, new Error('worker сборки не смог принять данные'));
     };
   });
@@ -406,9 +414,37 @@ function startStreamingMux(job) {
   // Adopted staged tracks are already here; hand them over as the first chunks.
   for (const track of ['video', 'audio']) {
     if (!job[track].length) continue;
-    for (const bytes of job[track]) bridge.queue.push({ track, bytes });
+    for (const bytes of job[track]) sendToMuxWorker(bridge, track, bytes);
     job[track] = [];
   }
+}
+
+// One ordered channel to the worker. Before `ready` the messages wait here, so
+// a chunk can never end up behind the `complete` that closes its track.
+function sendToMuxWorker(bridge, track, bytes) {
+  const message = { t: 'chunk', track, bytes: bytes.buffer };
+  if (bridge.ready) bridge.worker.postMessage(message, [bytes.buffer]);
+  else bridge.queue.push({ message, transfer: [bytes.buffer], track, bytes });
+}
+
+function completeMuxWorkerTrack(bridge, track, sent) {
+  const message = { t: 'complete', track, sent };
+  if (bridge.ready) bridge.worker.postMessage(message);
+  else bridge.queue.push({ message, transfer: [] });
+}
+
+// Whatever never left this document goes back to the job, so the buffered
+// fallback still has the bytes. Idempotent: the queue is drained as it goes.
+function restoreQueuedChunks(job, bridge) {
+  if (!bridge?.queue?.length) return 0;
+  let restored = 0;
+  for (const queued of bridge.queue) {
+    if (!queued.bytes || (queued.track !== 'video' && queued.track !== 'audio')) continue;
+    job[queued.track].push(queued.bytes);
+    restored += queued.bytes.length;
+  }
+  bridge.queue.length = 0;
+  return restored;
 }
 
 // Feeds one received chunk to the mux worker, or keeps it here when there is
@@ -416,11 +452,7 @@ function startStreamingMux(job) {
 function routeChunkToWorker(job, track, bytes) {
   const bridge = job.muxWorker;
   if (!bridge || (track !== 'video' && track !== 'audio')) return false;
-  if (bridge.ready) {
-    bridge.worker.postMessage({ t: 'chunk', track, bytes: bytes.buffer }, [bytes.buffer]);
-  } else {
-    bridge.queue.push({ track, bytes });
-  }
+  sendToMuxWorker(bridge, track, bytes);
   return true;
 }
 
@@ -1286,9 +1318,9 @@ async function finalizeJob(message) {
       completeTrackStream(job.streams.audio);
       for (const track of ['video', 'audio']) {
         try {
-          job.muxWorker?.worker.postMessage({
-            t: 'complete', track, sent: job.streams[track].received,
-          });
+          if (job.muxWorker) {
+            completeMuxWorkerTrack(job.muxWorker, track, job.streams[track].received);
+          }
         } catch (e) {}
       }
       const startedWaitingAt = Date.now();
@@ -1328,7 +1360,11 @@ async function finalizeJob(message) {
       } catch (error) {
         output = undefined;
         try { job.muxWorker?.worker.postMessage({ t: 'cancel' }); } catch (e) {}
-        logToWorker('mux', `stream remux unavailable, falling back: ${String(error?.message || error)}`);
+        // A stall or a rejected output leaves the bridge alive with bytes still
+        // queued; the buffered path below needs them back.
+        const restored = restoreQueuedChunks(job, bridgeAtStart);
+        logToWorker('mux', `stream remux unavailable, falling back: ${String(error?.message || error)}`
+          + (restored ? `; вернули из очереди ${restored} байт` : ''));
       } finally {
         clearTimeout(stallTimer);
       }
