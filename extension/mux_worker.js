@@ -1,4 +1,4 @@
-// Copy-remux on a worker thread.
+// Copy-remux on a worker thread, fed while the tracks are still arriving.
 //
 // mediabunny used to run on the offscreen document's own main thread, and a
 // 700 s video occupied it for more than a minute: the document stopped
@@ -7,117 +7,143 @@
 // extensions panel. The work is identical here, it simply no longer blocks the
 // thread that has to keep talking to the rest of the extension.
 //
-// The bytes are transferred in, never copied, so this worker holds the only
-// copy. If the mux fails they are transferred straight back, which is what lets
-// the ffmpeg fallback in the document still run.
+// Three findings decide the shape of this file. All three were reproduced
+// against this exact vendored build (mediabunny 1.51.0).
+//
+// 1. Declaring a size SMALLER than the real track truncates the output in
+//    SILENCE. Reads are clamped to the declared size and both the ISOBMFF and
+//    the Matroska demuxer treat a slice past it as end of file, with no error.
+//    That is the 14.4 MB file made from 62.8 MB of tracks in ROADMAP 3.2 — and
+//    the duration check waved it through because mediabunny writes
+//    `mvhd.duration` as the MAXIMUM over the output tracks, so the one complete
+//    track (audio) declared the full length while the video stopped a quarter
+//    of the way in. Nothing here declares a size any more.
+//
+// 2. A sized source cannot overlap the transfer at all for a fragmented MP4.
+//    `Conversion.init` probes the LAST FOUR BYTES of the file (the mfra index)
+//    the moment the source reports a size, so the parse cannot begin until the
+//    final byte has arrived. Measured overlap with the previous StreamSource:
+//    zero. `ReadableStreamSource` reports no size until its stream closes, so
+//    the tail probe is skipped and init returns in about a tenth of a second.
+//    Its cache holds references to the very chunks below, not copies.
+//
+// 3. `conversion.onProgress` is not free. Setting it makes `execute()`
+//    precompute the duration first, and for a fragmented MP4 that is
+//    `getPacket(Infinity)` — a walk to the last fragment before a single packet
+//    is copied. It defeats the streaming and blows the sliding cache. The
+//    document's stall guard is fed from the source's read callback instead.
+//
+// The bytes are transferred in, never copied. A failed mux hands them back so
+// the document can still run the proven buffered path.
 
-const streams = {
-  video: createStream(),
-  audio: createStream(),
+// Generous, and nearly free: the cache stores references to chunks this worker
+// holds anyway. It only bounds how far back the parser may seek before the
+// source gives up — loudly, with "Read is before the cached region".
+const CACHE_BYTES = 64 * 1024 * 1024;
+const TICK_INTERVAL_MS = 400;
+
+const tracks = {
+  video: createTrack(),
+  audio: createTrack(),
 };
 let mediabunny;
 let muxStarted = false;
 
-function createStream() {
+function createTrack() {
   return {
+    // Kept only so a failed mux can surrender them; these are the same objects
+    // the ReadableStream and mediabunny's cache reference, so they cost nothing
+    // beyond the array itself.
     chunks: [],
-    starts: [],
     received: 0,
-    expected: 0,
-    complete: false,
+    // What the document says it will send. Display only — it is NEVER handed to
+    // mediabunny, which is the whole point of finding 1 above.
+    announced: 0,
+    consumed: 0,
+    controller: null,
+    stream: null,
+    closed: false,
     failure: null,
-    waiters: [],
   };
 }
 
-function wake(stream) {
-  if (!stream.waiters.length) return;
-  const pending = stream.waiters;
-  stream.waiters = [];
-  for (const waiter of pending) {
-    if (stream.failure) waiter.reject(stream.failure);
-    else if (stream.complete || stream.received >= waiter.need) waiter.resolve();
-    else stream.waiters.push(waiter);
-  }
-}
-
-function pushChunk(stream, bytes) {
-  stream.starts.push(stream.received);
-  stream.chunks.push(bytes);
-  stream.received += bytes.length;
-  wake(stream);
-}
-
-function completeStream(stream) {
-  stream.complete = true;
-  wake(stream);
-}
-
-function failStream(stream, error) {
-  stream.failure = error instanceof Error ? error : new Error(String(error));
-  wake(stream);
-}
-
-function readRange(stream, start, end) {
-  const from = Math.max(0, Math.min(start, stream.received));
-  const to = Math.max(from, Math.min(end, stream.received));
-  const result = new Uint8Array(to - from);
-  if (!result.length) return result;
-  // Binary search for the chunk holding `from`: a long video arrives in
-  // hundreds of chunks and mediabunny reads tens of thousands of ranges.
-  let low = 0;
-  let high = stream.chunks.length - 1;
-  let index = 0;
-  while (low <= high) {
-    const mid = (low + high) >> 1;
-    const chunkStart = stream.starts[mid];
-    const chunkEnd = chunkStart + stream.chunks[mid].length;
-    if (from < chunkStart) high = mid - 1;
-    else if (from >= chunkEnd) low = mid + 1;
-    else { index = mid; break; }
-  }
-  let written = 0;
-  for (let i = index; i < stream.chunks.length && written < result.length; i++) {
-    const chunk = stream.chunks[i];
-    const chunkStart = stream.starts[i];
-    const sliceFrom = Math.max(0, from + written - chunkStart);
-    const sliceTo = Math.min(chunk.length, to - chunkStart);
-    if (sliceTo <= sliceFrom) continue;
-    result.set(chunk.subarray(sliceFrom, sliceTo), written);
-    written += sliceTo - sliceFrom;
-  }
-  return written === result.length ? result : result.subarray(0, written);
-}
-
-function streamSource(StreamSource, stream) {
-  return new StreamSource({
-    // The page knows each track's exact size before the transfer starts, so the
-    // parser never has to guess where the file ends.
-    getSize: () => stream.expected || stream.received,
-    read: async (start, end) => {
-      if (stream.failure) throw stream.failure;
-      if (end > stream.received && !stream.complete) {
-        await new Promise((resolve, reject) => {
-          stream.waiters.push({ need: end, resolve, reject });
-        });
-      }
-      if (stream.failure) throw stream.failure;
-      return readRange(stream, start, end);
-    },
+function openTrack(track) {
+  // The start callback runs synchronously inside the constructor, so the
+  // controller is available immediately after this line.
+  track.stream = new ReadableStream({
+    start(controller) { track.controller = controller; },
   });
+  // `start` is posted before any chunk, so in practice there is no backlog.
+  // Replaying one anyway is two lines, and the alternative — silently dropping
+  // chunks that arrived first — is the exact silent-truncation shape this file
+  // exists to make impossible.
+  for (const chunk of track.chunks) track.controller.enqueue(chunk);
+  // Settled before the stream existed: replay that too, and go through the
+  // controller directly — failTrack/closeTrack are guarded against repeats.
+  try {
+    if (track.failure) track.controller.error(track.failure);
+    else if (track.closed) track.controller.close();
+  } catch (error) { /* already settled */ }
+}
+
+function pushChunk(track, bytes) {
+  track.chunks.push(bytes);
+  track.received += bytes.length;
+  track.controller?.enqueue(bytes);
+}
+
+function closeTrack(track) {
+  if (track.closed || track.failure) return;
+  track.closed = true;
+  try { track.controller?.close(); } catch (error) { /* already closed */ }
+}
+
+function failTrack(track, error) {
+  if (track.failure) return;
+  track.failure = error instanceof Error ? error : new Error(String(error));
+  try { track.controller?.error(track.failure); } catch (e) { /* already settled */ }
+}
+
+let lastTickAt = 0;
+
+function reportProgress() {
+  const now = Date.now();
+  if (now - lastTickAt < TICK_INTERVAL_MS) return;
+  lastTickAt = now;
+  const announced = tracks.video.announced + tracks.audio.announced;
+  const consumed = tracks.video.consumed + tracks.audio.consumed;
+  if (announced > 0) {
+    self.postMessage({ t: 'progress', value: Math.max(0, Math.min(1, consumed / announced)) });
+  } else {
+    self.postMessage({ t: 'tick' });
+  }
+}
+
+function trackSource(ReadableStreamSource, track) {
+  const source = new ReadableStreamSource(track.stream, { maxCacheSize: CACHE_BYTES });
+  // Fires once per chunk pulled out of the stream, with the cumulative byte
+  // range. It is both the liveness signal and, at the end, the proof that the
+  // parser walked the whole track rather than stopping early.
+  source.onread = (_start, end) => {
+    if (end > track.consumed) track.consumed = end;
+    reportProgress();
+  };
+  return source;
 }
 
 async function mux() {
   const {
-    Input, Output, Conversion, ALL_FORMATS, StreamSource, BufferTarget, Mp4OutputFormat,
+    Input, Output, Conversion, ALL_FORMATS, ReadableStreamSource, BufferTarget, Mp4OutputFormat,
   } = mediabunny;
   const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
   const videoInput = new Input({
-    formats: ALL_FORMATS, source: streamSource(StreamSource, streams.video),
+    formats: ALL_FORMATS, source: trackSource(ReadableStreamSource, tracks.video),
   });
   const audioInput = new Input({
-    formats: ALL_FORMATS, source: streamSource(StreamSource, streams.audio),
+    formats: ALL_FORMATS, source: trackSource(ReadableStreamSource, tracks.audio),
   });
+  // Both of these resolve as soon as each track's header has arrived, which is
+  // the first chunk or two — not the whole file.
   const videoConversion = await Conversion.init({
     input: videoInput, output, composable: true, audio: { discard: true },
   });
@@ -128,30 +154,31 @@ async function mux() {
   if (discarded.length) {
     throw new Error(`дорожка не поддерживается: ${discarded.map((entry) => entry.reason).join(', ')}`);
   }
-  // The document watches these for its stall guard; without them a wedged
-  // conversion would look identical to a slow one.
-  videoConversion.onProgress = (value) => {
-    self.postMessage({ t: 'progress', value: Math.max(0, Math.min(1, Number(value) || 0)) });
-  };
-  audioConversion.onProgress = () => { self.postMessage({ t: 'tick' }); };
+  self.postMessage({ t: 'parsing' });
   await output.start();
   await Promise.all([videoConversion.execute(), audioConversion.execute()]);
   await output.finalize();
   const buffer = output.target.buffer;
   if (!buffer?.byteLength) throw new Error('сборка вернула пустой файл');
+  // Per-track truncation guard. The output's own duration cannot provide this:
+  // `mvhd.duration` is the maximum over the tracks, so a complete audio track
+  // hides a video track that stopped early — exactly how the 14.4 MB file
+  // passed every check it met. How far the parser actually walked each source
+  // cannot be hidden that way.
+  for (const [name, track] of Object.entries(tracks)) {
+    const missed = track.received - track.consumed;
+    if (missed > Math.max(65_536, track.received * 0.02)) {
+      throw new Error(`дорожка ${name} прочитана не до конца:`
+        + ` ${track.consumed} из ${track.received} байт`);
+    }
+  }
   return new Uint8Array(buffer);
 }
 
-// Starts only once both tracks are here in full.
-//
-// Reading ahead of the transfer was tried and produced a **truncated file**:
-// 62.8 MB of tracks came back as 14.4 MB whose header still claimed the full
-// duration, so nothing downstream noticed. The overlap it bought was ~3 s,
-// which is not worth a silently short video; the point of this worker is to
-// keep the document responsive, and that is unaffected by waiting.
+// Starts as soon as both streams exist, i.e. at `start` — long before any bytes
+// arrive. The parser blocks on its first read until the first chunks land.
 function maybeStartMux() {
   if (muxStarted || !mediabunny) return;
-  if (!streams.video.complete || !streams.audio.complete) return;
   muxStarted = true;
   (async () => {
     try {
@@ -161,7 +188,7 @@ function maybeStartMux() {
         bytes: bytes.buffer,
         // What the mux actually read, so a short output can be told apart from
         // a short input in the report.
-        consumed: { video: streams.video.received, audio: streams.audio.received },
+        consumed: { video: tracks.video.consumed, audio: tracks.audio.consumed },
       }, [bytes.buffer]);
     } catch (error) {
       const surrendered = surrenderChunks();
@@ -170,19 +197,25 @@ function maybeStartMux() {
         message: String(error?.message || error),
         video: surrendered.video,
         audio: surrendered.audio,
-      }, surrendered.transfer);
+      });
     }
   })();
 }
 
 // Everything this worker holds, handed back so the document can fall back to
 // the buffered path (mediabunny over a plain buffer, then ffmpeg).
+//
+// Copied, not transferred: mediabunny's sliding cache references these very
+// buffers, and a conversion that is still unwinding would find them detached
+// under it. One extra copy on a path that has already failed is the cheap side
+// of that trade.
 function surrenderChunks() {
-  const video = streams.video.chunks.map((chunk) => chunk.buffer);
-  const audio = streams.audio.chunks.map((chunk) => chunk.buffer);
-  streams.video.chunks = [];
-  streams.audio.chunks = [];
-  return { video, audio, transfer: [...video, ...audio] };
+  const take = (track) => {
+    const copies = track.chunks.map((chunk) => chunk.slice().buffer);
+    track.chunks = [];
+    return copies;
+  };
+  return { video: take(tracks.video), audio: take(tracks.audio) };
 }
 
 self.onmessage = async (event) => {
@@ -190,45 +223,46 @@ self.onmessage = async (event) => {
   if (!message || typeof message.t !== 'string') return;
 
   if (message.t === 'chunk') {
-    const stream = streams[message.track];
-    if (stream) pushChunk(stream, new Uint8Array(message.bytes));
+    const track = tracks[message.track];
+    if (track) pushChunk(track, new Uint8Array(message.bytes));
     return;
   }
   if (message.t === 'complete') {
-    const stream = streams[message.track];
-    if (!stream) return;
+    const track = tracks[message.track];
+    if (!track) return;
     // The document says how many bytes it sent. Anything less arrived here
     // means chunks were lost on the way, and finishing the mux on a truncated
     // input would produce a short file that still passes the duration check —
     // measured once as 14 MB of output from 62 MB of tracks.
     const expected = Math.max(0, Number(message.sent) || 0);
-    if (expected && stream.received !== expected) {
+    if (expected && track.received !== expected) {
       const short = `дорожка ${message.track} пришла не полностью:`
-        + ` ${stream.received} из ${expected} байт`;
-      failStream(stream, new Error(short));
+        + ` ${track.received} из ${expected} байт`;
+      failTrack(track, new Error(short));
       const surrendered = surrenderChunks();
       self.postMessage({
         t: 'error',
         message: short,
         video: surrendered.video,
         audio: surrendered.audio,
-      }, surrendered.transfer);
+      });
       return;
     }
-    completeStream(stream);
-    maybeStartMux();
+    closeTrack(track);
     return;
   }
   if (message.t === 'cancel') {
     const cancelled = new Error(message.reason || 'сборка отменена');
-    failStream(streams.video, cancelled);
-    failStream(streams.audio, cancelled);
+    failTrack(tracks.video, cancelled);
+    failTrack(tracks.audio, cancelled);
     return;
   }
   if (message.t !== 'start') return;
 
-  streams.video.expected = Math.max(0, Number(message.videoSize) || 0);
-  streams.audio.expected = Math.max(0, Number(message.audioSize) || 0);
+  tracks.video.announced = Math.max(0, Number(message.videoSize) || 0);
+  tracks.audio.announced = Math.max(0, Number(message.audioSize) || 0);
+  openTrack(tracks.video);
+  openTrack(tracks.audio);
   try {
     mediabunny = await import('./vendor/mediabunny/mediabunny.min.mjs');
   } catch (error) {

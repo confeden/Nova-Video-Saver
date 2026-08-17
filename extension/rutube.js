@@ -161,11 +161,18 @@
 
   // ---- handing the stream to the shared muxer ------------------------------
 
+  // See content_ui.js: the argument spread costs ~155 ms per 4 MiB chunk in
+  // Chrome 151 against 1.2 ms for the native encoder, and it is the transfer's
+  // whole bottleneck. Byte-identical output.
+  const HAS_NATIVE_BASE64 = typeof Uint8Array.prototype.toBase64 === 'function';
+
   function encodeBase64(bytes) {
+    if (!bytes.length) return '';
+    if (HAS_NATIVE_BASE64) return bytes.toBase64();
     let binary = '';
     const step = 0x8000;
     for (let offset = 0; offset < bytes.length; offset += step) {
-      binary += String.fromCharCode(...bytes.subarray(offset, Math.min(offset + step, bytes.length)));
+      binary += String.fromCharCode.apply(null, bytes.subarray(offset, Math.min(offset + step, bytes.length)));
     }
     return btoa(binary);
   }

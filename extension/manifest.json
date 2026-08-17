@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Nova Video Saver",
-  "version": "1.5",
-  "description": "Скачивание видео/аудио/субтитров YouTube, запись трансляций YouTube и Twitch — без внешних сервисов",
+  "version": "1.6",
+  "description": "Скачивание видео/аудио/субтитров YouTube, Rutube, Twitch и Coub, запись трансляций — без внешних сервисов",
   "permissions": ["downloads", "offscreen", "storage", "alarms"],
   "host_permissions": [
     "https://www.youtube.com/*",
@@ -13,7 +13,9 @@
     "https://rutube.ru/*",
     "https://rutube.sport/*",
     "https://*.rutube.ru/*",
-    "https://*.rtbcdn.ru/*"
+    "https://*.rtbcdn.ru/*",
+    "https://coub.com/*",
+    "https://*.coub.com/*"
   ],
   "background": { "service_worker": "background.js" },
   "action": {
@@ -48,6 +50,14 @@
       "matches": ["https://www.twitch.tv/*", "https://clips.twitch.tv/*"],
       "js": ["twitch_ui.js"],
       "css": ["twitch_ui.css"],
+      "run_at": "document_idle",
+      "world": "ISOLATED",
+      "all_frames": false
+    },
+    {
+      "matches": ["https://coub.com/*"],
+      "js": ["coub.js"],
+      "css": ["coub.css"],
       "run_at": "document_idle",
       "world": "ISOLATED",
       "all_frames": false

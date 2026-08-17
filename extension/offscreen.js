@@ -96,6 +96,7 @@ function processingStatus(job) {
       : `Кодирование ${String(job.audioFormat || 'mp3').toUpperCase()}…`;
   }
   if (job.scaleHeight) return `Масштабирование до ${job.scaleHeight}p…`;
+  if (job.loopVideo === -1) return 'Зацикливание видео под звук…';
   return job.transcode ? 'Перекодирование в H.264/AAC…' : 'Склейка дорожек…';
 }
 
@@ -321,9 +322,16 @@ async function muxVodWithMediabunny(job, videoSource, audioSource) {
 // thread so this document keeps answering messages. Eligibility is decided from
 // the begin message alone, so nothing here waits for bytes: the parser blocks
 // on its first read until the first chunks land.
+//
+// The sizes below are NOT given to mediabunny — the worker feeds it an unsized
+// ReadableStream precisely so it can never be told a track is shorter than it
+// is (see mux_worker.js). They gate the path and drive the progress bar.
 function startStreamingMux(job) {
   if (job.format === 'mp3' || job.transcode || job.muxed) return;
   if (job.scaleHeight || job.videoPrefixBoundary > 0) return;
+  // A looped/paired-audio job is not a copy remux: the video has to be repeated
+  // and the MP3 re-encoded, neither of which this path can do.
+  if (job.loopVideo !== null) return;
   if (!(job.streams.video.expected > 0) || !(job.streams.audio.expected > 0)) return;
 
   let worker;
@@ -343,7 +351,9 @@ function startStreamingMux(job) {
   // announced size and gave up, and the chunks it never got were also gone
   // from `job[track]`, leaving the fallback with nothing ("пустые данные
   // аудио").
-  const bridge = { worker, ready: false, queue: [], lastTick: Date.now(), settled: false };
+  const bridge = {
+    worker, ready: false, queue: [], lastTick: Date.now(), settled: false, startedAt: Date.now(),
+  };
   job.muxWorker = bridge;
   job.stage = 'mediabunny-stream';
 
@@ -372,6 +382,15 @@ function startStreamingMux(job) {
         return;
       }
       if (message.t === 'tick') return;
+      // The parse has begun. Under the old sized source this could not happen
+      // before the last byte of a fragmented MP4 had arrived (the parser probes
+      // the file's final four bytes for the fragment index), so the mux never
+      // truly overlapped the transfer. A small number here is the proof that it
+      // now does.
+      if (message.t === 'parsing') {
+        logToWorker('mux', `stream mux parsing after ${Date.now() - bridge.startedAt} ms`);
+        return;
+      }
       if (message.t === 'unavailable') {
         logToWorker('mux', `mux worker could not load mediabunny: ${message.message}`);
         settle(reject, new Error(message.message || 'worker не загрузил mediabunny'));
@@ -510,7 +529,15 @@ async function writeInputFiles(instance, inputs) {
   for (const input of inputs) await instance.writeFile(input.name, input.bytes.slice());
 }
 
+// Counterpart of the page's encodeBase64. Native fromBase64 is ~5x the atob +
+// charCodeAt loop (2.7 ms vs 14.4 ms per 4 MiB chunk). Do NOT "simplify" the
+// fallback to Uint8Array.from(atob(v), c => c.charCodeAt(0)): measured 403 ms,
+// nearly 30x worse than the explicit loop.
+const HAS_NATIVE_BASE64 = typeof Uint8Array.fromBase64 === 'function';
+
 function decodeBase64(value) {
+  if (!value) return new Uint8Array(0);
+  if (HAS_NATIVE_BASE64) return Uint8Array.fromBase64(value);
   const binary = atob(value);
   const bytes = new Uint8Array(binary.length);
   for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
@@ -610,6 +637,15 @@ function scanForMp4BoxChain(bytes, expected) {
   return false;
 }
 
+// A bare MPEG audio file (Coub's looped soundtrack) starts either with an ID3
+// tag or straight with a frame sync — eleven set bits. Without this check a
+// truncated or error-page body would only be noticed by ffmpeg, several
+// seconds later and with a far less readable message.
+function isMpegAudio(bytes) {
+  if (bytes.length >= 3 && bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33) return true;
+  return bytes.length >= 2 && bytes[0] === 0xFF && (bytes[1] & 0xE0) === 0xE0;
+}
+
 function assertContainerHeader(bytes, mime, track) {
   const isWebM = bytes.length >= 4
     && bytes[0] === 0x1A && bytes[1] === 0x45 && bytes[2] === 0xDF && bytes[3] === 0xA3;
@@ -617,7 +653,8 @@ function assertContainerHeader(bytes, mime, track) {
     && bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70;
   const validMp4 = isMp4 && hasMp4Box(bytes, 'moov')
     && (hasMp4Box(bytes, 'moof') || hasMp4Box(bytes, 'mdat'));
-  if ((/webm/i.test(mime) && !isWebM) || (/mp4/i.test(mime) && !validMp4)) {
+  if ((/webm/i.test(mime) && !isWebM) || (/mp4/i.test(mime) && !validMp4)
+    || (/mpeg|mp3/i.test(mime) && !isMpegAudio(bytes))) {
     const signature = [...bytes.subarray(0, 12)]
       .map((value) => value.toString(16).padStart(2, '0'))
       .join(' ');
@@ -627,6 +664,13 @@ function assertContainerHeader(bytes, mime, track) {
 
 function beginJob(message) {
   if (activeJob?.phase === 'receiving' && Date.now() - activeJob.lastActivity > STALE_JOB_MS) {
+    // Same reason as in abortJob: the mux worker now begins parsing with the
+    // first chunk, so an abandoned receiving job leaves a live worker holding a
+    // full copy of both tracks until the document itself is torn down.
+    if (activeJob.muxWorker) {
+      try { activeJob.muxWorker.worker.terminate(); } catch (e) {}
+      activeJob.muxWorker = null;
+    }
     activeJob.video.length = 0;
     activeJob.videoPrefix.length = 0;
     activeJob.audio.length = 0;
@@ -658,6 +702,11 @@ function beginJob(message) {
       ? message.audioFormat : 'mp3',
     videoId: /^[A-Za-z0-9_-]{6,}$/.test(String(message.videoId || '')) ? String(message.videoId) : '',
     audioQuality: message.audioQuality === 'best' ? 'best' : 'standard',
+    // Coub-shaped job: a short muted video plus a separate soundtrack that
+    // outlasts it. -1 repeats the video until the audio ends, 0 plays it once
+    // and cuts the audio to match; null means this is an ordinary job and the
+    // paired-audio run set below is not used at all.
+    loopVideo: message.loopVideo === -1 || message.loopVideo === 0 ? message.loopVideo : null,
     scaleHeight: Number(message.scaleHeight) || 0,
     duration: Number(message.duration) > 0 ? Number(message.duration) : 0,
     audioCaptureRate: Math.min(4, Math.max(1, Number(message.audioCaptureRate) || 1)),
@@ -775,10 +824,17 @@ function abortJob(message) {
   if (activeJob?.id === message.jobId && activeJob.phase === 'receiving') {
     // Release the streaming mux first: its reads are waiting for bytes that
     // will now never arrive, and an abandoned conversion would hold the whole
-    // job alive.
+    // job alive. The worker now starts parsing with the first chunk instead of
+    // idling until both tracks are complete, so leaving it running after a
+    // cancel would burn a core and hold a full copy of both tracks until the
+    // document is torn down.
     const aborted = new Error('загрузка отменена');
     failTrackStream(activeJob.streams?.video, aborted);
     failTrackStream(activeJob.streams?.audio, aborted);
+    if (activeJob.muxWorker) {
+      try { activeJob.muxWorker.worker.terminate(); } catch (e) {}
+      activeJob.muxWorker = null;
+    }
     activeJob.video.length = 0;
     activeJob.videoPrefix.length = 0;
     activeJob.audio.length = 0;
@@ -807,6 +863,31 @@ function buildRuns(job, videoName, audioName, videoPrefixName, coverName) {
       },
     ];
   }
+  // Coub: a muted H.264 loop plus a soundtrack that is usually many times
+  // longer. `-stream_loop -1` repeats the video input and `-shortest` stops at
+  // the end of the audio, so the video is copied — never re-encoded — and only
+  // the MP3 is converted (MP3 in MP4 is legal but plays badly on Apple devices
+  // and in some editors, so it is not stream-copied).
+  if (job.loopVideo !== null) {
+    const loop = job.loopVideo === -1 ? ['-stream_loop', '-1'] : [];
+    const run = (out, extra, videoArgs) => ({
+      out, type: 'video/mp4', extension: '.mp4',
+      args: [...progressOutput, ...extra, ...loop, '-i', videoName, '-i', audioName,
+        '-map', '0:v:0', '-map', '1:a:0', ...videoArgs,
+        '-c:a', 'aac', '-b:a', '192k', '-shortest', '-movflags', '+faststart', out],
+    });
+    return [
+      run('out.mp4', [], ['-c:v', 'copy']),
+      // A fragmented source can come back with timestamps ffmpeg refuses to
+      // stitch across loop boundaries; rebuilding them costs nothing.
+      run('repaired.mp4', ['-fflags', '+genpts+igndts'], ['-c:v', 'copy']),
+      // Last resort. Slow, but a re-encode never inherits a loop-boundary
+      // timestamp problem.
+      run('reencoded.mp4', ['-fflags', '+genpts'],
+        ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20', '-pix_fmt', 'yuv420p', '-threads', '0']),
+    ];
+  }
+
   const audioInput = ['-i', audioName];
   if (job.format === 'mp3') {
     const tempoFilters = [];
@@ -1461,7 +1542,7 @@ async function finalizeJob(message) {
     // Mediabunny reads fMP4 and WebM, not MPEG-TS: a muxed job goes straight to
     // ffmpeg rather than paying for a parse that cannot succeed.
     if (!selectedRun && job.format !== 'mp3' && !job.transcode && !videoPrefixName
-      && !job.scaleHeight && !job.muxed && videoBytes) {
+      && !job.scaleHeight && !job.muxed && job.loopVideo === null && videoBytes) {
       job.stage = 'mediabunny';
       sendProgress(0.08, 'Сборка дорожек…');
       try {

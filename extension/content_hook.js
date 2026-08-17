@@ -2358,10 +2358,16 @@
   // entry: further candidates resolve to nothing instead of re-asking the API.
   function dropInnertubeFormats() {
     const cache = store.innertubeFormats;
+    // The video and audio halves now download at the same time, so both can be
+    // refused within milliseconds of each other. That is ONE refused signature
+    // seen twice, not two: counting it twice would trip the cooldown after a
+    // single failed download. An already-emptied set has been counted.
+    const alreadyDropped = Boolean(cache) && cache.formats.length === 0;
     if (cache) {
       cache.formats = [];
       cache.expiresAt = Date.now() + INNERTUBE_FAILURE_MS;
     }
+    if (alreadyDropped) return;
     store.innertubeRefusals += 1;
     log('direct-url', 'innertube formats discarded after a refused signature; refusals=',
       store.innertubeRefusals);
@@ -6728,26 +6734,52 @@
               Number(video()?.duration) || Number(player()?.getDuration?.()) || 0,
             );
             try {
-              const directVideo = await fetchDirectVideo(height, (pct) => reply({
-                progress: Math.min(0.84, pct * 0.84),
-                phase: 'direct-video',
-              }));
+              // Both halves at once. They are independent HTTP downloads over
+              // the same signed set, and audio is roughly a sixth of the bytes,
+              // so waiting for the whole video first added the audio's entire
+              // duration to the download for nothing. Progress stays honest by
+              // weighting the two streams the way the bytes divide.
+              const startedBothAt = Date.now();
+              let videoFraction = 0;
+              let audioFraction = completedAudioForVideo ? 1 : 0;
+              const reportBoth = (phase) => reply({
+                progress: Math.min(0.99, (videoFraction * 0.84) + (audioFraction * 0.15)),
+                phase,
+              });
+              const videoRequest = fetchDirectVideo(height, (pct) => {
+                videoFraction = Math.max(0, Math.min(1, Number(pct) || 0));
+                reportBoth('direct-video');
+              });
               let directAudio = completedAudioForVideo;
               if (directAudio) {
                 log('direct-audio', 'reusing completed MP3 source audio; bytes=',
                   directAudio.bytes.length);
-                reply({ progress: 0.99, phase: 'direct-audio' });
-              } else {
+              }
+              const audioRequest = directAudio
+                ? null
+                : fetchDirectAudio((pct) => {
+                  audioFraction = Math.max(0, Math.min(1, Number(pct) || 0));
+                  reportBoth('direct-audio');
+                });
+              // Whichever half loses the race, the other one's rejection must
+              // not surface as an unhandled promise while the first error is
+              // still on its way up.
+              videoRequest.catch(() => {});
+              audioRequest?.catch(() => {});
+              const directVideo = await videoRequest;
+              if (audioRequest) {
                 const expectedDuration = Number(video()?.duration)
                   || directVideo.duration || Number(player()?.getDuration?.()) || 0;
-                directAudio = validateDirectAudioTrack(
-                  await fetchDirectAudio((pct) => reply({
-                    progress: 0.84 + (Math.min(1, pct) * 0.15),
-                    phase: 'direct-audio',
-                  })),
-                  expectedDuration,
-                );
+                directAudio = validateDirectAudioTrack(await audioRequest, expectedDuration);
               }
+              // Defensive on purpose: this line is pure diagnostics, but it
+              // sits inside the try whose catch turns any throw into a full MSE
+              // capture. A diagnostic must never be able to cost a download.
+              log('direct-video', 'both tracks downloaded in parallel; seconds=',
+                ((Date.now() - startedBothAt) / 1000).toFixed(1),
+                'videoBytes=', directVideo?.bytes?.length || 0,
+                'audioBytes=', directAudio?.bytes?.length || 0,
+                'audioReused=', Boolean(completedAudioForVideo));
               cap = {
                 actualHeight: directVideo.height || Number(height) || null,
                 duration: Number(video()?.duration)

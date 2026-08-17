@@ -55,7 +55,7 @@
 
 ## Установка
 
-1. Скачайте актуальный архив (например, `Nova_Video_Saver_v1.5.zip`) из [раздела релизов](https://github.com/confeden/Nova-Video-Saver/releases).
+1. Скачайте актуальный архив (например, `Nova_Video_Saver_v1.6.zip`) из [раздела релизов](https://github.com/confeden/Nova-Video-Saver/releases).
 2. Распакуйте архив в удобное место.
 3. Перейдите в `chrome://extensions/`.
 4. Включите **«Режим разработчика»** (Developer mode).
