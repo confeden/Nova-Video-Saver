@@ -24,6 +24,7 @@ const HANDLED_MESSAGES = new Set([
   'nova-error',
   'nova-ensure',
   'nova-save',
+  'nova-download-state',
   'nova-fetch-caption',
   'nova-register-job',
   'nova-progress',
@@ -276,12 +277,30 @@ function scheduleUpdateChecks() {
   });
 }
 
+// A report is read to understand ONE failing download, and entries from earlier
+// sessions only bury it: exported logs had grown to hundreds of lines covering
+// days, where the run in question was the last twenty. Reloading the extension
+// or restarting the browser starts a fresh journal.
+//
+// Deliberately NOT tied to the service worker starting up: MV3 terminates it
+// whenever it is idle, so that would wipe the log between the capture and the
+// error report about it — exactly the lines needed.
+async function startNewLogSession(reason) {
+  await logWrite.catch(() => {});
+  logWrite = logWrite.catch(() => {}).then(() => chrome.storage.local
+    .set({ [LOG_KEY]: [{ ts: Date.now(), tag: 'session', text: `journal cleared on ${reason}` }] })
+    .catch(() => {}));
+  return logWrite;
+}
+
 chrome.runtime.onInstalled.addListener(() => {
+  startNewLogSession('extension reload/update');
   scheduleUpdateChecks();
   checkForUpdates();
   flushRecoveredFiles().catch(() => {});
 });
 chrome.runtime.onStartup.addListener(() => {
+  startNewLogSession('browser start');
   scheduleUpdateChecks();
   checkForUpdates();
   flushRecoveredFiles().catch(() => {});
@@ -376,6 +395,24 @@ async function handleMessage(message, sender) {
     case 'nova-save': {
       const id = await saveDownload(message.url, message.filename);
       return { ok: true, id };
+    }
+
+    // A direct save is pulled by the browser itself, so the page has no byte
+    // count of its own: without this the on-page panel could only say "handed
+    // over" while Chrome's own bubble showed the real progress.
+    case 'nova-download-state': {
+      const id = Number(message.id);
+      if (!Number.isInteger(id)) return { ok: false, error: 'download id is missing' };
+      const [item] = await chrome.downloads.search({ id });
+      if (!item) return { ok: false, error: 'download not found' };
+      return {
+        ok: true,
+        state: item.state,
+        paused: Boolean(item.paused),
+        bytesReceived: item.bytesReceived || 0,
+        totalBytes: item.totalBytes || item.fileSize || 0,
+        error: item.error || '',
+      };
     }
 
     case 'nova-check-update':

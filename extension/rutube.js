@@ -134,29 +134,41 @@
     }
   }
 
-  // Ordered result, bounded concurrency: the pieces must be concatenated in
-  // playlist order, but waiting for each one in turn would be needlessly slow.
-  async function downloadSegments(urls, onProgress) {
-    const parts = new Array(urls.length);
-    let done = 0;
-    let next = 0;
-    const worker = async () => {
-      while (next < urls.length) {
-        const index = next++;
-        parts[index] = await fetchSegment(urls[index]);
-        done += 1;
-        onProgress(done / urls.length);
+  // Segments are fetched ahead but handed over strictly in playlist order, and
+  // are released as soon as they leave. Collecting the whole film first is what
+  // this replaced, and it could not work: a two-hour Rutube video is 1814
+  // segments, and after holding all of them the code asked for ONE contiguous
+  // buffer of the same size again — reported from the field as
+  // `RangeError: Array buffer allocation failed` at 480p, where the file is
+  // under a gigabyte and only the doubling made it fail.
+  async function streamSegments(urls, send, onProgress) {
+    // Fetches run ahead, the handover stays in playlist order, and a segment is
+    // released the moment it leaves. `LOOKAHEAD` bounds both the concurrency and
+    // the memory: never more than this many segments in flight.
+    //
+    // The single loop is deliberate. An earlier version polled a "have I got the
+    // next one yet" condition with `while (...) await drain()`, and when the
+    // awaited promise was already resolved that became a pure microtask spin:
+    // microtasks starve the event loop, so the very network responses it was
+    // waiting for could never be delivered and the whole tab froze. Awaiting the
+    // promise of the segment actually needed is what makes progress possible.
+    const LOOKAHEAD = SEGMENT_CONCURRENCY * 2;
+    const inFlight = new Map();
+    let nextToFetch = 0;
+
+    for (let index = 0; index < urls.length; index++) {
+      while (nextToFetch < urls.length && inFlight.size < LOOKAHEAD) {
+        const at = nextToFetch++;
+        const request = fetchSegment(urls[at]);
+        // Marks it handled; the await below still sees a rejection.
+        request.catch(() => {});
+        inFlight.set(at, request);
       }
-    };
-    await Promise.all(Array.from({ length: Math.min(SEGMENT_CONCURRENCY, urls.length) }, worker));
-    const total = parts.reduce((sum, part) => sum + part.length, 0);
-    const merged = new Uint8Array(total);
-    let offset = 0;
-    for (const part of parts) {
-      merged.set(part, offset);
-      offset += part.length;
+      const request = inFlight.get(index);
+      inFlight.delete(index);
+      await send(await request);
+      onProgress((index + 1) / urls.length);
     }
-    return merged;
   }
 
   // ---- handing the stream to the shared muxer ------------------------------
@@ -177,7 +189,7 @@
     return btoa(binary);
   }
 
-  async function muxViaOffscreen(job, bytes, onProgress) {
+  async function beginJob(job, expectedBytes) {
     const ensured = await chrome.runtime.sendMessage({ t: 'nova-ensure' });
     if (!ensured?.ok) throw new Error(ensured?.error || 'не удалось запустить обработчик медиа');
     const registration = await chrome.runtime.sendMessage({ t: 'nova-register-job', jobId: job.jobId });
@@ -194,22 +206,23 @@
       videoMime: 'video/mp2t',
       audioMime: '',
       duration: job.duration,
+      // Lets the muxer decide up front whether to spool to disk instead of
+      // holding the stream in memory. An estimate is enough: it also switches
+      // over on its own once the bytes actually pile up.
+      expectedBytes: Math.max(0, Math.round(expectedBytes) || 0),
     });
     if (!started?.ok) throw new Error(started?.error || 'не удалось начать обработку');
+  }
 
-    try {
-      for (let offset = 0; offset < bytes.length; offset += TRANSFER_CHUNK_SIZE) {
-        const chunk = bytes.subarray(offset, Math.min(offset + TRANSFER_CHUNK_SIZE, bytes.length));
-        const response = await chrome.runtime.sendMessage({
-          t: 'nova-chunk', jobId: job.jobId, track: 'video', b64: encodeBase64(chunk),
-        });
-        if (!response?.ok) throw new Error(response?.error || 'передача данных прервалась');
-        onProgress(Math.min(offset + chunk.length, bytes.length) / bytes.length);
-      }
-      return await chrome.runtime.sendMessage({ t: 'nova-finalize', jobId: job.jobId });
-    } catch (error) {
-      await chrome.runtime.sendMessage({ t: 'nova-abort', jobId: job.jobId }).catch(() => {});
-      throw error;
+  // Sends one segment onwards, split into transfer-sized chunks. The segment
+  // itself is dropped by the caller right after.
+  async function sendBytes(jobId, bytes) {
+    for (let offset = 0; offset < bytes.length; offset += TRANSFER_CHUNK_SIZE) {
+      const chunk = bytes.subarray(offset, Math.min(offset + TRANSFER_CHUNK_SIZE, bytes.length));
+      const response = await chrome.runtime.sendMessage({
+        t: 'nova-chunk', jobId, track: 'video', b64: encodeBase64(chunk),
+      });
+      if (!response?.ok) throw new Error(response?.error || 'передача данных прервалась');
     }
   }
 
@@ -346,22 +359,34 @@
         } catch (error) { lastError = error; }
       }
       if (!segments?.length) throw lastError || new Error('плейлист сегментов пуст');
+      const estimate = (variant.bandwidth || 0) / 8 * (options.durationSeconds || 0);
       log('download', `start; height=${variant.height} segments=${segments.length}`
-        + ` mirrors=${variant.mirrors.length}`);
-
-      const bytes = await downloadSegments(segments, (fraction) => {
-        notification.set(`Получение сегментов ${Math.round(fraction * 100)}%`, fraction * 0.8);
-      });
-      log('download', `segments fetched; bytes=${bytes.length}`);
+        + ` mirrors=${variant.mirrors.length} estimateBytes=${Math.round(estimate)}`);
 
       const filename = `${safeFilename(options.title)} [${variant.height}p].mp4`;
-      const result = await muxViaOffscreen({
+      const job = {
         jobId: crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`,
         filename,
         duration: options.durationSeconds,
-      }, bytes, (fraction) => {
-        notification.set(`Передача ${Math.round(fraction * 100)}%`, 0.8 + fraction * 0.15);
-      });
+      };
+      await beginJob(job, estimate);
+
+      let sentBytes = 0;
+      try {
+        await streamSegments(segments, async (bytes) => {
+          await sendBytes(job.jobId, bytes);
+          sentBytes += bytes.length;
+        }, (fraction) => {
+          notification.set(`Скачивание ${Math.round(fraction * 100)}%`, fraction * 0.92);
+        });
+      } catch (error) {
+        await chrome.runtime.sendMessage({ t: 'nova-abort', jobId: job.jobId }).catch(() => {});
+        throw error;
+      }
+      log('download', `segments streamed; bytes=${sentBytes}`);
+
+      notification.set('Сборка файла…', 0.94);
+      const result = await chrome.runtime.sendMessage({ t: 'nova-finalize', jobId: job.jobId });
       if (!result?.ok) throw new Error(result?.error || 'не удалось собрать файл');
       notification.set(`Готово: ${result.filename || filename}`, 1);
       notification.hide(5000);

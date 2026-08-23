@@ -671,6 +671,13 @@ function beginJob(message) {
       try { activeJob.muxWorker.worker.terminate(); } catch (e) {}
       activeJob.muxWorker = null;
     }
+    if (activeJob.spool) {
+      // Detached on purpose: closing and deleting are async, and the caller of
+      // both these paths is synchronous.
+      const abandoned = activeJob;
+      closeSpool(abandoned.spool).then(() => removeSpoolFiles(abandoned)).catch(() => {});
+      activeJob.spool = null;
+    }
     activeJob.video.length = 0;
     activeJob.videoPrefix.length = 0;
     activeJob.audio.length = 0;
@@ -713,7 +720,12 @@ function beginJob(message) {
     lastProgress: 0,
     lastProgressAt: 0,
     stage: 'receiving',
+    spool: null,
   };
+  // A site that announces a big already-muxed stream goes to disk from the very
+  // first chunk. The estimate only has to be roughly right: appendChunk switches
+  // over on its own once the bytes actually pile up.
+  if (activeJob.muxed && Number(message.expectedBytes) > SPOOL_THRESHOLD) startSpool(activeJob);
   // Adopt what the page shipped during the capture, per track and only where
   // it said the bytes are the finished file. A size mismatch means something
   // was lost on the way, so that track is transferred again instead.
@@ -768,17 +780,177 @@ function appendChunk(message) {
   const target = message.track === 'video-prefix' ? 'videoPrefix' : message.track;
   const bytes = decodeBase64(message.b64);
   const length = bytes.length;
-  // Straight to the worker when there is one: it owns the bytes from then on,
-  // which is what keeps a single copy in memory. Read the length first — the
-  // transfer neuters the view.
-  if (!routeChunkToWorker(activeJob, target, bytes)) activeJob[target].push(bytes);
   const stream = activeJob.streams?.[target];
   if (stream) {
     stream.received += length;
     stream.starts.push(stream.received - length);
   }
   activeJob.lastActivity = Date.now();
+  // An already-muxed stream that has grown past the threshold moves to disk,
+  // even if the site's own estimate said it would be small. From here the reply
+  // waits for the write, which is what stops the sender running ahead of us.
+  if (activeJob.muxed) {
+    if (!activeJob.spool && (stream?.received || 0) > SPOOL_THRESHOLD) startSpool(activeJob);
+    if (activeJob.spool) return spoolChunk(activeJob, bytes);
+  }
+  // Straight to the worker when there is one: it owns the bytes from then on,
+  // which is what keeps a single copy in memory. Read the length first — the
+  // transfer neuters the view.
+  if (!routeChunkToWorker(activeJob, target, bytes)) activeJob[target].push(bytes);
   return { ok: true };
+}
+
+// ---- spooling a large already-muxed stream to disk ------------------------
+// An HLS site hands over one MPEG-TS stream, and a feature-length one does not
+// fit anywhere in memory: the page died building a contiguous buffer of it
+// (`RangeError: Array buffer allocation failed` on a 1814-segment Rutube video),
+// and ffmpeg.wasm cannot hold much over a gigabyte either. Past a threshold the
+// stream therefore goes straight to OPFS, and the mux reads it from there and
+// writes the MP4 back to disk — the ceiling becomes free disk space.
+//
+// Its own directory, not the live-recording one: cleanupStaleLiveFiles() deletes
+// everything there that no live job claims, which would eat an active spool.
+const SPOOL_DIR = 'nvs-spool';
+const SPOOL_THRESHOLD = 256 * 1024 * 1024;
+const SPOOL_FFMPEG_LIMIT = 1_000_000_000;
+
+async function spoolDirectory() {
+  const root = await navigator.storage.getDirectory();
+  return root.getDirectoryHandle(SPOOL_DIR, { create: true });
+}
+
+async function cleanupStaleSpoolFiles() {
+  try {
+    const dir = await spoolDirectory();
+    for await (const name of dir.keys()) {
+      if (activeJob?.spool && name.startsWith(activeJob.id)) continue;
+      await dir.removeEntry(name).catch(() => {});
+    }
+  } catch (error) { /* OPFS unavailable: the in-memory path still works */ }
+}
+
+// Switches the job to disk and moves whatever was buffered before the decision.
+function startSpool(job) {
+  const spool = { name: `${job.id}.ts`, bytes: 0, handle: null, writable: null, closed: false };
+  spool.chain = (async () => {
+    const dir = await spoolDirectory();
+    spool.handle = await dir.getFileHandle(spool.name, { create: true });
+    spool.writable = await spool.handle.createWritable();
+    for (const part of job.video) {
+      await spool.writable.write(part);
+      spool.bytes += part.length;
+    }
+    job.video.length = 0;
+  })();
+  spool.chain.catch(() => {});
+  job.spool = spool;
+  logToWorker('spool', `streaming to disk; job=${job.id} threshold=${SPOOL_THRESHOLD}`);
+  return spool;
+}
+
+// Per-job write chain: the response is sent only once the bytes are on disk, so
+// the sender gets real backpressure and the order is the arrival order.
+function spoolChunk(job, bytes) {
+  const spool = job.spool;
+  spool.chain = spool.chain.then(async () => {
+    await spool.writable.write(bytes);
+    spool.bytes += bytes.length;
+  });
+  return spool.chain.then(() => ({ ok: true }));
+}
+
+async function closeSpool(spool) {
+  if (!spool || spool.closed) return;
+  spool.closed = true;
+  await spool.chain.catch(() => {});
+  await spool.writable?.close().catch(() => {});
+}
+
+async function removeSpoolFiles(job) {
+  try {
+    const dir = await spoolDirectory();
+    for (const name of [`${job.id}.ts`, `${job.id}-out.mp4`]) {
+      await dir.removeEntry(name).catch(() => {});
+    }
+  } catch (error) {}
+}
+
+// Disk to disk. mediabunny reads the spooled MPEG-TS through a BlobSource and
+// writes the MP4 through a StreamTarget, so neither side is ever held whole.
+// The cost is layout: a StreamTarget cannot rewind, so `moov` lands at the end
+// of the file instead of the front. Players read it either way; the alternative
+// is holding the entire output in RAM, which is the ceiling being removed.
+async function remuxSpooledStream(job, inputFile) {
+  const {
+    Input, Output, Conversion, ALL_FORMATS, BlobSource, StreamTarget, Mp4OutputFormat,
+  } = await getMediabunny();
+  const dir = await spoolDirectory();
+  const outName = `${job.id}-out.mp4`;
+  const outHandle = await dir.getFileHandle(outName, { create: true });
+  const writable = await outHandle.createWritable();
+  let writableClosed = false;
+  const target = new StreamTarget(new WritableStream({
+    write: (chunk) => writable.write({ type: 'write', position: chunk.position, data: chunk.data }),
+    close: async () => {
+      writableClosed = true;
+      await writable.close();
+    },
+  }), { chunked: true });
+
+  const output = new Output({ format: new Mp4OutputFormat(), target });
+  const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(inputFile) });
+  const conversion = await Conversion.init({ input, output });
+  if (conversion.discardedTracks.length) {
+    throw new Error(`дорожка не поддерживается: ${conversion.discardedTracks.map((entry) => entry.reason).join(', ')}`);
+  }
+  let lastTick = Date.now();
+  conversion.onProgress = (progress) => {
+    lastTick = Date.now();
+    if (activeJob !== job) return;
+    job.lastProgressAt = lastTick;
+    sendProgress(0.1 + Math.max(0, Math.min(1, progress)) * 0.85, 'Сборка дорожек…');
+  };
+  let stallTimer;
+  const stallGuard = new Promise((_, reject) => {
+    const check = () => {
+      if (Date.now() - lastTick > 180_000) {
+        reject(new Error('сборка не показывает прогресс более 180 секунд'));
+        return;
+      }
+      stallTimer = setTimeout(check, 5_000);
+    };
+    stallTimer = setTimeout(check, 5_000);
+  });
+  try {
+    await Promise.race([conversion.execute(), stallGuard]);
+    if (!writableClosed) await writable.close().catch(() => {});
+  } catch (error) {
+    await conversion.cancel?.().catch(() => {});
+    if (!writableClosed) await writable.abort?.().catch(() => {});
+    await dir.removeEntry(outName).catch(() => {});
+    throw error;
+  } finally {
+    clearTimeout(stallTimer);
+  }
+
+  const outFile = await outHandle.getFile();
+  // A copy remux of MPEG-TS into MP4 sheds the 4-byte packet headers and the
+  // PSI tables, so a little smaller is expected; half is not.
+  if (!outFile.size || outFile.size < inputFile.size * 0.5) {
+    await dir.removeEntry(outName).catch(() => {});
+    throw new Error(`сборка записала ${outFile.size} байт из ${inputFile.size}`);
+  }
+  // Reading the finished file back costs only its index — the moov is parsed
+  // through ranged reads, not by loading three gigabytes.
+  const check = new Input({ formats: ALL_FORMATS, source: new BlobSource(outFile) });
+  const actual = await check.computeDuration().catch(() => 0);
+  if (job.duration > 10 && actual > 0 && actual < job.duration * 0.9) {
+    await dir.removeEntry(outName).catch(() => {});
+    throw new Error(`собранный файл длится ${actual.toFixed(1)} сек вместо ${job.duration.toFixed(1)} сек`);
+  }
+  logToWorker('spool', `disk remux ok; in=${inputFile.size} out=${outFile.size}`
+    + ` duration=${actual.toFixed(1)} expected=${(job.duration || 0).toFixed(1)}`);
+  return outFile;
 }
 
 // ---- staging: track bytes that arrive while the capture still runs --------
@@ -834,6 +1006,13 @@ function abortJob(message) {
     if (activeJob.muxWorker) {
       try { activeJob.muxWorker.worker.terminate(); } catch (e) {}
       activeJob.muxWorker = null;
+    }
+    if (activeJob.spool) {
+      // Detached on purpose: closing and deleting are async, and the caller of
+      // both these paths is synchronous.
+      const abandoned = activeJob;
+      closeSpool(abandoned.spool).then(() => removeSpoolFiles(abandoned)).catch(() => {});
+      activeJob.spool = null;
     }
     activeJob.video.length = 0;
     activeJob.videoPrefix.length = 0;
@@ -1378,8 +1557,12 @@ async function finalizeJob(message) {
   let instance;
 
   try {
-    sendProgress(0.02, 'Инициализация движка кодирования…');
-    instance = await getFFmpeg();
+    // A spooled stream never touches the wasm filesystem, and loading ffmpeg
+    // for it would only cost a second and 32 MB of wasm.
+    if (!job.spool) {
+      sendProgress(0.02, 'Инициализация движка кодирования…');
+      instance = await getFFmpeg();
+    }
 
     job.stage = 'buffers';
     sendProgress(0.06, 'Подготовка буферов дорожек…');
@@ -1387,6 +1570,47 @@ async function finalizeJob(message) {
     let output;
     let selectedRun;
     let lastError = '';
+
+    // ---- spooled stream: disk to disk, no size ceiling ----------------------
+    if (job.spool) {
+      job.stage = 'spool-finish';
+      await closeSpool(job.spool);
+      const inputFile = await job.spool.handle.getFile();
+      if (!inputFile.size) throw new Error('пустые данные потока');
+      logToWorker('spool', `stream on disk; bytes=${inputFile.size} declared=${job.spool.bytes}`);
+      job.stage = 'spool-remux';
+      sendProgress(0.1, 'Сборка дорожек…');
+      let outFile;
+      try {
+        outFile = await remuxSpooledStream(job, inputFile);
+      } catch (error) {
+        logToWorker('spool', `disk remux failed: ${String(error?.message || error)}`);
+        // ffmpeg can still rescue a stream small enough to fit its filesystem;
+        // anything larger has nowhere else to go and must fail honestly.
+        if (inputFile.size > SPOOL_FFMPEG_LIMIT) {
+          throw new Error(`не удалось собрать поток на ${Math.round(inputFile.size / 1e6)} МБ:`
+            + ` ${String(error?.message || error)}`);
+        }
+        job.stage = 'spool-ffmpeg';
+        instance = await getFFmpeg();
+        job.video = [new Uint8Array(await inputFile.arrayBuffer())];
+        job.spool = null;
+      }
+      if (outFile) {
+        job.stage = 'saving';
+        sendProgress(0.97, 'Подготовка файла к сохранению…', 97);
+        const spooledName = job.filename.replace(/\.(mp4|webm|mp3|m4a|aac|flac|wav|ogg|opus)$/i, '') + '.mp4';
+        await deliverOutput(outFile, spooledName);
+        job.stage = 'saved';
+        sendProgress(1, 'Файл передан браузеру…', 100);
+        // The download reads the output straight from OPFS, so only the source
+        // stream goes now; the result is swept on the next start.
+        await spoolDirectory()
+          .then((dir) => dir.removeEntry(`${job.id}.ts`).catch(() => {}))
+          .catch(() => {});
+        return { ok: true, filename: spooledName };
+      }
+    }
 
     // The streaming mux has been running since the first chunks arrived, so by
     // now it is usually all but finished. Telling it the tracks are complete is
@@ -1635,6 +1859,13 @@ async function finalizeJob(message) {
       try { job.muxWorker.worker.terminate(); } catch (e) {}
       job.muxWorker = null;
     }
+    // A spool that survived to here belongs to a failed job: the success path
+    // deleted its source and returned already.
+    if (job.spool) {
+      await closeSpool(job.spool).catch(() => {});
+      await removeSpoolFiles(job).catch(() => {});
+      job.spool = null;
+    }
     job.video.length = 0;
     job.videoPrefix.length = 0;
     job.audio.length = 0;
@@ -1669,6 +1900,9 @@ async function cleanupStaleLiveFiles() {
   } catch (error) { /* OPFS unavailable: live begin will report it */ }
 }
 cleanupStaleLiveFiles();
+// Spools of jobs that died with the document; the finished MP4 of the last
+// successful one is also here, and by now its download has long been read.
+cleanupStaleSpoolFiles();
 
 const LIVE_STALE_MS = 10 * 60_000;
 
@@ -2127,8 +2361,18 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return false;
   }
   if (message.t === 'nova-chunk') {
-    try { sendResponse(appendChunk(message)); }
-    catch (error) { sendResponse({ ok: false, error: String(error) }); }
+    let result;
+    try { result = appendChunk(message); }
+    catch (error) { sendResponse({ ok: false, error: String(error) }); return false; }
+    // A spooled job answers only once the bytes are on disk, so its result is a
+    // promise; every other path is still synchronous.
+    if (result && typeof result.then === 'function') {
+      result.then(sendResponse, (error) => sendResponse({
+        ok: false, error: `запись на диск не удалась: ${String(error?.message || error)}`,
+      }));
+      return true;
+    }
+    sendResponse(result);
     return false;
   }
   if (message.t === 'nova-abort') {

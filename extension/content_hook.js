@@ -417,6 +417,7 @@
     window.fetch = function (input, init) {
       const url = (typeof input === 'string') ? input : (input && input.url) || '';
       rememberObservedMediaFormat(url);
+      rememberSabrRequest(url, input, init);
       return OrigFetch(input, init).then((response) => {
         inspectFetchResponse(response, url);
         return response;
@@ -2412,6 +2413,651 @@
     return cache.formats.filter((format) => directUrlIsUsable(format.url));
   }
 
+  // ---- SABR client (experimental) -------------------------------------------
+  // A signed googlevideo URL hands over only the first ~60 s of a format and
+  // then answers 403 — measured on two tracks whose bitrates differ 22x, so the
+  // limit is time, not bytes, and `pot=` does not lift it (the parameter is
+  // ignored: a garbage token behaves identically). SABR is the only channel
+  // that serves a whole track, and it runs at ~16 MB/s against ~0.7 MB/s.
+  //
+  // Nova does not build that request from scratch — the PO token and the
+  // ustreamer config live inside one the player already sent. It copies the
+  // last such request and rewrites it. What each field does — all measured, the
+  // proto is not published:
+  //   ClientAbrState 28 — playback position in ms: what to serve next;
+  //   ClientAbrState 21 — height cap, and it is what picks the video rung:
+  //                       4320 → itag 399, 1080 → 399, 720 → 398, 360 → 396.
+  //                       Neighbouring field 16 is NOT a second cap: setting it
+  //                       alone dropped the answer to 360p;
+  //   top-level 16      — the audio formats the client accepts. Replacing the
+  //                       list with one FormatId selects exactly that track,
+  //                       dubbing included (verified: en original, de-DE, opus).
+  //                       Video FormatIds do not belong here — adding one made
+  //                       the server fall to the lowest rung;
+  //   top-level 3       — buffered ranges: dropped, or the answer is 143 bytes
+  //                       of "you already have this";
+  //   top-level 17      — initialized formats: dropped, or no init segment.
+  // Field 2 (a video + audio pair) is left alone: the server ignores it — it
+  // asked for 299 + 140 and served 399 + 251. Field 5 (ustreamer config) must
+  // stay, without it the answer is `sabr.malformed_config`.
+  //
+  // Known gap, and the rule that avoids it: for the format the page's player is
+  // playing right now the server does not re-send the init segment (a fresh
+  // `cpn` does not fool it), so that track starts at its second segment and
+  // `assemble()` reports a hole at 0. Everything else gets its init. The web
+  // player runs VP9 + opus in WebM, while these requests are answered with AV1
+  // + AAC in MP4 — ask for the MP4 pair and the collision does not arise
+  // (measured: itag 140 starts at 0, itag 251 at 2371).
+  //
+  // `observedInitFor` below is the fallback for when it does. It rarely
+  // fires: the init the player appends is not the file's head — 220 bytes
+  // against a 2371-byte WebM head — so the length check refuses it, which is
+  // the point. A wrong init glued to the front is worse than a visible hole.
+  // The catch: a template exists only after the player has really streamed this
+  // video, and a hidden tab never plays (§5).
+  const SABR_REQUEST_RE = /\/videoplayback\?/;
+  const sabrTemplate = { videoId: '', url: '', body: null, at: 0 };
+  const SABR_TEMPLATE_MS = 30 * 60_000;
+
+  function rememberSabrRequest(url, input, init) {
+    try {
+      if (!SABR_REQUEST_RE.test(url) || !/[?&]sabr=1/.test(url)) return;
+      // The player passes a Request, not init.body, so the bytes have to be
+      // read from a clone — reading the original would consume it.
+      const bodyOf = (input && typeof input === 'object' && typeof input.clone === 'function')
+        ? input.clone().arrayBuffer().then((buffer) => new Uint8Array(buffer))
+        : Promise.resolve(asBytes(init && init.body));
+      bodyOf.then((bytes) => {
+        if (!bytes || bytes.length < 512) return;
+        sabrTemplate.videoId = vidId();
+        sabrTemplate.url = String(url);
+        sabrTemplate.body = bytes;
+        sabrTemplate.at = Date.now();
+      }).catch(() => {});
+    } catch (e) {}
+  }
+
+  function asBytes(body) {
+    if (!body) return null;
+    if (body instanceof ArrayBuffer) return new Uint8Array(body);
+    if (ArrayBuffer.isView(body)) return new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
+    return null;
+  }
+
+  function sabrTemplateFor(videoId) {
+    if (!sabrTemplate.body || sabrTemplate.videoId !== videoId) return null;
+    if (Date.now() - sabrTemplate.at > SABR_TEMPLATE_MS) return null;
+    return sabrTemplate;
+  }
+
+  // ---- protobuf, only as much as rewriting the request needs ---------------
+  function readVarint(bytes, at) {
+    let value = 0;
+    let shift = 0;
+    let used = 0;
+    while (at + used < bytes.length) {
+      const byte = bytes[at + used];
+      used += 1;
+      value += (byte & 0x7f) * Math.pow(2, shift);
+      shift += 7;
+      if (!(byte & 0x80)) break;
+    }
+    return { value, used };
+  }
+
+  // Arithmetic, not `& 0x7f`: bitwise operators truncate to 32 bits and a
+  // format's `lastModified` is a 15-digit number.
+  function writeVarint(value) {
+    const out = [];
+    let rest = Math.max(0, Math.floor(Number(value) || 0));
+    while (rest > 127) {
+      out.push((rest % 128) + 128);
+      rest = Math.floor(rest / 128);
+    }
+    out.push(rest);
+    return out;
+  }
+
+  function varintRecord(field, value) {
+    return Uint8Array.from([...writeVarint((field << 3) | 0), ...writeVarint(value)]);
+  }
+
+  // Top-level records with their raw bytes: enough to drop a field or swap one
+  // out without understanding the rest of the message.
+  function splitProtobuf(bytes) {
+    const records = [];
+    let at = 0;
+    while (at < bytes.length) {
+      const start = at;
+      const tag = readVarint(bytes, at);
+      at += tag.used;
+      const field = tag.value >>> 3;
+      const wire = tag.value & 7;
+      if (wire === 2) {
+        const length = readVarint(bytes, at);
+        at += length.used + length.value;
+      } else if (wire === 0) {
+        at += readVarint(bytes, at).used;
+      } else if (wire === 5) {
+        at += 4;
+      } else if (wire === 1) {
+        at += 8;
+      } else break;
+      records.push({ field, wire, raw: bytes.subarray(start, at) });
+    }
+    return records;
+  }
+
+  function concatBytes(chunks) {
+    const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    const out = new Uint8Array(total);
+    let at = 0;
+    for (const chunk of chunks) { out.set(chunk, at); at += chunk.length; }
+    return out;
+  }
+
+  function recordPayload(record) {
+    let at = readVarint(record.raw, 0).used;
+    const length = readVarint(record.raw, at);
+    return record.raw.subarray(at + length.used, at + length.used + length.value);
+  }
+
+  function lengthDelimited(field, payload) {
+    return concatBytes([
+      Uint8Array.from(writeVarint((field << 3) | 2)),
+      Uint8Array.from(writeVarint(payload.length)),
+      payload,
+    ]);
+  }
+
+  // FormatId: 1 itag, 2 lastModified, 3 xtags. The itag alone does not name a
+  // track — this video answers with 21 formats numbered 140, one per dubbed
+  // language, told apart only by xtags. Video formats carry no xtags.
+  // `field` is the record this FormatId is written as — 16 for the audio list.
+  // Hardcoding it is how the first attempt silently failed: the id went out as
+  // another field-2 record, which the server ignores.
+  function encodeFormatId(format, field) {
+    const parts = [varintRecord(1, format.itag)];
+    if (format.lastModified) parts.push(varintRecord(2, format.lastModified));
+    const xtags = String(format.xtags || '');
+    if (xtags) {
+      parts.push(lengthDelimited(3, Uint8Array.from(xtags, (char) => char.charCodeAt(0) & 0xff)));
+    }
+    return lengthDelimited(field, concatBytes(parts));
+  }
+
+  // A shorter varint written over a longer one leaves the tail of the old value
+  // behind and the server answers `sabr.malformed_config`; the message is
+  // rebuilt instead, so the length prefixes stay honest.
+  function buildSabrRequest(template, playerTimeMs, options = {}) {
+    const height = Number(options.height) || 0;
+    const audio = options.audio ? encodeFormatId(options.audio, 16) : null;
+    const out = [];
+    let audioPlaced = false;
+    for (const record of splitProtobuf(template.body)) {
+      if (record.field === 3 || record.field === 17) continue;
+      if (record.field === 16 && audio) {
+        if (!audioPlaced) { out.push(audio); audioPlaced = true; }
+        continue;
+      }
+      if (record.field === 1) {
+        const children = splitProtobuf(recordPayload(record));
+        const inner = children.map((child) => {
+          if (child.field === 28) return varintRecord(28, playerTimeMs);
+          if (child.field === 21 && height) return varintRecord(21, height);
+          return child.raw;
+        });
+        // A template captured at another moment may simply not carry the field.
+        for (const [field, value] of [[28, playerTimeMs], [21, height]]) {
+          if (value && !children.some((child) => child.field === field)) {
+            inner.push(varintRecord(field, value));
+          }
+        }
+        out.push(lengthDelimited(1, concatBytes(inner)));
+        continue;
+      }
+      out.push(record.raw);
+    }
+    if (audio && !audioPlaced) out.push(audio);
+    return concatBytes(out);
+  }
+
+  // ---- UMP ------------------------------------------------------------------
+  // Not protobuf varints: the leading ones of the first byte give the width.
+  const UMP_MEDIA_HEADER = 20;
+  const UMP_MEDIA = 21;
+  const UMP_SABR_ERROR = 44;
+
+  function readUmpVarint(bytes, at) {
+    const first = bytes[at];
+    const width = first < 128 ? 1 : first < 192 ? 2 : first < 224 ? 3 : first < 240 ? 4 : 5;
+    let value;
+    if (width === 1) value = first;
+    else if (width === 2) value = (first & 0x3f) + bytes[at + 1] * 64;
+    else if (width === 3) value = (first & 0x1f) + bytes[at + 1] * 32 + bytes[at + 2] * 8192;
+    else if (width === 4) {
+      value = (first & 0x0f) + bytes[at + 1] * 16 + bytes[at + 2] * 4096 + bytes[at + 3] * 1048576;
+    } else {
+      value = bytes[at + 1] + bytes[at + 2] * 256 + bytes[at + 3] * 65536 + bytes[at + 4] * 16777216;
+    }
+    return { value, used: width };
+  }
+
+  function parseUmpParts(bytes) {
+    const parts = [];
+    let at = 0;
+    while (at < bytes.length) {
+      const type = readUmpVarint(bytes, at);
+      at += type.used;
+      const size = readUmpVarint(bytes, at);
+      at += size.used;
+      if (at + size.value > bytes.length) break;
+      parts.push({ type: type.value, size: size.value, at });
+      at += size.value;
+    }
+    return parts;
+  }
+
+  // MediaHeader: 1 header id, 3 itag, 6 start byte in the format, 9 sequence,
+  // 11 start ms, 12 duration ms, 14 segment size. Field 10 is the bitrate, not
+  // the size — reading it as the size hides every hole.
+  function parseMediaHeader(bytes) {
+    const header = {};
+    for (const record of splitProtobuf(bytes)) {
+      if (record.wire !== 0) continue;
+      let at = readVarint(record.raw, 0).used;
+      header[record.field] = readVarint(record.raw, at).value;
+    }
+    return {
+      headerId: header[1], itag: header[3], lastModified: header[4], startByte: header[6],
+      sequence: header[9], startMs: header[11] || 0,
+      durationMs: header[12] || 0, size: header[14] || 0,
+    };
+  }
+
+  async function sabrFetch(template, playerTimeMs, options) {
+    const response = await (OrigFetch || fetch)(template.url, {
+      method: 'POST',
+      body: buildSabrRequest(template, playerTimeMs, options),
+      credentials: 'include',
+      cache: 'no-store',
+    });
+    if (!response.ok) throw new Error(`SABR HTTP ${response.status}`);
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    const parts = parseUmpParts(bytes);
+    const failure = parts.find((part) => part.type === UMP_SABR_ERROR);
+    if (failure) {
+      const text = String.fromCharCode(...bytes.subarray(failure.at, failure.at + failure.size))
+        .replace(/[^\x20-\x7e]/g, ' ').trim();
+      throw new Error(`SABR отказал: ${text}`);
+    }
+    return { bytes, parts };
+  }
+
+  // Walks a video from `fromMs` and hands back the tracks it saw. Segments carry
+  // absolute byte offsets, so the re-send the server always makes for the
+  // segment containing the requested instant is placed, not appended. With
+  // `onSegment(track, bytes)` nothing is kept: see `emitTrackBytes`.
+  async function sabrCollect(videoId, options = {}) {
+    const template = sabrTemplateFor(videoId);
+    if (!template) throw new Error('нет перехваченного SABR-запроса для этого видео');
+    const emit = typeof options.onSegment === 'function' ? options.onSegment : null;
+    const untilMs = Number(options.untilMs) || Infinity;
+    const tracks = new Map();
+    let playerTimeMs = Number(options.fromMs) || 0;
+    let requests = 0;
+    let wireBytes = 0;
+    const startedAt = Date.now();
+    while (playerTimeMs < untilMs && requests < (options.maxRequests || 400)) {
+      const { bytes, parts } = await sabrFetch(template, playerTimeMs, options);
+      requests += 1;
+      wireBytes += bytes.length;
+      // One segment arrives as MANY media parts sharing a header id, so the
+      // write cursor walks with them; deduplication is per segment, not per
+      // part, or everything after a segment's first part is dropped.
+      const openByHeader = new Map();
+      for (const part of parts) {
+        if (part.type !== UMP_MEDIA_HEADER) continue;
+        const header = parseMediaHeader(bytes.subarray(part.at, part.at + part.size));
+        const track = tracks.get(header.itag)
+          || { itag: header.itag, lastModified: header.lastModified, segments: [], bytes: 0,
+            endMs: 0, firstByte: Infinity, seen: new Set(),
+            cursor: 0, emitted: 0, pending: new Map(), pendingBytes: 0 };
+        tracks.set(header.itag, track);
+        track.endMs = Math.max(track.endMs, header.startMs + header.durationMs);
+        track.firstByte = Math.min(track.firstByte, header.startByte);
+        const held = track.seen.has(header.startByte);
+        if (!held) track.seen.add(header.startByte);
+        openByHeader.set(header.headerId, { track, offset: header.startByte, skip: held });
+      }
+      for (const part of parts) {
+        if (part.type !== UMP_MEDIA) continue;
+        const id = readUmpVarint(bytes, part.at);
+        const open = openByHeader.get(id.value);
+        if (!open || open.skip) continue;
+        const payload = bytes.slice(part.at + id.used, part.at + part.size);
+        open.track.bytes += payload.length;
+        if (emit) emitTrackBytes(open.track, open.offset, payload, emit);
+        else open.track.segments.push({ start: open.offset, bytes: payload });
+        open.offset += payload.length;
+      }
+      if (!tracks.size) throw new Error('SABR не отдал ни одной дорожки');
+      // Streaming has no way to prepend a head later: a track whose first byte
+      // never came would quietly pile up in `pending` — the very ceiling this
+      // mode exists to avoid. Take the player's init if it fits, otherwise stop
+      // now and let the caller fall back.
+      if (emit) {
+        for (const track of tracks.values()) {
+          if (track.cursor || !track.firstByte) continue;
+          const init = observedInitFor(track);
+          if (init) {
+            track.bytes += init.length;
+            emitTrackBytes(track, 0, init, emit);
+            log('sabr', 'adopted the player init for itag', track.itag, 'bytes=', init.length);
+          } else if (requests > 1) {
+            throw new Error(`SABR: дорожка ${track.itag} пришла без init-сегмента`);
+          }
+        }
+      }
+      // Which representations the height cap actually resolved to is only known
+      // once the server has answered, and the offscreen job needs their exact
+      // sizes before the first chunk can be sent.
+      if (requests === 1 && typeof options.onTracks === 'function') options.onTracks(tracks);
+      const reached = Math.min(...[...tracks.values()].map((track) => track.endMs));
+      if (!(reached > playerTimeMs)) break;
+      playerTimeMs = reached;
+      if (typeof options.onProgress === 'function') options.onProgress({ reachedMs: reached, wireBytes });
+      if (typeof options.backpressure === 'function') await options.backpressure();
+    }
+    if (!emit) {
+      for (const track of tracks.values()) {
+        const init = observedInitFor(track);
+        if (!init) continue;
+        track.segments.push({ start: 0, bytes: init });
+        track.bytes += init.length;
+        track.firstByte = 0;
+        log('sabr', 'adopted the player init for itag', track.itag, 'bytes=', init.length);
+      }
+    }
+    const seconds = (Date.now() - startedAt) / 1000;
+    log('sabr', 'collected; requests=', requests, 'MB=', (wireBytes / 1048576).toFixed(1),
+      'seconds=', seconds.toFixed(1), 'MBps=', (wireBytes / 1048576 / Math.max(seconds, 0.001)).toFixed(1),
+      'reachedMs=', playerTimeMs,
+      'tracks=', [...tracks.values()].map((track) => `${track.itag}:${(track.bytes / 1048576).toFixed(1)}MB`
+        + (emit ? `(emitted ${(track.emitted / 1048576).toFixed(1)}MB, held ${track.pendingBytes})` : '')
+        + (track.firstByte ? `(no init, starts at ${track.firstByte})` : '')).join(' '));
+    return tracks;
+  }
+
+  // Streaming mode. A whole 1080p track does not fit in the page twice — this
+  // is the same ceiling as B18 — so with `onSegment` the collector keeps no
+  // segments at all: bytes leave in file order and only what cannot be emitted
+  // yet is held. Two things make holding necessary: the two tracks interleave
+  // inside one answer, and the server always re-sends the segment covering the
+  // requested instant, so a piece can arrive that is entirely behind the cursor
+  // (dropped) or overlaps it (only the tail is emitted).
+  function emitTrackBytes(track, start, payload, emit) {
+    if (start + payload.length <= track.cursor) return;          // already behind
+    if (start > track.cursor) {
+      // Out of order: hold it. A duplicate of something already held is dropped.
+      if (track.pending.has(start)) return;
+      track.pending.set(start, payload);
+      track.pendingBytes += payload.length;
+      return;
+    }
+    const fresh = start === track.cursor ? payload : payload.subarray(track.cursor - start);
+    track.cursor += fresh.length;
+    track.emitted += fresh.length;
+    emit(track, fresh);
+    // A piece that had to wait for this one can now go out, and so on.
+    for (;;) {
+      const next = track.pending.get(track.cursor);
+      if (!next) break;
+      track.pending.delete(track.cursor);
+      track.pendingBytes -= next.length;
+      track.cursor += next.length;
+      track.emitted += next.length;
+      emit(track, next);
+    }
+    // A held piece can be overtaken — a later arrival covered its start while it
+    // waited — and nothing would ever ask for it again. Randomised tests left
+    // pieces stuck in 61 of 300 rounds without this sweep, which on a 400 MB
+    // download is the very ceiling streaming mode exists to avoid.
+    for (const [heldStart, held] of [...track.pending]) {
+      if (heldStart >= track.cursor) continue;
+      track.pending.delete(heldStart);
+      track.pendingBytes -= held.length;
+      emitTrackBytes(track, heldStart, held, emit);               // drops it or emits its tail
+    }
+  }
+
+  // The one format SABR refuses to re-initialise is the one the page's player
+  // is playing — and that is exactly the init the MSE hook has already seen
+  // (`initFallback` is filled during ordinary playback, `_lastInit` during a
+  // capture). Adopted only when it fits the hole byte for byte, so a mismatched
+  // representation cannot be glued to the front of a track.
+  function observedInitFor(track) {
+    if (!track.firstByte || !Number.isFinite(track.firstByte)) return null;
+    for (const source of [store.initFallback, store._lastInit]) {
+      for (const kind of ['audio', 'video']) {
+        const bytes = source?.[kind]?.bytes;
+        if (bytes && bytes.length === track.firstByte) return bytes.slice();
+      }
+    }
+    return null;
+  }
+
+  // A track is only usable if its segments tile [0, size) without a hole; the
+  // init segment (no sequence number, offset 0) is part of that tiling.
+  function sabrAssembleTrack(track) {
+    const ordered = [...track.segments].sort((left, right) => left.start - right.start);
+    let at = 0;
+    for (const segment of ordered) {
+      if (segment.start > at) return { bytes: null, holeAt: at };
+      at = Math.max(at, segment.start + segment.bytes.length);
+    }
+    const out = new Uint8Array(at);
+    for (const segment of ordered) out.set(segment.bytes, segment.start);
+    return { bytes: out, holeAt: -1 };
+  }
+
+  // ---- SABR downloads: bytes leave the page as they arrive ------------------
+  // The offscreen job belongs to the ISOLATED world — `RELAYED_MESSAGES` there
+  // is what stops a page script from starting one — so the hook only produces
+  // bytes and hands them over when asked. The outbox is bounded: the walk waits
+  // until the UI has taken what is there, otherwise the page would end up
+  // holding the whole file again, which is the point of streaming.
+  const SABR_OUTBOX_LIMIT = 24 * 1024 * 1024;
+  const SABR_DRAIN_WAIT_MS = 30_000;
+  let sabrJob = null;
+
+  function webClientVersion() {
+    const version = window.ytcfg?.data_?.INNERTUBE_CLIENT_VERSION;
+    return typeof version === 'string' && version ? version : '2.20250101.00.00';
+  }
+
+  // What a SABR FormatId is made of — `contentLength`, `lastModified`, `xtags` —
+  // is already on the page: the player's own response carries all 104 formats
+  // even though none of them has a URL. Asking InnerTube for a second copy is
+  // both wasteful and fragile: after a session has made many player requests
+  // YouTube starts answering `UNPLAYABLE / Video unavailable`, which is exactly
+  // what made every SABR download decline and fall back to the capture.
+  function pageFormats(videoId) {
+    try {
+      const response = playerResponse();
+      if (!response) return [];
+      const details = response.videoDetails?.videoId;
+      if (details && videoId && details !== videoId) return [];
+      const formats = response.streamingData?.adaptiveFormats;
+      return Array.isArray(formats) ? formats : [];
+    } catch (error) { return []; }
+  }
+
+  async function fetchWebFormats(videoId) {
+    const key = innertubeApiKey();
+    if (!key) throw new Error('ключ InnerTube API недоступен');
+    const visitorData = (() => {
+      try { return window.ytcfg?.get?.('VISITOR_DATA') || ''; } catch (e) { return ''; }
+    })();
+    const response = await (OrigFetch || fetch)(
+      `${location.origin}/youtubei/v1/player?key=${encodeURIComponent(key)}&prettyPrint=false`,
+      {
+        method: 'POST',
+        credentials: 'include',
+        cache: 'no-store',
+        headers: { 'content-type': 'application/json', 'X-Goog-Visitor-Id': visitorData },
+        body: JSON.stringify({
+          videoId,
+          context: { client: { hl: 'en', gl: 'US', clientName: 'WEB', clientVersion: webClientVersion(), visitorData } },
+          contentCheckOk: true,
+          racyCheckOk: true,
+        }),
+      },
+    );
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const payload = await response.json();
+    const formats = payload?.streamingData?.adaptiveFormats;
+    if (!Array.isArray(formats) || !formats.length) {
+      throw new Error(payload?.playabilityStatus?.reason || 'WEB player-response без форматов');
+    }
+    return formats;
+  }
+
+  function decodeXtags(value) {
+    try { return atob(String(value || '').replace(/-/g, '+').replace(/_/g, '/')); } catch (e) { return ''; }
+  }
+
+  // AAC in MP4, original language. Two reasons, both measured: the page's player
+  // runs opus/WebM, and the format it is playing is the one whose init segment
+  // SABR will not re-send; and 21 formats share itag 140, told apart only by
+  // xtags, so the original has to be picked explicitly.
+  function pickSabrAudio(formats) {
+    const candidates = formats.filter((format) => format.itag === 140);
+    const original = candidates.find((format) => /acont.{0,4}original/.test(decodeXtags(format.xtags)));
+    const chosen = original || candidates[0] || formats.find((format) => /^audio\//.test(format.mimeType || ''));
+    if (!chosen) throw new Error('в player-response нет аудиодорожки');
+    return { itag: chosen.itag, lastModified: chosen.lastModified, xtags: chosen.xtags || '' };
+  }
+
+  // Matched on both itag and lastModified: 21 formats share itag 140 here, and
+  // taking the first by itag reads a dubbed track's size for the original.
+  function describeFormat(formats, itag, lastModified) {
+    const exact = formats.find((format) => format.itag === itag
+      && String(format.lastModified) === String(lastModified));
+    return {
+      size: Number(exact?.contentLength) || 0,
+      height: formatQualityHeight(exact) || 0,
+      mime: String(exact?.mimeType || '').split(';')[0] || '',
+    };
+  }
+
+  function sabrWake() {
+    const waiter = sabrJob?.waiter;
+    if (waiter) { sabrJob.waiter = null; waiter(); }
+  }
+
+  function sabrFreeSpace() {
+    const waiter = sabrJob?.space;
+    if (waiter) { sabrJob.space = null; waiter(); }
+  }
+
+  async function sabrStart(payload) {
+    const videoId = vidId();
+    if (!sabrTemplateFor(videoId)) throw new Error('нет перехваченного SABR-запроса для этого видео');
+    // The page's own copy first; the request is only for the case where the SPA
+    // has navigated and the response on the page belongs to another video.
+    const formats = pageFormats(videoId).length
+      ? pageFormats(videoId)
+      : await fetchWebFormats(videoId);
+    const audio = pickSabrAudio(formats);
+    const height = Number(payload?.height) || 0;
+    sabrJob = { videoId, chunks: [], bytes: 0, done: false, error: null, waiter: null, space: null, cancelled: false };
+    const job = sabrJob;
+
+    let announce;
+    const described = new Promise((resolve, reject) => { announce = { resolve, reject }; });
+    sabrCollect(videoId, {
+      height,
+      audio,
+      onTracks: (tracks) => {
+        const seen = [...tracks.values()].map((track) => ({
+          itag: track.itag,
+          kind: track.itag === audio.itag ? 'audio' : 'video',
+          ...describeFormat(formats, track.itag, track.lastModified),
+        }));
+        job.kinds = new Map(seen.map((track) => [track.itag, track.kind]));
+        announce.resolve({
+          video: seen.find((track) => track.kind === 'video') || null,
+          audio: seen.find((track) => track.kind === 'audio') || null,
+        });
+      },
+      onSegment: (track, bytes) => {
+        const kind = job.kinds?.get(track.itag) || (track.itag === audio.itag ? 'audio' : 'video');
+        job.chunks.push({ track: kind, bytes });
+        job.bytes += bytes.length;
+        sabrWake();
+      },
+      // Back-pressure between requests: waiting on a promise the drain resolves,
+      // never on a re-checked condition (§5 — a poll loop over microtasks wedges
+      // the tab so hard that even the network answers stop arriving).
+      backpressure: async () => {
+        while (job.bytes > SABR_OUTBOX_LIMIT && !job.cancelled) {
+          await new Promise((resolve) => { job.space = resolve; });
+        }
+        if (job.cancelled) throw new Error('загрузка отменена');
+      },
+    }).then(() => {
+      job.done = true;
+      sabrWake();
+    }).catch((error) => {
+      job.error = String(error?.message || error);
+      job.done = true;
+      announce.reject(error);
+      sabrWake();
+    });
+    return described;
+  }
+
+  // Hands over everything queued, waiting for the first bytes rather than
+  // returning empty — the UI would otherwise spin asking again.
+  async function sabrDrain() {
+    const job = sabrJob;
+    if (!job) throw new Error('нет активной SABR-загрузки');
+    if (!job.chunks.length && !job.done) {
+      let timer;
+      await Promise.race([
+        new Promise((resolve) => { job.waiter = resolve; }),
+        new Promise((resolve) => { timer = setTimeout(resolve, SABR_DRAIN_WAIT_MS); }),
+      ]);
+      clearTimeout(timer);
+    }
+    const chunks = job.chunks;
+    job.chunks = [];
+    job.bytes = 0;
+    sabrFreeSpace();
+    return { chunks, done: job.done && !chunks.length, error: job.error };
+  }
+
+  function sabrCancel() {
+    if (!sabrJob) return { ok: true };
+    sabrJob.cancelled = true;
+    sabrJob.chunks = [];
+    sabrJob.bytes = 0;
+    sabrFreeSpace();
+    sabrWake();
+    sabrJob = null;
+    return { ok: true };
+  }
+
+  // No global surface on purpose. During the bring-up this module was exposed as
+  // `window.__novaSabr` (template/bytes/request/collect), which is fine on a
+  // bench and wrong in a release: the hook shares its world with the page, so
+  // any script on youtube.com could have read the intercepted request — the PO
+  // token and the ustreamer config included — or driven downloads through it.
+  // The download path does not need it: the ISOLATED world drives everything
+  // through the `sabr-start` / `sabr-drain` / `sabr-cancel` commands. To debug,
+  // re-add it locally and take it out again before shipping.
+
   function selectInnertubeAudioFormat() {
     const candidates = innertubeFormatsFor(vidId())
       .filter((format) => /^audio\//i.test(format.mimeType));
@@ -2581,7 +3227,6 @@
   // (music.youtube always, www often). Splitting the byte range across a few
   // concurrent requests — the same trick the player itself uses with its
   // `range=` parameter — is answered at full link speed.
-  const PARALLEL_RANGE_PARTS = 8;
   // Small enough that even a short track is split: a single stream is
   // throttled to playback speed, so two slices already halve the wait.
   const PARALLEL_RANGE_MIN_BYTES = 128 * 1024;
@@ -2648,8 +3293,13 @@
       throw retired;
     }
 
-    for (let attempt = 0; attempt < 3; attempt++) {
-      if (attempt) await sleep(200 * attempt);
+    // Five, not three. A bare connection failure to googlevideo is common in
+    // this environment — measured 2 of 5 identical requests, same URL, same
+    // signature, same `ip` parameter, seconds apart. With eight slices in
+    // flight a 40 % per-connection failure rate means the whole parallel
+    // download almost never completes unless each slice can retry.
+    for (let attempt = 0; attempt < 5; attempt++) {
+      if (attempt) await sleep(250 * attempt);
       try {
         const response = await (OrigFetch || window.fetch.bind(window))(
           `${url}${url.includes('?') ? '&' : '?'}range=${start}-${end}`,
@@ -2673,8 +3323,16 @@
         return media.length > wanted ? media.subarray(0, wanted) : media;
       } catch (error) {
         lastError = error;
+        // ONLY an explicit refusal retires the URL. A bare `Failed to fetch`
+        // carries no status because the connection never completed — and
+        // measurement says that is transient here, not a verdict: the same URL
+        // answered 200 on three of five tries within seconds. Treating it as a
+        // refusal retired a perfectly good signature on the first hiccup, threw
+        // away the whole format set, and dropped the download into the MSE
+        // capture — which is where the holes, the repairs and the page reloads
+        // come from. One flaky connection used to cost the entire fast path.
         const refused = error?.novaHttpStatus === 401 || error?.novaHttpStatus === 403
-          || error?.novaHttpStatus === 410 || isNetworkRefusal(error);
+          || error?.novaHttpStatus === 410;
         if (!refused) continue;
         // Retire the URL so the sibling slices stop repeating the same failure.
         invalidateDirectUrl(url);
@@ -2684,36 +3342,71 @@
     throw lastError || new Error(`диапазон ${start}-${end} не получен`);
   }
 
-  async function fetchDirectRangesInParallel(url, totalLength, onProgress, logTag, maxParts) {
-    const parts = Math.min(maxParts || PARALLEL_RANGE_PARTS,
-      Math.max(2, Math.floor(totalLength / PARALLEL_RANGE_MIN_BYTES)));
-    const chunkSize = Math.ceil(totalLength / parts);
-    const buffers = new Array(parts).fill(null);
+  // googlevideo serves ONE request at a time per signed URL. Measured on the
+  // very video whose downloads kept failing, fresh signature per round:
+  //
+  //   1 запрос  → 200
+  //   2         → 200 + оборванное
+  //   4         → 200 + 403 + 403 + оборванное
+  //   8         → 200 + 403×4 + оборванное×3
+  //
+  // Exactly one succeeds; the rest are refused. That refusal is what the code
+  // read as "the signature is bad", retiring the URL and dropping the whole
+  // download into the MSE capture — so the parallel splitting introduced to
+  // beat the throttle was itself the reason the fast path never ran. Requested
+  // one after another the same URL answers 200 at 3.6–8.9 MB/s.
+  //
+  // The budget is per signature, not just per moment: the fifth sequential
+  // request was refused too, so a 403 mid-download means "ask InnerTube for a
+  // fresh URL and carry on from the byte we reached", not "give up".
+  const SEQUENTIAL_CHUNK_BYTES = 4 * 1024 * 1024;
+  const SEQUENTIAL_RENEWALS = 3;
+
+  async function fetchDirectRangesSequentially(url, totalLength, onProgress, logTag, renewUrl) {
+    const collected = [];
     let received = 0;
+    let current = url;
+    let renewals = 0;
+    let receivedAtLastRenewal = 0;
     const started = Date.now();
-    await Promise.all(Array.from({ length: parts }, async (_, index) => {
-      const start = index * chunkSize;
-      const end = Math.min(totalLength - 1, start + chunkSize - 1);
-      if (start > end) {
-        buffers[index] = new Uint8Array(0);
-        return;
+    while (received < totalLength) {
+      const end = Math.min(totalLength - 1, received + SEQUENTIAL_CHUNK_BYTES - 1);
+      try {
+        const bytes = await fetchDirectRangeSlice(current, received, end, logTag);
+        collected.push(bytes);
+        received += bytes.length;
+        onProgress(Math.min(0.99, received / totalLength));
+      } catch (error) {
+        const spent = error?.novaHttpStatus === 403 || error?.novaHttpStatus === 401
+          || error?.novaHttpStatus === 410 || error?.novaRetiredUrl;
+        // Renew only when the signature actually carried the download part of
+        // the way and then stopped. A refusal at the same byte the last renewal
+        // started from is not an exhausted signature — nothing was spent — and
+        // renewing anyway turns one failure into a burst: measured five
+        // InnerTube requests plus ten range requests in 2.3 s, all at byte 0.
+        // googlevideo rate-limits on exactly that pattern, so the burst made
+        // the next attempts worse instead of better.
+        const madeProgress = received > receivedAtLastRenewal;
+        if (!spent || !madeProgress || renewals >= SEQUENTIAL_RENEWALS || !renewUrl) throw error;
+        renewals += 1;
+        receivedAtLastRenewal = received;
+        // Give the rate limiter room before asking for anything else.
+        await sleep(1_000 * renewals);
+        const fresh = await renewUrl();
+        if (!fresh) throw error;
+        log(logTag, 'signature spent at byte', received, 'of', totalLength,
+          '— renewed, renewal', renewals);
+        current = fresh;
       }
-      buffers[index] = await fetchDirectRangeSlice(url, start, end, logTag);
-      received += buffers[index].length;
-      onProgress(Math.min(0.99, received / totalLength));
-    }));
-    const assembled = new Uint8Array(buffers.reduce((total, part) => total + part.length, 0));
+    }
+    const assembled = new Uint8Array(received);
     let offset = 0;
-    for (const part of buffers) {
+    for (const part of collected) {
       assembled.set(part, offset);
       offset += part.length;
     }
-    // The server may hand back a couple of bytes more than clen announced.
-    if (assembled.length < totalLength) {
-      throw new Error(`параллельная загрузка вернула ${assembled.length} из ${totalLength} байт`);
-    }
-    log(logTag, 'parallel range download complete; parts=', parts, 'bytes=', assembled.length,
-      'seconds=', ((Date.now() - started) / 1000).toFixed(1));
+    log(logTag, 'sequential range download complete; bytes=', assembled.length,
+      'renewals=', renewals, 'seconds=', ((Date.now() - started) / 1000).toFixed(1));
     return assembled;
   }
 
@@ -2757,25 +3450,27 @@
     if (declaredLength > PARALLEL_RANGE_MIN_BYTES * 2) {
       try {
         let assembled = null;
-        let parallelError = null;
-        // Fewer, larger slices on retry: a rejected slice is usually the
-        // server pushing back on concurrency, not a broken URL.
-        for (const maxParts of [PARALLEL_RANGE_PARTS, 4, 2]) {
-          try {
-            assembled = await fetchDirectRangesInParallel(
-              format.url, declaredLength, reportProgress, directLogTag, maxParts);
-            break;
-          } catch (error) {
-            parallelError = error;
-            if (error?.novaFatal || error?.novaHttpStatus === 401
-              || error?.novaHttpStatus === 403 || error?.novaHttpStatus === 410) throw error;
-            log(directLogTag, 'parallel range attempt failed with', maxParts, 'parts:',
-              String(error?.message || error));
-            // A connection refused at the network layer (CORS rejection, reset
-            // by a tunnel) is not concurrency pushback: retrying with fewer,
-            // larger slices only repeats it nine more times.
-            if (isNetworkRefusal(error)) break;
-          }
+        let downloadError = null;
+        // Hands back a freshly signed URL for the same representation, so a
+        // spent signature costs one InnerTube round trip instead of the whole
+        // download. Null when nothing equivalent is on offer.
+        const renewUrl = async () => {
+          if (format._novaSource !== 'innertube') return null;
+          const videoId = requestedVideoId;
+          store.innertubeFormats = null;
+          await ensureInnertubeFormats(videoId);
+          const replacement = innertubeFormatsFor(videoId)
+            .find((candidate) => String(candidate.itag) === String(format.itag)
+              && candidate.url && candidate.url !== format.url);
+          return replacement?.url || null;
+        };
+        try {
+          assembled = await fetchDirectRangesSequentially(
+            format.url, declaredLength, reportProgress, directLogTag, renewUrl);
+        } catch (error) {
+          downloadError = error;
+          if (error?.novaFatal) throw error;
+          log(directLogTag, 'sequential range download failed:', String(error?.message || error));
         }
         if (!assembled) {
           // Empty replies for every slice mean this URL no longer serves the
@@ -2783,7 +3478,7 @@
           // Retire it and let the caller retry with the next observed URL
           // instead of grinding through the throttled sequential path.
           invalidateDirectUrl(format.url);
-          const retired = parallelError || new Error('параллельная загрузка не удалась');
+          const retired = downloadError || new Error('последовательная загрузка не удалась');
           retired.novaRetiredUrl = true;
           log(directLogTag, 'direct URL retired (no data);', directUrlDiagnostics(format.url));
           if (format._novaSource === 'innertube') dropInnertubeFormats();
@@ -2955,15 +3650,15 @@
 
       if (!lastError) break;
       if (lastError.novaStaleDirectUrl) break;
-      // Not a byte arrived and the connection itself was refused: three more
-      // identical attempts cannot end differently.
+      // A bare connection failure with nothing received is NOT a verdict on the
+      // URL — measured 2 of 5 identical requests failing seconds apart with the
+      // same signature. Retiring it here (and discarding the whole InnerTube
+      // set, which arms the 30-minute cooldown) turned one dropped connection
+      // into a lost fast path and an MSE capture. Keep retrying inside the
+      // attempt budget; only an explicit 401/403/410 retires anything.
       if (received === attemptStart && isNetworkRefusal(lastError)) {
-        invalidateDirectUrl(format.url);
-        log(directLogTag, 'direct URL refused at the network layer;',
+        log(directLogTag, 'connection dropped before any byte; retrying —',
           directUrlDiagnostics(format.url));
-        if (format._novaSource === 'innertube') dropInnertubeFormats();
-        lastError.novaRetiredUrl = true;
-        break;
       }
       if (received === attemptStart && attempt + 1 >= maxAttempts) break;
       log(directLogTag, 'resume; attempt=', attempt + 2, 'from=', received,
@@ -3478,6 +4173,48 @@
     const track = store.tracks[kind];
     return Boolean(track?.parts?.length
       && (track.parts.length > 1 || Number.isFinite(track.firstMediaTime)));
+  }
+
+  // Where the captured media actually ends, measured from the WebM block
+  // timecodes rather than taken from the player.
+  //
+  // `track.lastMediaTime` is the player's report and lags a whole cluster
+  // behind — audio clusters here run about ten seconds. On a 1218 s video it
+  // read 1204 s for an audio track that was in fact complete, the 14 s
+  // shortfall failed the 0.15 s completeness test, and the sequential retry
+  // re-recorded the entire audio track for 82 seconds to produce byte-identical
+  // data (23 352 780 bytes before and after). Measuring the real tail is what
+  // makes that reuse decision truthful.
+  function capturedTrackEndSeconds(kind) {
+    const track = store.tracks[kind];
+    if (!track?.parts?.length) return 0;
+    const reported = Number(track.lastMediaTime);
+    const fallback = Number.isFinite(reported) && reported > 0 ? reported : 0;
+    const isWebmTrack = /webm/i.test(track.mime || '')
+      || track.parts.some((part) => part.length >= 4
+        && part[0] === 0x1a && part[1] === 0x45 && part[2] === 0xdf && part[3] === 0xa3);
+    if (!isWebmTrack) return fallback;
+    let lastTimecode = -Infinity;
+    // Only the tail matters, and a long video holds thousands of parts. The
+    // scan stops at the FIRST cluster header near the front of each part, the
+    // way capturedTrackStartSeconds does: a media segment begins with one, and
+    // hunting further in would eventually match those four bytes inside block
+    // payload. Here that would be the dangerous direction — a bogus timecode
+    // makes a short track look finished and skips the repair it needs.
+    const earliest = Math.max(0, track.parts.length - 40);
+    for (let index = track.parts.length - 1; index >= earliest; index--) {
+      const part = track.parts[index];
+      const inspectionEnd = Math.min(part.length, 64 * 1024);
+      for (let offset = 0; offset + 4 <= inspectionEnd; offset++) {
+        if (part[offset] !== 0x1f || part[offset + 1] !== 0x43
+          || part[offset + 2] !== 0xb6 || part[offset + 3] !== 0x75) continue;
+        for (const timecode of webmClusterBlockTimecodes(part, offset, part.length)) {
+          if (Number.isFinite(timecode) && timecode > lastTimecode) lastTimecode = timecode;
+        }
+        break;
+      }
+    }
+    return lastTimecode > 0 ? Math.max(fallback, lastTimecode / 1000) : fallback;
   }
 
   function capturedTrackStartSeconds(kind) {
@@ -5255,10 +5992,36 @@
     try {
       // After a completed MP3 pass, keep its verified audio bytes and rebuild
       // only video. This is substantially faster than downloading audio twice.
+      const rawAudioEnd = needVideo && store.tracks.audio ? capturedTrackEndSeconds('audio') : 0;
+      // A measurement far beyond the target cannot be real: it means the scan
+      // matched something that was not a cluster header. Distrust it rather
+      // than let it wave a short track through.
+      const measuredAudioEnd = rawAudioEnd <= capEnd + 60 ? rawAudioEnd : 0;
+      // The decisive signal, when the caller has it: the assembler examined this
+      // very audio track in the run that failed and complained only about video.
+      // Comparing audio against the CONTAINER duration instead is a test it can
+      // never pass on a video whose sound simply ends earlier — measured here at
+      // 1211.6 s of audio against 1218.1 s of video. That unsatisfiable check
+      // re-recorded the track for 50 s and got back byte-identical data
+      // (23 352 780 bytes), because a full pass produces exactly what we already
+      // had. The tail check is deliberately video-only for non-mp3 jobs, so
+      // "the assembler did not flag audio" IS this project's definition of
+      // complete audio.
+      const audioAlreadyValidated = Boolean(opts.audioValidated) && store.tracks.audio
+        && store.tracks.audio.parts.length > 1
+        && capturedTrackStartSeconds('audio') <= 5;
       reusedCompleteAudio = needVideo && store.tracks.audio
-        && capturedTrackStartSeconds('audio') <= 5
-        && (Number(store.tracks.audio.lastMediaTime) >= capEnd - endTolerance
-          || bufferedEdgeForTrack('audio', 0) >= capEnd - endTolerance);
+        && (audioAlreadyValidated
+          || (capturedTrackStartSeconds('audio') <= 5
+            && (measuredAudioEnd >= capEnd - endTolerance
+              || Number(store.tracks.audio.lastMediaTime) >= capEnd - endTolerance
+              || bufferedEdgeForTrack('audio', 0) >= capEnd - endTolerance)));
+      if (needVideo && store.tracks.audio) {
+        log('capture', 'sequential retry audio reuse check; measuredEnd=', measuredAudioEnd.toFixed(1),
+          'reportedEnd=', (Number(store.tracks.audio.lastMediaTime) || 0).toFixed(1),
+          'target=', capEnd.toFixed(1), 'assemblerValidated=', Boolean(opts.audioValidated),
+          'reuse=', reusedCompleteAudio);
+      }
       const audioSpan = needVideo && !reusedCompleteAudio ? 0.12 : 0;
       if (!reusedCompleteAudio) {
         await captureSequentialTrack('audio', 0, needVideo ? audioSpan : 1);
@@ -6542,6 +7305,35 @@
         reply({ ok: true, tracks }, transfers);
         return;
       }
+      // SABR download, page half: `sabr-start` answers with the exact track
+      // sizes the offscreen job needs, then every `sabr-drain` hands over what
+      // has arrived since. Buffers are transferred, so nothing is copied on the
+      // way out of this world.
+      if (cmd === 'sabr-start') {
+        sabrStart({ height })
+          .then((tracks) => reply({ ok: true, tracks }))
+          .catch((error) => reply({ ok: false, error: String(error?.message || error) }));
+        return;
+      }
+      if (cmd === 'sabr-drain') {
+        sabrDrain()
+          .then((result) => {
+            const transfers = [];
+            const seen = new Set();
+            for (const chunk of result.chunks) {
+              if (seen.has(chunk.bytes.buffer)) continue;
+              seen.add(chunk.bytes.buffer);
+              transfers.push(chunk.bytes.buffer);
+            }
+            reply({ ok: true, chunks: result.chunks, done: result.done, error: result.error }, transfers);
+          })
+          .catch((error) => reply({ ok: false, error: String(error?.message || error) }));
+        return;
+      }
+      if (cmd === 'sabr-cancel') {
+        reply({ ok: true, ...sabrCancel() });
+        return;
+      }
       if (cmd === 'info') {
         const p = player();
         const rawDuration = video() && video().duration;
@@ -6746,7 +7538,15 @@
                 progress: Math.min(0.99, (videoFraction * 0.84) + (audioFraction * 0.15)),
                 phase,
               });
-              const videoRequest = fetchDirectVideo(height, (pct) => {
+              // ONE AT A TIME, deliberately. Running the halves together was an
+              // earlier optimisation here and it has to go: googlevideo refuses
+              // concurrent requests, and it does so across signatures too —
+              // measured video 200 / audio 403 fired together, and in the field
+              // both halves failing at byte 0 while each renewed its signature
+              // and clobbered the other's InnerTube cache. The audio is ~8 % of
+              // the bytes, so the sequencing costs little; the concurrency cost
+              // the whole fast path.
+              const directVideo = await fetchDirectVideo(height, (pct) => {
                 videoFraction = Math.max(0, Math.min(1, Number(pct) || 0));
                 reportBoth('direct-video');
               });
@@ -6754,28 +7554,18 @@
               if (directAudio) {
                 log('direct-audio', 'reusing completed MP3 source audio; bytes=',
                   directAudio.bytes.length);
-              }
-              const audioRequest = directAudio
-                ? null
-                : fetchDirectAudio((pct) => {
-                  audioFraction = Math.max(0, Math.min(1, Number(pct) || 0));
-                  reportBoth('direct-audio');
-                });
-              // Whichever half loses the race, the other one's rejection must
-              // not surface as an unhandled promise while the first error is
-              // still on its way up.
-              videoRequest.catch(() => {});
-              audioRequest?.catch(() => {});
-              const directVideo = await videoRequest;
-              if (audioRequest) {
+              } else {
                 const expectedDuration = Number(video()?.duration)
                   || directVideo.duration || Number(player()?.getDuration?.()) || 0;
-                directAudio = validateDirectAudioTrack(await audioRequest, expectedDuration);
+                directAudio = validateDirectAudioTrack(await fetchDirectAudio((pct) => {
+                  audioFraction = Math.max(0, Math.min(1, Number(pct) || 0));
+                  reportBoth('direct-audio');
+                }), expectedDuration);
               }
               // Defensive on purpose: this line is pure diagnostics, but it
               // sits inside the try whose catch turns any throw into a full MSE
               // capture. A diagnostic must never be able to cost a download.
-              log('direct-video', 'both tracks downloaded in parallel; seconds=',
+              log('direct-video', 'direct tracks downloaded one after the other; seconds=',
                 ((Date.now() - startedBothAt) / 1000).toFixed(1),
                 'videoBytes=', directVideo?.bytes?.length || 0,
                 'audioBytes=', directAudio?.bytes?.length || 0,
@@ -6966,9 +7756,23 @@
                       && Math.round(Number(nextDetails.gapEndMs) || 0) === Math.round(Number(details.gapEndMs) || 0)
                       && Math.round(Number(nextDetails.firstTimecode) || 0) === Math.round(Number(details.firstTimecode) || 0);
                     if (sameHole) {
-                      attemptsByGap.set(repairKey, maxAttemptsPerGap);
+                      // ...but the FIRST interior attempt is deliberately
+                      // target-only, and the paired variant — the bounded range
+                      // opened in both tracks at once — is the one with evidence
+                      // of working: §5 records a paired prefix refill answering
+                      // in a second where a single-track pass got nothing three
+                      // times over. Skipping straight to the reload here meant
+                      // the paired attempt was never reached, so the interior
+                      // repair only ever ran in the shape already known to fail
+                      // (measured twice in one download: 22 s each, "changed
+                      // nothing", then a reload that started the whole capture
+                      // over). Give up only after the pairing has been tried.
+                      const pairedAlreadyTried = mode !== 'interior' || attempt > 0;
+                      attemptsByGap.set(repairKey, pairedAlreadyTried ? maxAttemptsPerGap : 1);
                       log('assembly', `webm ${details.kind}; ${mode} refill changed nothing`
-                        + ' — skipping the remaining attempts for this hole');
+                        + (pairedAlreadyTried
+                          ? ' — skipping the remaining attempts for this hole'
+                          : ' — retrying once with the companion track paired'));
                     }
                     validationError = nextValidationError;
                   }
@@ -7116,8 +7920,13 @@
             const captureSequentialVideo = async (reason) => {
               log('capture', 'retry with sequential MSE before rendered 1x:', reason?.message || reason);
               reportMseProgress(0, 'mse-sequential-video');
+              // An assembly verdict naming video as the defective track means the
+              // audio passed the very same validation pass, so rebuilding it too
+              // is work with a known-empty result. A capture error carries no
+              // verdict, and then the measured checks decide.
+              const audioValidated = reason?.details?.kind === 'video';
               cap = await captureBackgroundSequentialReset(
-                { targetQ, end, isMp3: false, height },
+                { targetQ, end, isMp3: false, height, audioValidated },
                 (pct) => reportMseProgress(pct, 'mse-sequential-video'),
               );
               usedSequentialMse = true;

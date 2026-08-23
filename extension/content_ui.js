@@ -76,8 +76,13 @@
   function callHook(cmd, payload = {}, onProgress) {
     return new Promise((resolve, reject) => {
       const reqId = requestSequence++;
-      const timeoutMs = cmd === 'download' ? 70_000
-        : (cmd === 'live-start' ? 180_000 : (cmd === 'subtitles' ? 120_000 : 15_000));
+      // `sabr-drain` deliberately blocks until bytes exist instead of answering
+      // empty, so its budget is the page's own wait plus room for a slow answer.
+      const HOOK_TIMEOUTS = {
+        download: 70_000, 'live-start': 180_000, subtitles: 120_000,
+        'sabr-start': 60_000, 'sabr-drain': 90_000,
+      };
+      const timeoutMs = HOOK_TIMEOUTS[cmd] || 15_000;
       let timeout;
       const touch = () => {
         clearTimeout(timeout);
@@ -253,6 +258,17 @@
 
   function scheduleButton() {
     if (buttonFrame) return;
+    // requestAnimationFrame does not fire in a hidden tab, so a video opened in
+    // a background tab has no button at all until it is looked at — and the
+    // playlist queue resumes in exactly such a tab. The timer is only the
+    // fallback; a visible tab still mounts on the next frame.
+    if (document.visibilityState === 'hidden') {
+      buttonFrame = setTimeout(() => {
+        buttonFrame = undefined;
+        ensureButton();
+      }, 250);
+      return;
+    }
     buttonFrame = requestAnimationFrame(() => {
       buttonFrame = undefined;
       ensureButton();
@@ -739,6 +755,31 @@
     chrome.runtime.onMessage.addListener(onFfmpegProgress);
 
     try {
+      // SABR first: it is the only route that can hand over a whole track, and
+      // it costs seconds instead of the video's own length. Its own job id
+      // keeps a refusal from disturbing the capture job that may follow.
+      if (!isMp3 && !IS_MUSIC && !IS_SHORTS() && !info.isLive && format === 'mp4') {
+        const viaSabr = await tryDownloadViaSabr({
+          jobId: `${jobId}-sabr`, info, height, notification,
+          isCancelled: () => cancelRequested,
+        });
+        if (viaSabr) {
+          restorePrimedMedia();
+          notification.setCancel(null);
+          notification.stage('engine', 1, 'done');
+          notification.stage('process', 1, 'done', 'Склейка дорожек');
+          await clearReloadGuard();
+          notification.set(`Готово: ${viaSabr.filename}`, 1);
+          notification.hide(4000);
+          return true;
+        }
+        if (cancelRequested) {
+          notification.set('Загрузка отменена', 1);
+          notification.hide(4000);
+          return false;
+        }
+        notification.stage('capture', 0, 'active', 'Получение сегментов');
+      }
       // Loading the wasm core is expensive. Start it in parallel with segment
       // capture; actual ffmpeg execution still waits for a complete container.
       const warmup = warmupMediaProcessor().then(
@@ -774,7 +815,10 @@
         else if (message.phase === 'buffering-prefix') captureLabel = 'Проверка крайних сегментов';
         else if (message.phase === 'buffering-gap') captureLabel = 'Докачка пропущенного сегмента';
         else if (message.phase === 'rendered-prefix') captureLabel = 'Восстановление только начала видео (1×)';
-        else if (message.phase === 'mse-sequential-video') captureLabel = 'Проверка непрерывности видео';
+        // Not a check: this phase re-records the track from the very beginning,
+        // which looks exactly like a second download — and reads as a bug when
+        // the label promises an inspection.
+        else if (message.phase === 'mse-sequential-video') captureLabel = 'Пропуск в видео — перезаписываю дорожку с начала';
         notification.stage('capture', message.progress, message.progress >= 1 ? 'done' : 'active', captureLabel);
       });
       if (staging) stagingReport = await staging.stop();
@@ -1164,6 +1208,118 @@
     } catch (error) {
       if (begun) await sendRuntimeMessage({ t: 'nova-abort', jobId }, 10_000).catch(() => {});
       throw error;
+    }
+  }
+
+  // ---- SABR download: the page produces bytes, this world owns the job ------
+  // Unlike `muxViaOffscreen`, nothing is complete when this starts: the sizes
+  // come from the player response and the bytes arrive while the offscreen
+  // muxer is already parsing them. The page holds no more than its outbox, so
+  // a 300 MB video never exists in one piece anywhere on this side either.
+  async function downloadViaSabr(job, onStage, isCancelled) {
+    const jobId = job.jobId;
+    let begun = false;
+    const stopIfCancelled = () => {
+      if (!isCancelled?.()) return;
+      const cancelled = new Error('загрузка отменена пользователем');
+      cancelled.details = { cancelled: true };
+      throw cancelled;
+    };
+    try {
+      const ensured = await sendWorkerMessage({ t: 'nova-ensure' }, 30_000);
+      if (!ensured?.ok) throw new Error(ensured?.error || 'не удалось запустить обработчик медиа');
+      const registration = await sendRuntimeMessage({ t: 'nova-register-job', jobId }, 10_000);
+      if (!registration?.ok || !Number.isInteger(registration.tabId)) {
+        throw new Error(registration?.error || 'не удалось определить вкладку загрузки');
+      }
+
+      onStage?.('capture', 0, 'active', 'Прямая загрузка (SABR)');
+      const started = await callHook('sabr-start', { height: job.height });
+      const tracks = started?.tracks || {};
+      if (!tracks.video?.size || !tracks.audio?.size) {
+        throw new Error('SABR не сообщил размеры дорожек');
+      }
+      const totalBytes = tracks.video.size + tracks.audio.size;
+
+      const begin = await sendRuntimeMessage({
+        t: 'nova-begin', jobId, tabId: registration.tabId,
+        filename: job.filename(tracks), format: job.format,
+        audioFormat: job.audioFormat, audioQuality: job.audioQuality,
+        videoId: job.videoId || '',
+        videoSize: tracks.video.size,
+        audioSize: tracks.audio.size,
+        videoMime: tracks.video.mime || 'video/mp4',
+        audioMime: tracks.audio.mime || 'audio/mp4',
+        duration: job.duration,
+      }, 30_000);
+      if (!begin?.ok) throw new Error(begin?.error || 'не удалось начать обработку');
+      begun = true;
+
+      let transferred = 0;
+      for (;;) {
+        stopIfCancelled();
+        const drained = await callHook('sabr-drain');
+        if (drained?.error) throw new Error(drained.error);
+        for (const chunk of drained?.chunks || []) {
+          const bytes = new Uint8Array(chunk.bytes);
+          // The offscreen side takes 4 MiB at a time; a SABR segment can be
+          // bigger than that.
+          for (let offset = 0; offset < bytes.length; offset += TRANSFER_CHUNK_SIZE) {
+            const slice = bytes.subarray(offset, Math.min(offset + TRANSFER_CHUNK_SIZE, bytes.length));
+            const response = await sendRuntimeMessage({
+              t: 'nova-chunk', jobId, track: chunk.track, b64: encodeBase64(slice),
+            }, 60_000);
+            if (!response?.ok) throw new Error(response?.error || `передача данных прервалась (${chunk.track})`);
+            transferred += slice.length;
+          }
+          onStage?.('capture', totalBytes ? transferred / totalBytes : 0, 'active', 'Прямая загрузка (SABR)');
+        }
+        if (drained?.done) break;
+      }
+      onStage?.('capture', 1, 'done');
+      onStage?.('transfer', 1, 'done');
+      onStage?.('process', 0, 'active');
+      return await sendRuntimeMessage({ t: 'nova-finalize', jobId }, 2 * 60 * 60_000);
+    } catch (error) {
+      void callHook('sabr-cancel').catch(() => {});
+      if (begun) await sendRuntimeMessage({ t: 'nova-abort', jobId }, 10_000).catch(() => {});
+      throw error;
+    }
+  }
+
+  // Tried before the capture: it hands over the whole file at network speed and
+  // is the only path not capped at 60 s of media. Anything it cannot do — no
+  // intercepted template yet, an odd container, a refusal mid-way — returns
+  // `null` and the old route runs as before, so this can only add outcomes.
+  async function tryDownloadViaSabr({ jobId, info, height, notification, isCancelled }) {
+    const started = Date.now();
+    try {
+      const result = await downloadViaSabr({
+        jobId,
+        height,
+        format: 'mp4',
+        audioFormat: null,
+        audioQuality: 'best',
+        videoId: info.videoId || '',
+        duration: Number(info.duration) || 0,
+        // The rung the server picks is only known after its first answer, so the
+        // name is built from what actually arrived, not from what was asked.
+        filename: (tracks) => `${safeFilename(info.title)}`
+          + ` [${tracks.video?.height || height}p].mp4`,
+      }, (stage, fraction, state, label) => {
+        notification.stage(stage, fraction, state, label);
+      }, isCancelled);
+      if (!result?.ok) throw new Error(result?.error || 'не удалось собрать файл');
+      return result;
+    } catch (error) {
+      if (error?.details?.cancelled) throw error;
+      const reason = `sabr path declined after ${((Date.now() - started) / 1000).toFixed(1)}s:`
+        + ` ${String(error?.message || error)}`;
+      // Also to the console: a silent fall-through to the capture looks like the
+      // SABR path was never tried, and the journal is not visible while testing.
+      console.warn('[Nova Video Saver]', reason);
+      void sendRuntimeMessage({ t: 'nova-log', tag: 'sabr', text: reason }).catch(() => {});
+      return null;
     }
   }
 

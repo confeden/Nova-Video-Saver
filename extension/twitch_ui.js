@@ -17,9 +17,10 @@
   const GQL_CLIENT_ID = 'kimne78kx3ncx6brgo4mv6wki5h1ko';
   const SEGMENT_CONCURRENCY = 6;
   const TRANSFER_CHUNK_SIZE = 4 * 1024 * 1024;
-  // ffmpeg.wasm runs out of memory long before a multi-hour VOD is assembled,
-  // and half a download is worse than an honest refusal.
-  const VOD_BYTE_LIMIT = 1_500_000_000;
+  // A VOD past this is spooled to disk by the muxer instead of being held in
+  // memory, so the old honest refusal at 1.5 GB is gone: the ceiling is now free
+  // disk space. Kept only as the hint that decides it up front.
+  const VOD_SPOOL_HINT = 256 * 1024 * 1024;
 
   let recorder = null;
   let recorderMime = 'video/webm';
@@ -239,9 +240,6 @@
   async function downloadVod(info, quality) {
     const { segments, duration } = await loadVodSegments(quality.url);
     const estimate = (quality.bandwidth || 0) / 8 * (duration || info.duration || 0);
-    if (estimate > VOD_BYTE_LIMIT) {
-      throw new Error(`запись слишком большая для сборки в браузере (~${Math.round(estimate / 1e9)} ГБ)`);
-    }
     const jobId = crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`;
     const filename = `Twitch - ${safeName(info.channel)} - ${safeName(info.title)} [${quality.label}].mp4`;
 
@@ -261,6 +259,9 @@
       videoMime: 'video/mp2t',
       audioMime: '',
       duration: duration || info.duration || 0,
+      // Lets the muxer spool to disk from the first chunk instead of finding out
+      // the hard way; it also switches over on its own if the estimate is low.
+      expectedBytes: estimate > VOD_SPOOL_HINT ? Math.round(estimate) : 0,
     });
     if (!started?.ok) throw new Error(started?.error || 'не удалось начать обработку');
 

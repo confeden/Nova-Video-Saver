@@ -63,6 +63,9 @@ function createTrack() {
     controller: null,
     stream: null,
     closed: false,
+    // Set once mediabunny has read this track to its end. Gates the heartbeat:
+    // see startHeartbeat.
+    fullyRead: false,
     failure: null,
   };
 }
@@ -105,6 +108,44 @@ function failTrack(track, error) {
 }
 
 let lastTickAt = 0;
+let heartbeat = null;
+
+// The document kills a mux that stays silent for 120 s, and that guard is the
+// ONLY thing that turns a wedged mux (a mediabunny deadlock, a track stream
+// that never closes) into a recoverable fallback to ffmpeg. So the heartbeat
+// must NOT run for the whole mux — that would keep the guard's clock reset
+// forever and make a real hang unrecoverable.
+//
+// The only phase that is legitimately silent is the tail: once mediabunny has
+// read both tracks to the end, `source.onread` stops firing, but `execute()`
+// is still assembling and `output.finalize()` writes `moov` — reading nothing.
+// That silence (measured at ~2 min on a 269 MB pair) tripped the guard and
+// threw away a working mux. So the heartbeat starts exactly when both tracks
+// are fully read: before that, silence still means a genuine stall and the
+// guard rightly fires; after it, the tick says "assembling, still alive".
+function maybeStartTailHeartbeat() {
+  if (heartbeat) return;
+  if (!tracks.video.fullyRead || !tracks.audio.fullyRead) return;
+  heartbeat = setInterval(() => { self.postMessage({ t: 'tick' }); }, 1_000);
+}
+
+function stopHeartbeat() {
+  if (!heartbeat) return;
+  clearInterval(heartbeat);
+  heartbeat = null;
+}
+
+// One definition of "read to the end", shared by the tail-heartbeat gate and
+// the final truncation guard so they can never disagree. The tolerance matters:
+// a copy remux legitimately leaves a few trailing bytes unread (padding, a
+// closing box), so an exact `consumed === received` would keep the heartbeat
+// from ever arming on a healthy mux and let a slow `finalize()` trip the guard —
+// the very false-positive this whole mechanism removes.
+function trackReadToEnd(track) {
+  if (!track.closed) return false;
+  const missed = track.received - track.consumed;
+  return missed <= Math.max(65_536, track.received * 0.02);
+}
 
 function reportProgress() {
   const now = Date.now();
@@ -126,6 +167,12 @@ function trackSource(ReadableStreamSource, track) {
   // parser walked the whole track rather than stopping early.
   source.onread = (_start, end) => {
     if (end > track.consumed) track.consumed = end;
+    // The last read of a closed track means mediabunny reached its end; from
+    // here this track is silent by right, so it may arm the tail heartbeat.
+    if (!track.fullyRead && trackReadToEnd(track)) {
+      track.fullyRead = true;
+      maybeStartTailHeartbeat();
+    }
     reportProgress();
   };
   return source;
@@ -166,8 +213,7 @@ async function mux() {
   // passed every check it met. How far the parser actually walked each source
   // cannot be hidden that way.
   for (const [name, track] of Object.entries(tracks)) {
-    const missed = track.received - track.consumed;
-    if (missed > Math.max(65_536, track.received * 0.02)) {
+    if (!trackReadToEnd(track)) {
       throw new Error(`дорожка ${name} прочитана не до конца:`
         + ` ${track.consumed} из ${track.received} байт`);
     }
@@ -180,9 +226,13 @@ async function mux() {
 function maybeStartMux() {
   if (muxStarted || !mediabunny) return;
   muxStarted = true;
+  // The tail heartbeat arms itself once both tracks are fully read (see
+  // trackSource.onread); it is not started here, so a stall before then still
+  // trips the document's guard.
   (async () => {
     try {
       const bytes = await mux();
+      stopHeartbeat();
       self.postMessage({
         t: 'done',
         bytes: bytes.buffer,
@@ -191,6 +241,7 @@ function maybeStartMux() {
         consumed: { video: tracks.video.consumed, audio: tracks.audio.consumed },
       }, [bytes.buffer]);
     } catch (error) {
+      stopHeartbeat();
       const surrendered = surrenderChunks();
       self.postMessage({
         t: 'error',

@@ -1,9 +1,14 @@
 {
   "manifest_version": 3,
   "name": "Nova Video Saver",
-  "version": "1.6",
+  "version": "1.7",
   "description": "Скачивание видео/аудио/субтитров YouTube, Rutube, Twitch и Coub, запись трансляций — без внешних сервисов",
-  "permissions": ["downloads", "offscreen", "storage", "alarms"],
+  "permissions": [
+    "downloads",
+    "offscreen",
+    "storage",
+    "alarms"
+  ],
   "host_permissions": [
     "https://www.youtube.com/*",
     "https://music.youtube.com/*",
@@ -15,58 +20,123 @@
     "https://*.rutube.ru/*",
     "https://*.rtbcdn.ru/*",
     "https://coub.com/*",
-    "https://*.coub.com/*"
+    "https://*.coub.com/*",
+    "https://vkvideo.ru/*",
+    "https://*.vkvideo.ru/*",
+    "https://vk.com/*"
   ],
-  "background": { "service_worker": "background.js" },
+  "background": {
+    "service_worker": "background.js"
+  },
   "action": {
     "default_popup": "popup.html",
-    "default_icon": { "16": "icons/16.png", "48": "icons/48.png", "128": "icons/128.png" }
+    "default_icon": {
+      "16": "icons/16.png",
+      "48": "icons/48.png",
+      "128": "icons/128.png"
+    }
   },
   "content_scripts": [
     {
-      "matches": ["https://www.youtube.com/*", "https://music.youtube.com/*"],
-      "js": ["content_hook.js"],
+      "matches": [
+        "https://www.youtube.com/*",
+        "https://music.youtube.com/*"
+      ],
+      "js": [
+        "content_hook.js"
+      ],
       "run_at": "document_start",
       "world": "MAIN",
       "all_frames": false
     },
     {
-      "matches": ["https://www.youtube.com/*", "https://music.youtube.com/*"],
-      "js": ["content_ui.js"],
-      "css": ["content_ui.css"],
+      "matches": [
+        "https://www.youtube.com/*",
+        "https://music.youtube.com/*"
+      ],
+      "js": [
+        "content_ui.js"
+      ],
+      "css": [
+        "content_ui.css"
+      ],
       "run_at": "document_idle",
       "world": "ISOLATED",
       "all_frames": false
     },
     {
-      "matches": ["https://rutube.ru/*", "https://rutube.sport/*"],
-      "js": ["rutube.js"],
-      "css": ["rutube.css"],
+      "matches": [
+        "https://rutube.ru/*",
+        "https://rutube.sport/*"
+      ],
+      "js": [
+        "rutube.js"
+      ],
+      "css": [
+        "rutube.css"
+      ],
       "run_at": "document_idle",
       "world": "ISOLATED",
       "all_frames": false
     },
     {
-      "matches": ["https://www.twitch.tv/*", "https://clips.twitch.tv/*"],
-      "js": ["twitch_ui.js"],
-      "css": ["twitch_ui.css"],
+      "matches": [
+        "https://www.twitch.tv/*",
+        "https://clips.twitch.tv/*"
+      ],
+      "js": [
+        "twitch_ui.js"
+      ],
+      "css": [
+        "twitch_ui.css"
+      ],
       "run_at": "document_idle",
       "world": "ISOLATED",
       "all_frames": false
     },
     {
-      "matches": ["https://coub.com/*"],
-      "js": ["coub.js"],
-      "css": ["coub.css"],
+      "matches": [
+        "https://coub.com/*"
+      ],
+      "js": [
+        "coub.js"
+      ],
+      "css": [
+        "coub.css"
+      ],
       "run_at": "document_idle",
       "world": "ISOLATED",
       "all_frames": false
+    },
+    {
+      "matches": [
+        "https://vkvideo.ru/*",
+        "https://*.vkvideo.ru/*",
+        "https://vk.com/video*",
+        "https://vk.com/clip*"
+      ],
+      "js": [
+        "vk.js"
+      ],
+      "css": [
+        "vk.css"
+      ],
+      "run_at": "document_idle",
+      "world": "ISOLATED"
     }
   ],
   "content_security_policy": {
     "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; worker-src 'self'"
   },
-  "cross_origin_embedder_policy": { "value": "require-corp" },
-  "cross_origin_opener_policy": { "value": "same-origin" },
-  "icons": { "16": "icons/16.png", "48": "icons/48.png", "128": "icons/128.png" }
+  "cross_origin_embedder_policy": {
+    "value": "require-corp"
+  },
+  "cross_origin_opener_policy": {
+    "value": "same-origin"
+  },
+  "icons": {
+    "16": "icons/16.png",
+    "48": "icons/48.png",
+    "128": "icons/128.png"
+  }
 }
