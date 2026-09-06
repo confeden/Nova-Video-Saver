@@ -1695,11 +1695,21 @@ async function finalizeJob(message) {
       }
 
       if (job.muxed) {
-        videoName = 'input.ts';
         videoBytes = concatParts(job.video);
         if (!videoBytes.length) throw new Error('пустые данные потока');
-        // MPEG-TS has no ftyp/EBML header to check; its packets start with 0x47.
-        if (videoBytes[0] !== 0x47) throw new Error('поток не является MPEG-TS');
+        // An already-muxed stream is not always MPEG-TS: HLS sites hand over TS,
+        // but a site whose file is a whole progressive MP4 (TikTok) hands that
+        // over instead. Check the container the sender declared — a blanket
+        // `bytes[0] !== 0x47` refused every MP4 with "поток не является MPEG-TS"
+        // after the whole file had already been transferred.
+        const isMpegTs = !/mp4/i.test(job.videoMime || '');
+        videoName = isMpegTs ? 'input.ts' : 'input.mp4';
+        if (isMpegTs) {
+          // MPEG-TS has no ftyp/EBML header to check; its packets start with 0x47.
+          if (videoBytes[0] !== 0x47) throw new Error('поток не является MPEG-TS');
+        } else {
+          assertContainerHeader(videoBytes, job.videoMime, 'video');
+        }
         inputs.push({ name: videoName, bytes: videoBytes });
         files.add(videoName);
       } else if (job.format !== 'mp3') {

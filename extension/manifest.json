@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Nova Video Saver",
-  "version": "1.7",
-  "description": "Скачивание видео/аудио/субтитров YouTube, Rutube, Twitch и Coub, запись трансляций — без внешних сервисов",
+  "version": "1.8",
+  "description": "Скачивание видео/аудио/субтитров YouTube, Rutube, Twitch, Coub, VK, Zvuk и TikTok, запись трансляций — без внешних сервисов",
   "permissions": [
     "downloads",
     "offscreen",
@@ -23,7 +23,18 @@
     "https://*.coub.com/*",
     "https://vkvideo.ru/*",
     "https://*.vkvideo.ru/*",
-    "https://vk.com/*"
+    "https://vk.com/*",
+    "https://zvuk.com/*",
+    "https://*.zvuk.com/*",
+    "https://www.tiktok.com/*",
+    "https://*.tiktok.com/*",
+    "https://*.tiktokcdn.com/*",
+    "https://*.tiktokcdn-us.com/*",
+    "https://*.tiktokcdn-eu.com/*",
+    "https://*.tiktokv.com/*",
+    "https://*.tiktokv.us/*",
+    "https://*.byteoversea.com/*",
+    "https://*.ibyteimg.com/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -55,6 +66,7 @@
         "https://music.youtube.com/*"
       ],
       "js": [
+        "settings.js",
         "content_ui.js"
       ],
       "css": [
@@ -85,12 +97,13 @@
         "https://clips.twitch.tv/*"
       ],
       "js": [
+        "settings.js",
         "twitch_ui.js"
       ],
       "css": [
         "twitch_ui.css"
       ],
-      "run_at": "document_idle",
+      "run_at": "document_start",
       "world": "ISOLATED",
       "all_frames": false
     },
@@ -123,6 +136,34 @@
       ],
       "run_at": "document_idle",
       "world": "ISOLATED"
+    },
+    {
+      "matches": [
+        "https://zvuk.com/*"
+      ],
+      "js": [
+        "zvuk.js"
+      ],
+      "css": [
+        "zvuk.css"
+      ],
+      "run_at": "document_idle",
+      "world": "ISOLATED",
+      "all_frames": false
+    },
+    {
+      "matches": [
+        "https://www.tiktok.com/*"
+      ],
+      "js": [
+        "tiktok.js"
+      ],
+      "css": [
+        "tiktok.css"
+      ],
+      "run_at": "document_idle",
+      "world": "ISOLATED",
+      "all_frames": false
     }
   ],
   "content_security_policy": {

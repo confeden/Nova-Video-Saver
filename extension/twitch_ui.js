@@ -56,8 +56,16 @@
       : (segments[0] || 'stream');
   }
 
+  // Code points, not UTF-16 units: slicing through a surrogate pair leaves a
+  // lone surrogate, and Chrome then names the file after the blob UUID (G28).
   function safeName(value) {
-    return String(value || '').replace(/[\\/:*?"<>|]+/g, '_').replace(/\s+/g, ' ').trim().slice(0, 120);
+    const cleaned = String(value || '')
+      .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '')
+      .replace(/[\\/:*?"<>|]+/g, '_')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const points = [...cleaned];
+    return points.length > 120 ? points.slice(0, 120).join('').trim() : cleaned;
   }
 
   // ---- Twitch API ----------------------------------------------------------
@@ -636,8 +644,242 @@
 
   new MutationObserver(scheduleInject).observe(document.documentElement, { childList: true, subtree: true });
   scheduleInject();
+  // rAF never runs in a hidden tab, so a channel opened in a background tab
+  // would get no button at all until it was looked at (N29). The timer is the
+  // cheap insurance; ensureButton() returns immediately once the button exists.
+  setInterval(() => { try { ensureButton(); } catch (error) {} }, 2_000);
   window.addEventListener('beforeunload', () => {
     // Best effort: flush what was recorded before the tab goes away.
     if (recorder) stopRecording('страница закрывается');
   });
+
+  // ---- player quality preference -------------------------------------------
+  //
+  // Twitch has no scriptable player API reachable from an isolated world, but
+  // it does have two stable seams: `localStorage['video-quality']`, which the
+  // player reads when it mounts, and its own settings menu, whose radios are
+  // the only place the real rung names ("1080p60", "480p30") are published —
+  // the fps suffix differs per stream, so those names cannot be guessed.
+  //
+  // Measured on a live channel: clicking a rung's label writes
+  // {"default":"720p60"} and flips 'video-quality-highest-available' to false.
+  const QUALITY_STORE_KEY = 'video-quality';
+  const HIGHEST_STORE_KEY = 'video-quality-highest-available';
+  const SETTINGS_BUTTON = '[data-a-target="player-settings-button"]';
+  const QUALITY_ITEM = '[data-a-target="player-settings-menu-item-quality"]';
+  const QUALITY_RADIO = 'input[name="player-settings-submenu-quality-option"]';
+  const MENU_ROOT = '[data-a-target="player-settings-menu"]';
+
+  let quality = {
+    settings: null, target: null, lastWritten: null, busy: false, timer: null,
+    attempts: 0, lockMisses: 0,
+  };
+
+  function qualityLog(text) {
+    chrome.runtime.sendMessage({ t: 'nova-log', tag: 'twitch/quality', text }).catch(() => {});
+  }
+
+  function readStoredQuality() {
+    try { return JSON.parse(localStorage.getItem(QUALITY_STORE_KEY) || 'null')?.default || null; }
+    catch (error) { return null; }
+  }
+
+  // "1080p60(Источник)" → 1080, "Автоматически" → null.
+  function heightFromLabel(label) {
+    const match = /(\d{3,4})\s*p/i.exec(String(label || ''));
+    return match ? Number(match[1]) : null;
+  }
+
+  function labelFor(radio) {
+    return (document.querySelector(`label[for="${radio.id}"]`)?.textContent || '').trim();
+  }
+
+  // The menu is opened only to read or click; hiding it keeps that from
+  // flashing over the stream. `opacity` and not `visibility`/`display`, because
+  // the element still has to be laid out for React to treat the click as real.
+  function hideMenuChrome(hidden) {
+    let style = document.getElementById('nvs-twitch-quiet-menu');
+    if (!hidden) { style?.remove(); return; }
+    if (style) return;
+    style = document.createElement('style');
+    style.id = 'nvs-twitch-quiet-menu';
+    style.textContent = `${MENU_ROOT} { opacity: 0 !important; }`;
+    (document.head || document.documentElement).append(style);
+  }
+
+  async function withQualityMenu(action) {
+    const button = document.querySelector(SETTINGS_BUTTON);
+    if (!button) return null;
+    hideMenuChrome(true);
+    try {
+      button.click();
+      let item = null;
+      for (let attempt = 0; attempt < 20 && !item; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        item = document.querySelector(QUALITY_ITEM);
+      }
+      if (!item) return null;
+      item.click();
+      let radios = [];
+      for (let attempt = 0; attempt < 20 && !radios.length; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        radios = [...document.querySelectorAll(QUALITY_RADIO)];
+      }
+      if (!radios.length) return null;
+      return await action(radios);
+    } finally {
+      // The same button toggles the menu, so closing it means clicking again —
+      // but ONLY while it is actually open. A blind second click on a menu
+      // Twitch had already closed would re-open it, and the style that hides it
+      // is removed a moment later, leaving the popover stuck open over the
+      // stream. Hence: close if open, look again, and only then reveal.
+      const closeIfOpen = () => {
+        if (!document.querySelector(MENU_ROOT)) return;
+        try { document.querySelector(SETTINGS_BUTTON)?.click(); } catch (error) {}
+      };
+      closeIfOpen();
+      setTimeout(() => {
+        closeIfOpen();
+        setTimeout(() => hideMenuChrome(false), 120);
+      }, 250);
+    }
+  }
+
+  // The rung the preference resolves to, given what this stream actually
+  // offers. 'auto' follows the monitor the window is on, so an undocked laptop
+  // asks for less without anyone changing a setting.
+  function desiredHeight(available) {
+    const settings = quality.settings;
+    const wanted = settings?.twitchQuality ?? 'auto';
+    return globalThis.NovaSettings.resolveHeight(wanted, available);
+  }
+
+  // Returns 'skipped' when the page was not ready to be asked at all, so a slow
+  // player does not burn the caller's retry budget.
+  async function applyQualityPreference(reason) {
+    if (quality.busy || recorder) return 'skipped';
+    const settings = quality.settings;
+    if (!settings) return 'skipped';
+    if (pageKind().kind === 'other') return 'skipped';
+    const media = findPlayerVideo();
+    if (!media || !media.videoHeight) return 'skipped';
+
+    // A rung the viewer picked by hand after we last wrote one is their
+    // decision; adopt it as the new target instead of overruling it.
+    const stored = readStoredQuality();
+    if (stored && quality.lastWritten && stored !== quality.lastWritten) {
+      quality.target = heightFromLabel(stored);
+      quality.lastWritten = stored;
+      qualityLog(`manual selection adopted: ${stored}`);
+      return 'ok';
+    }
+
+    quality.busy = true;
+    try {
+      const chosen = await withQualityMenu(async (radios) => {
+        const rungs = radios
+          .map((radio) => ({ radio, label: labelFor(radio), height: heightFromLabel(labelFor(radio)) }))
+          .filter((rung) => rung.height);
+        if (!rungs.length) return null;
+        const target = desiredHeight(rungs.map((rung) => rung.height));
+        const pick = rungs.find((rung) => rung.height === target);
+        if (!pick) return null;
+        quality.target = pick.height;
+        // Already on it, and not sitting on "Автоматически": nothing to click.
+        if (pick.radio.checked) return { label: pick.label, clicked: false };
+        document.querySelector(`label[for="${pick.radio.id}"]`)?.click();
+        return { label: pick.label, clicked: true };
+      });
+      if (!chosen) return 'failed';
+      quality.lastWritten = chosen.label.replace(/\s*\(.*\)\s*$/, '');
+      // 'highest available' overrules the stored rung, so it is the flag that
+      // decides whether "Максимальное" or a fixed rung wins.
+      try {
+        localStorage.setItem(HIGHEST_STORE_KEY, settings.twitchQuality === 'max' ? 'true' : 'false');
+      } catch (error) {}
+      qualityLog(`${reason}: ${chosen.clicked ? 'switched to' : 'already on'} ${chosen.label}`
+        + ` (pref=${settings.twitchQuality}, lock=${settings.twitchLock})`);
+      return 'ok';
+    } catch (error) {
+      qualityLog(`could not apply preference: ${String(error?.message || error)}`);
+      return 'failed';
+    } finally {
+      quality.busy = false;
+    }
+  }
+
+  // The lock: ABR drops the rendition long after any one-time choice, so the
+  // only thing that holds it is checking what is actually being decoded.
+  // `videoHeight` is the honest answer and needs no page-world access.
+  function enforceQualityLock() {
+    if (!quality.settings?.twitchLock || quality.busy || recorder) return;
+    const media = findPlayerVideo();
+    if (!media?.videoHeight || !quality.target) return;
+    if (media.videoHeight >= quality.target) {
+      quality.lockMisses = 0;
+      return;
+    }
+    // There are states where the rendition simply cannot reach the target and
+    // never will: an ad playing in the same element at a lower resolution, a
+    // "1080p60" rung whose source is really 936p, a rung the line cannot carry.
+    // Without a cap this would open and close the settings menu every five
+    // seconds for as long as the tab is open.
+    if ((quality.lockMisses = (quality.lockMisses || 0) + 1) > 3) {
+      if (quality.lockMisses === 4) {
+        qualityLog(`lock: ${media.videoHeight}p stayed below ${quality.target}p after 3 tries,`
+          + ' standing down until the page or the setting changes');
+      }
+      return;
+    }
+    qualityLog(`lock: ${media.videoHeight}p is below ${quality.target}p, re-selecting`);
+    void applyQualityPreference('lock');
+  }
+
+  let qualityPath = '';
+  function watchQuality() {
+    if (!quality.settings) return;
+    // Twitch is an SPA: switching channels re-mounts the player without a page
+    // load, and the new stream has its own ladder.
+    if (location.pathname !== qualityPath) {
+      qualityPath = location.pathname;
+      quality.target = null;
+      quality.lastWritten = null;
+      quality.attempts = 0;
+      quality.lockMisses = 0;
+      setTimeout(() => { void applyQualityPreference('page'); }, 3_000);
+      return;
+    }
+    // A page whose menu never yields a usable rung (a directory page, a player
+    // that refused to mount) must not re-open that menu every five seconds
+    // forever — three tries and this page is left alone.
+    if (quality.target === null) {
+      if (quality.attempts >= 3) return;
+      void applyQualityPreference('retry').then((result) => {
+        if (result === 'failed') quality.attempts += 1;
+      });
+      return;
+    }
+    enforceQualityLock();
+  }
+
+  (async () => {
+    const api = globalThis.NovaSettings;
+    if (!api) return;
+    quality.settings = await api.load();
+    // 'Максимальное' is the one preference that needs no menu and no player:
+    // set the flag before Twitch's own player reads it.
+    if (quality.settings.twitchQuality === 'max') {
+      try { localStorage.setItem(HIGHEST_STORE_KEY, 'true'); } catch (error) {}
+    }
+    api.subscribe((next) => {
+      quality.settings = next;
+      quality.target = null;
+      quality.lastWritten = null;
+      quality.attempts = 0;
+      quality.lockMisses = 0;
+      void applyQualityPreference('settings changed');
+    });
+    quality.timer = setInterval(() => { try { watchQuality(); } catch (error) {} }, 5_000);
+    watchQuality();
+  })();
 })();

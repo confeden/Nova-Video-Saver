@@ -14,17 +14,55 @@
         <a href="https://t.me/nova_txt" target="_blank" rel="noopener noreferrer">t.me/nova_txt</a>
       </span>
     </div>
+    <button id="recheck" class="icon-btn" type="button" title="Проверить обновления"
+            aria-label="Проверить обновления">
+      <svg viewBox="0 0 16 16" aria-hidden="true">
+        <path d="M8 2.6a5.4 5.4 0 1 0 5.24 4.1" fill="none" stroke="currentColor"
+              stroke-width="1.6" stroke-linecap="round"></path>
+        <path d="M13.4 2v3.1h-3.1" fill="none" stroke="currentColor"
+              stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"></path>
+      </svg>
+    </button>
   </div>
   <div id="status" class="status">Проверка обновлений…</div>
   <a id="release-link" class="release-link" target="_blank" rel="noopener noreferrer">
     Открыть страницу актуального релиза
   </a>
-  <div class="footer">
-    <button id="recheck" type="button">Проверить обновления</button>
+
+  <div class="section">
+    <div class="section-head">Качество плеера</div>
+
+    <div class="setting">
+      <label class="setting-row" for="yt-quality">
+        <span class="setting-name">YouTube</span>
+        <select id="yt-quality"></select>
+      </label>
+      <label class="setting-row check" for="yt-lock">
+        <input id="yt-lock" type="checkbox">
+        <span>Запретить понижение качества</span>
+      </label>
+    </div>
+
+    <div class="setting">
+      <label class="setting-row" for="tw-quality">
+        <span class="setting-name">Twitch</span>
+        <select id="tw-quality"></select>
+      </label>
+      <label class="setting-row check" for="tw-lock">
+        <input id="tw-lock" type="checkbox">
+        <span>Запретить понижение качества</span>
+      </label>
+    </div>
+
+    <div id="settings-hint" class="hint">
+      «Как у монитора» — по разрешению экрана, на котором открыта вкладка.
+    </div>
   </div>
+
   <div id="recovered" class="status update" hidden></div>
   <button id="save-recovered" class="export-log" type="button" hidden>Сохранить готовый файл</button>
   <button id="export-log" class="export-log" type="button">Сохранить журнал диагностики (NVS-debug)</button>
+  <script src="settings.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

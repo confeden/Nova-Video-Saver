@@ -37,9 +37,15 @@ async function refresh(force) {
   if (force) {
     statusBox.className = 'status';
     statusBox.textContent = 'Проверка обновлений…';
+    // The check is now a 26px icon, so the spinner on it is the only sign that
+    // anything is happening — without it the click reads as a dead button.
+    recheckButton.classList.add('busy');
+    recheckButton.disabled = true;
     const result = await chrome.runtime.sendMessage({ t: 'nova-check-update' }).catch((error) => ({
       error: String(error?.message || error),
     }));
+    recheckButton.classList.remove('busy');
+    recheckButton.disabled = false;
     render(result);
     return;
   }
@@ -50,6 +56,80 @@ async function refresh(force) {
 
 recheckButton.addEventListener('click', () => refresh(true));
 refresh(false);
+
+// Player quality preferences. Applied by content_ui.js/content_hook.js on
+// YouTube and by twitch_ui.js on Twitch; this popup only edits the record.
+const settingsHint = document.getElementById('settings-hint');
+
+function fillQualitySelect(select, heights) {
+  // `screen` here is the display the popup — and therefore the browser window
+  // — is on, so the number quoted next to "Как у монитора" is what that same
+  // window will resolve 'auto' to.
+  const monitor = globalThis.NovaSettings.monitorHeight();
+  const options = [
+    ['auto', `Как у монитора (${monitor}p)`],
+    ['max', 'Максимальное'],
+    ...heights.map((height) => [String(height), `${height}p`]),
+  ];
+  for (const [value, label] of options) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    select.append(option);
+  }
+}
+
+async function setupSettings() {
+  const { YOUTUBE_HEIGHTS, TWITCH_HEIGHTS, save, load } = globalThis.NovaSettings;
+  const youtubeQuality = document.getElementById('yt-quality');
+  const youtubeLock = document.getElementById('yt-lock');
+  const twitchQuality = document.getElementById('tw-quality');
+  const twitchLock = document.getElementById('tw-lock');
+
+  fillQualitySelect(youtubeQuality, YOUTUBE_HEIGHTS);
+  fillQualitySelect(twitchQuality, TWITCH_HEIGHTS);
+
+  const current = await load();
+  youtubeQuality.value = String(current.youtubeQuality);
+  youtubeLock.checked = current.youtubeLock;
+  twitchQuality.value = String(current.twitchQuality);
+  twitchLock.checked = current.twitchLock;
+
+  const note = (text) => { settingsHint.textContent = text; };
+  const persist = async (patch, message) => {
+    try {
+      await save(patch);
+      note(message);
+    } catch (error) {
+      note(`Не удалось сохранить настройку: ${String(error?.message || error)}`);
+    }
+  };
+
+  youtubeQuality.addEventListener('change', () => persist(
+    { youtubeQuality: youtubeQuality.value },
+    'Сохранено. На открытых вкладках YouTube — обновите страницу (F5).',
+  ));
+  twitchQuality.addEventListener('change', () => persist(
+    { twitchQuality: twitchQuality.value },
+    'Сохранено. Twitch применяет качество при следующей загрузке плеера.',
+  ));
+  youtubeLock.addEventListener('change', () => persist(
+    { youtubeLock: youtubeLock.checked },
+    youtubeLock.checked
+      ? 'Качество YouTube закреплено: плеер не будет понижать его сам.'
+      : 'YouTube снова может понижать качество при слабой сети.',
+  ));
+  twitchLock.addEventListener('change', () => persist(
+    { twitchLock: twitchLock.checked },
+    twitchLock.checked
+      ? 'Качество Twitch закреплено: авто-режим плеера выключен.'
+      : 'Twitch снова может выбирать качество сам.',
+  ));
+}
+
+setupSettings().catch((error) => {
+  settingsHint.textContent = `Настройки недоступны: ${String(error?.message || error)}`;
+});
 
 // Files that finished processing but that the browser did not accept for
 // saving (a service-worker restart at the wrong moment). They wait in the

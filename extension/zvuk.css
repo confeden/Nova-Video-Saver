@@ -1,0 +1,211 @@
+/* VK Video adapter UI. Its own sheet, like every other adapter: the rules are
+   anchored to VK's player box and must not leak onto the other hosts. */
+
+[hidden] { display: none !important; }
+
+/* The button normally lives inside the player's own shadow root, styled by the
+   inline sheet in vk.js — an extension stylesheet cannot cross that boundary.
+   These rules are for the fallback overlay only, and every dimension is
+   !important: VK stretches any direct child of the player box to its full size,
+   which turned the icon into a screen-wide arrow. */
+.nova-zvuk-btn.nova-zvuk-overlay {
+  position: absolute !important;
+  right: 12px !important;
+  bottom: 64px !important;
+  width: 36px !important;
+  height: 36px !important;
+  padding: 0 !important;
+  border: 0 !important;
+  background: transparent !important;
+  box-sizing: border-box !important;
+  color: #fff;
+  font: inherit;
+  cursor: pointer;
+  z-index: 40;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.6));
+}
+
+[class*="VideoPlayer__aspectRatio"]:hover .nova-zvuk-overlay,
+[class*="VideoPlayer__player"]:hover .nova-zvuk-overlay,
+.nova-zvuk-overlay:focus-visible { opacity: 0.92; }
+.nova-zvuk-overlay:hover { opacity: 1; }
+
+.nova-zvuk-btn.nova-zvuk-overlay svg {
+  width: 100% !important;
+  height: 100% !important;
+  display: block;
+  shape-rendering: geometricPrecision;
+}
+
+/* ---- menu ---------------------------------------------------------------- */
+
+.nova-zvuk-menu {
+  position: fixed;
+  z-index: 2147483000;
+  min-width: 260px;
+  max-width: 340px;
+  padding: 6px;
+  border-radius: 12px;
+  background: #1c1d21;
+  color: #e8e9eb;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+  font: 13px/1.35 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+.nova-zvuk-head {
+  padding: 8px 10px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #9aa0a6;
+}
+
+.nova-zvuk-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.nova-zvuk-item:hover { background: rgba(255, 255, 255, 0.08); }
+.nova-zvuk-muted { color: #9aa0a6; cursor: default; }
+.nova-zvuk-muted:hover { background: transparent; }
+.nova-zvuk-text { font-weight: 500; }
+.nova-zvuk-hint { font-size: 11px; color: #9aa0a6; }
+
+/* ---- toast --------------------------------------------------------------- */
+
+.nova-zvuk-toast {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 2147483000;
+  min-width: 260px;
+  max-width: 360px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: #1c1d21;
+  color: #e8e9eb;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+  font: 13px/1.35 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  /* Hidden by transform, not by `display`: the panel slides in the way the
+     YouTube one does, and a `display: none` box cannot animate at all. */
+  opacity: 0;
+  transform: translateY(12px);
+  pointer-events: none;
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+
+.nova-zvuk-toast.show { opacity: 1; transform: translateY(0); pointer-events: auto; }
+
+.nova-zvuk-toast-text { display: block; margin-bottom: 8px; }
+
+.nova-zvuk-toast-bar {
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.14);
+  overflow: hidden;
+}
+
+.nova-zvuk-toast-bar[hidden] { display: none; }
+
+.nova-zvuk-toast-bar i {
+  display: block;
+  height: 100%;
+  width: 0;
+  border-radius: 2px;
+  background: #35d477;
+  transition: width 0.2s ease;
+}
+
+/* ---- stages -------------------------------------------------------------- */
+
+.nova-zvuk-stages { display: none; }
+.nova-zvuk-stages.show { display: block; margin-top: 2px; }
+
+.nova-zvuk-stage { margin-top: 8px; }
+.nova-zvuk-stage.queued { opacity: 0.55; }
+
+.nova-zvuk-stage-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 4px;
+  font-size: 12px;
+}
+
+.nova-zvuk-stage-value { color: #9aa0a6; }
+.nova-zvuk-stage.done .nova-zvuk-stage-value { color: #35d477; }
+.nova-zvuk-stage.error .nova-zvuk-stage-value { color: #ff6e64; }
+
+.nova-zvuk-stage-bar {
+  position: relative;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.14);
+  overflow: hidden;
+}
+
+.nova-zvuk-stage-bar i {
+  display: block;
+  height: 100%;
+  width: 0;
+  border-radius: 2px;
+  background: #35d477;
+  transition: width 0.2s ease;
+}
+
+/* A stage that cannot report a number — a remux, a browser hand-off — still has
+   to look alive, so the bar runs a stripe instead of standing empty. */
+.nova-zvuk-stage.busy .nova-zvuk-stage-bar::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  width: 38%;
+  border-radius: 2px;
+  background: linear-gradient(90deg, rgba(53, 212, 119, 0), #35d477, rgba(53, 212, 119, 0));
+  animation: nova-zvuk-sweep 1.1s linear infinite;
+}
+
+@keyframes nova-zvuk-sweep {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(300%); }
+}
+
+.nova-zvuk-menu-note {
+  padding: 6px 12px 8px; color: #9aa0a6; font-size: 11px; line-height: 1.35;
+}
+
+/* One button per track row, inside the row's own controls block and just to
+   the left of the duration. Sized against Zvuk's own 38px round buttons so it
+   sits in the same line without stretching the row. */
+.nova-zvuk-btn.nova-zvuk-row-btn {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  align-self: center;
+  cursor: pointer;
+  opacity: 0.75;
+  transition: opacity 0.15s ease;
+}
+
+.nova-zvuk-btn.nova-zvuk-row-btn:hover,
+.nova-zvuk-btn.nova-zvuk-row-btn:focus-visible { opacity: 1; }
+
+.nova-zvuk-btn.nova-zvuk-row-btn svg {
+  width: 22px;
+  height: 22px;
+  display: block;
+  shape-rendering: geometricPrecision;
+}

@@ -3,7 +3,7 @@
 [hidden] { display: none !important; }
 
 body {
-  width: 280px;
+  width: 288px;
   margin: 0;
   padding: 14px;
   background: #181a1c;
@@ -20,6 +20,7 @@ body {
 .titles {
   display: flex;
   flex-direction: column;
+  min-width: 0;
 }
 
 .titles b {
@@ -43,6 +44,35 @@ body {
 }
 
 .subtitle a:hover { text-decoration: underline; }
+
+/* The update check used to be a full-width button under the status, which read
+   as the popup's main action. It is a refresh, so it is a 26px icon in the
+   header instead and the green release link keeps the visual weight. */
+.icon-btn {
+  flex: 0 0 auto;
+  margin-left: auto;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #3c4043;
+  border-radius: 7px;
+  background: #222528;
+  color: #9aa0a6;
+  cursor: pointer;
+}
+
+.icon-btn svg { width: 15px; height: 15px; display: block; }
+
+.icon-btn:hover { background: #2b2f33; color: #f1f1f1; }
+
+.icon-btn:disabled { opacity: 0.5; cursor: default; }
+
+.icon-btn.busy svg { animation: nova-spin 0.9s linear infinite; }
+
+@keyframes nova-spin { to { transform: rotate(360deg); } }
 
 .status {
   margin: 12px 0 0;
@@ -78,29 +108,73 @@ body {
   background: #4ade87;
 }
 
-.footer {
-  display: flex;
-  align-items: center;
+.section {
   margin-top: 12px;
+  padding: 10px 11px 11px;
+  border: 1px solid #2b2f33;
+  border-radius: 8px;
 }
 
-.footer button {
-  flex: 1;
-  padding: 6px 10px;
+.section-head {
+  margin-bottom: 8px;
+  color: #9aa0a6;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.setting + .setting {
+  margin-top: 9px;
+  padding-top: 9px;
+  border-top: 1px solid #232629;
+}
+
+.setting-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.setting-name {
+  flex: 0 0 auto;
+}
+
+/* The select takes the rest of the row rather than a fixed width: the longest
+   option is «Как у монитора (1440p)» and a 150px box cut it to «(144». */
+.setting-row select {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 4px 6px;
   border: 1px solid #3c4043;
-  border-radius: 7px;
+  border-radius: 6px;
   background: #222528;
   color: #f1f1f1;
+  font: inherit;
   cursor: pointer;
 }
 
-.footer button:hover {
-  background: #2b2f33;
+.setting-row.check {
+  margin-top: 6px;
+  color: #c9cdd1;
+  font-size: 12px;
+  cursor: pointer;
 }
 
-.footer a {
-  color: #8ab4f8;
-  text-decoration: none;
+.setting-row.check input {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: #35d477;
+  cursor: pointer;
+}
+
+.hint {
+  margin-top: 9px;
+  color: #7c8288;
+  font-size: 11px;
+  line-height: 1.35;
 }
 
 .export-log {

@@ -594,8 +594,19 @@
     };
   }
 
+  // Truncation is by CODE POINT, not by UTF-16 unit: `String.slice(0, 120)` cuts
+  // a title whose 120th unit is half of a surrogate pair, and the lone surrogate
+  // left behind makes the whole name unusable — Chrome then silently names the
+  // file after the blob's UUID (`50b453d3-….m4a`) instead of failing. A title
+  // that strips down to nothing does the same, hence the second fallback.
   function safeFilename(value) {
-    return (value || 'video').replace(/[\\/:*?"<>|]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+    const cleaned = String(value || 'video')
+      .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '')
+      .replace(/[\\/:*?"<>|]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const points = [...cleaned];
+    return (points.length > 120 ? points.slice(0, 120).join('').trim() : cleaned) || 'video';
   }
 
   function formatCueTime(seconds, separator) {
@@ -2048,6 +2059,26 @@
     setTimeout(() => { void processPlaylistQueue(null); }, 1_500);
   });
   muteEarlyIfQueueActive();
+
+  // Quality preferences live in chrome.storage, which only this world can read;
+  // the player they apply to lives in the page's world. Push them across on
+  // load and on every change, so editing the popup takes effect on an open tab
+  // without a reload.
+  function pushSettings(settings) {
+    return callHook('settings', { settings }).catch((error) => {
+      void sendRuntimeMessage({
+        t: 'nova-log', tag: 'settings',
+        text: `push failed: ${String(error?.message || error)}`,
+      }).catch(() => {});
+    });
+  }
+  (async () => {
+    const settings = globalThis.NovaSettings;
+    if (!settings) return;
+    await pushSettings(await settings.load());
+    settings.subscribe((next) => { void pushSettings(next); });
+  })();
+
   (async () => {
     const resumed = await resumeReloadedVideoDownload();
     await processPlaylistQueue(resumed || null, 'load');

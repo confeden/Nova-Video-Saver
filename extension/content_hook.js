@@ -1758,6 +1758,16 @@
   // What the monitor-based default asked for on this video. Applied once per
   // video, so it is the only record of the quality the viewer should end up on.
   let recommendedQuality = { videoId: null, quality: null };
+  // Mirror of the popup's `nova_settings`, pushed in by content_ui.js. The hook
+  // runs at document_start and the isolated world only reaches chrome.storage
+  // at document_idle, so this stays null for the first moments of a page and
+  // every reader has to cope with that — 'auto' is what null means.
+  let userSettings = null;
+  // What the viewer picked in YouTube's own quality menu on this video. The
+  // lock re-pins to this rather than to our preference: a deliberate choice is
+  // still a choice, and "do not let it drop" is the only thing being asked for.
+  let manualQuality = null;
+  let qualityLockTimer = null;
 
   function setQualityRaw(q) {
     const p = player();
@@ -1873,6 +1883,11 @@
       return HEIGHT_BY_QUALITY[quality] || null;
     } catch (e) { return null; }
   }
+  // The short edge, not the height: a monitor turned portrait is still a 1440p
+  // monitor. devicePixelRatio is folded in because a 150 %-scaled 1440p panel
+  // reports 960 CSS pixels while still being worth 1440p of detail. `screen`
+  // follows the window, so dragging the tab to the second monitor changes the
+  // answer — which is the point of the 'auto' setting.
   function monitorDefaultHeight() {
     const ratio = Number(window.devicePixelRatio) || 1;
     const shortEdge = Math.min(Number(screen.width) || 0, Number(screen.height) || 0) * ratio;
@@ -1882,30 +1897,120 @@
     if (shortEdge >= 720) return 720;
     return 480;
   }
+  // The rung the viewer's preference resolves to among the ones this video
+  // actually has. Resolved per call, never cached: the preference is 'auto' by
+  // default and the monitor under the window can change without a reload.
+  function preferredHeight(heights) {
+    const rungs = [...heights].sort((left, right) => right - left);
+    if (!rungs.length) return null;
+    const wanted = userSettings?.youtubeQuality ?? 'auto';
+    if (wanted === 'max') return rungs[0];
+    const target = wanted === 'auto' ? monitorDefaultHeight() : Number(wanted);
+    return rungs.find((height) => height <= target) ?? rungs[rungs.length - 1];
+  }
   function scheduleDefaultQuality() {
     const videoId = vidId();
     if (!videoId || defaultQualityAppliedVideoId === videoId) return;
     let tries = 30;
+    let busyWaits = 150;
     (function tick() {
       if (vidId() !== videoId || defaultQualityAppliedVideoId === videoId) return;
       if (manuallySelectedQualityVideoId === videoId) {
         defaultQualityAppliedVideoId = videoId;
         return;
       }
-      const heights = availableHeights().sort((a, b) => b - a);
+      // Applying a preference is a representation change like any other, so it
+      // waits for the download or recording to finish rather than switching the
+      // player under a capture that is already running. Bounded at ~5 minutes so
+      // a hold that never releases cannot leave a timer running for the session.
+      if (playerIsBusy()) {
+        if (busyWaits-- > 0) setTimeout(tick, 2_000);
+        return;
+      }
+      const heights = availableHeights();
       if (!heights.length && tries-- > 0) { setTimeout(tick, 200); return; }
-      const target = monitorDefaultHeight();
-      const selected = heights.find((height) => height <= target) || heights[heights.length - 1];
+      const selected = preferredHeight(heights);
       const quality = QUALITY_BY_HEIGHT[selected];
       defaultQualityAppliedVideoId = videoId;
       if (quality) {
-        // A recommendation only: no quality range is pinned, and a later
-        // selection in YouTube's own menu always wins.
         recommendedQuality = { videoId, quality };
-        recommendQuality(quality);
-        logLocal('quality', 'default recommendation', selected + 'p', 'monitorShortEdge=', monitorDefaultHeight());
+        // Without the lock this is a recommendation only: no range is pinned,
+        // and a later selection in YouTube's own menu always wins. With the
+        // lock the range is pinned to the single rung, which is what actually
+        // stops ABR from dropping — setPlaybackQuality alone does not.
+        if (userSettings?.youtubeLock) setQualityRaw(quality);
+        else recommendQuality(quality);
+        logLocal('quality', 'default recommendation', selected + 'p',
+          'monitorShortEdge=', monitorDefaultHeight(), 'pref=', userSettings?.youtubeQuality ?? 'auto',
+          'lock=', Boolean(userSettings?.youtubeLock));
       }
     })();
+  }
+  // "Do not let the quality drop": ABR moves the rendition down on its own long
+  // after any one-shot call, so the pin has to be re-applied. It is deliberately
+  // idle while `deliberatePlaybackDepth > 0` — that flag covers both regions
+  // that change quality on purpose (the download command and the live
+  // recording), and fighting them would corrupt exactly the file being built.
+  function qualityLockTarget() {
+    const videoId = vidId();
+    if (manuallySelectedQualityVideoId === videoId && manualQuality) return manualQuality;
+    if (recommendedQuality.videoId === videoId && recommendedQuality.quality) return recommendedQuality.quality;
+    const selected = preferredHeight(availableHeights());
+    return QUALITY_BY_HEIGHT[selected] || null;
+  }
+  // True while something in here is deliberately driving the player: the
+  // download command holds `store.playbackHold` for its whole length, a live
+  // recording sets `store.liveSession`, and `deliberatePlaybackDepth` covers the
+  // shorter playback-driven rescues inside the capture. `playbackHold` is the
+  // one that matters most — the MP3 path pins the LOWEST rung on purpose, so a
+  // lock pulling it back to 1080p mid-capture is a changed representation in the
+  // middle of a file (N1/G11), i.e. exactly the defect D1 forbids shipping.
+  function playerIsBusy() {
+    return deliberatePlaybackDepth > 0 || Boolean(store.playbackHold) || Boolean(store.liveSession);
+  }
+  function enforceQualityLock() {
+    if (!userSettings?.youtubeLock || playerIsBusy()) return;
+    const p = player();
+    if (!p || !vidId()) return;
+    const target = qualityLockTarget();
+    if (!target) return;
+    let current = null;
+    try { current = p.getPlaybackQuality?.() || null; } catch (e) { return; }
+    // Only ever raise back to the target. A rung above it (the viewer asked for
+    // more in YouTube's menu and `manualQuality` has not caught up yet) is left
+    // alone rather than pulled down by our own lock.
+    if (current && qualityRank(current) >= qualityRank(target)) return;
+    try { setQualityRaw(target); } catch (e) { return; }
+    logLocal('quality', 'lock re-applied', 'target=', target, 'was=', current);
+  }
+  function restartQualityLock() {
+    clearInterval(qualityLockTimer);
+    qualityLockTimer = null;
+    if (!userSettings?.youtubeLock) return;
+    // An interval, not rAF: a background tab still plays and still gets
+    // downgraded, and rAF does not run there at all.
+    qualityLockTimer = setInterval(() => {
+      try { enforceQualityLock(); } catch (e) {}
+    }, 4_000);
+  }
+  function applyUserSettings(next) {
+    const previous = userSettings;
+    userSettings = next || null;
+    const qualityChanged = previous?.youtubeQuality !== userSettings?.youtubeQuality;
+    const lockChanged = previous?.youtubeLock !== userSettings?.youtubeLock;
+    // Turning the lock off has to undo the pin, not just stop re-applying it:
+    // the range is sticky, so the player would stay frozen on the locked rung
+    // and look like the setting had no effect.
+    if (lockChanged && previous?.youtubeLock && !userSettings?.youtubeLock) {
+      try { player()?.setPlaybackQualityRange?.('tiny', 'highres'); } catch (error) {}
+    }
+    if (qualityChanged) {
+      // The preference arrived (or changed) after the one-shot default already
+      // ran with whatever it knew, so let it run again for this video.
+      defaultQualityAppliedVideoId = null;
+      scheduleDefaultQuality();
+    }
+    if (lockChanged || qualityChanged) restartQualityLock();
   }
   function keepAutoplayOff() {
     try {
@@ -7334,6 +7439,13 @@
         reply({ ok: true, ...sabrCancel() });
         return;
       }
+      // The isolated world owns chrome.storage and pushes the quality
+      // preferences here — once at document_idle and again on every change.
+      if (cmd === 'settings') {
+        applyUserSettings(ev.data.settings);
+        reply({ ok: true });
+        return;
+      }
       if (cmd === 'info') {
         const p = player();
         const rawDuration = video() && video().duration;
@@ -8180,6 +8292,8 @@
       store.mediaEpochStart = performance.now();
       store.completedAudioCache = null;
       store.mp3Isolation = null;
+      // A quality picked on the previous video says nothing about this one.
+      manualQuality = null;
       resetCapture();
     }
     if (!store.liveSession) store.capturing = true; // keep passive capture on while watching
@@ -8194,6 +8308,30 @@
       || /quality|качество/i.test(text))) {
       manuallySelectedQualityVideoId = vidId();
       manualQualityRevision += 1;
+      // The click carries the label, not the internal name, and the player has
+      // not switched yet — read the rung it actually lands on. Without this the
+      // lock would keep re-pinning our own preference over the viewer's choice.
+      //
+      // A fixed delay is not enough: the same handler fires for the "Качество"
+      // item that merely opens the submenu, and that timer would land on the
+      // OLD rung and record it as the manual choice — after which the lock
+      // would drag the viewer back up and a deliberate downgrade would be
+      // impossible. So poll for an actual change instead, from the rung that
+      // was on screen when the menu was touched.
+      const videoIdAtClick = vidId();
+      const before = (() => {
+        try { return player()?.getPlaybackQuality?.() || null; } catch (e) { return null; }
+      })();
+      (function waitForSwitch(attempt) {
+        if (attempt > 40 || vidId() !== videoIdAtClick) return;
+        let quality = null;
+        try { quality = player()?.getPlaybackQuality?.() || null; } catch (e) { return; }
+        if (quality && quality !== before && HEIGHT_BY_QUALITY[quality]) {
+          manualQuality = quality;
+          return;
+        }
+        setTimeout(() => waitForSwitch(attempt + 1), 250);
+      })(0);
     }
   }, true);
 
