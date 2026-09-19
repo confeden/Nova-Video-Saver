@@ -2697,6 +2697,12 @@
   function buildSabrRequest(template, playerTimeMs, options = {}) {
     const height = Number(options.height) || 0;
     const audio = options.audio ? encodeFormatId(options.audio, 16) : null;
+    // ClientAbrState 40 is the enabled-track-types bitfield (0 both, 1 audio
+    // only) in the public googlevideo protobufs; the 21/28 numbering in this
+    // table matched ours field for field. Not measured here — the caller treats
+    // any video that still arrives as disposable, so being ignored costs bytes,
+    // not the download.
+    const trackTypes = Number(options.trackTypes) || 0;
     const out = [];
     let audioPlaced = false;
     for (const record of splitProtobuf(template.body)) {
@@ -2710,10 +2716,11 @@
         const inner = children.map((child) => {
           if (child.field === 28) return varintRecord(28, playerTimeMs);
           if (child.field === 21 && height) return varintRecord(21, height);
+          if (child.field === 40 && trackTypes) return varintRecord(40, trackTypes);
           return child.raw;
         });
         // A template captured at another moment may simply not carry the field.
-        for (const [field, value] of [[28, playerTimeMs], [21, height]]) {
+        for (const [field, value] of [[28, playerTimeMs], [21, height], [40, trackTypes]]) {
           if (value && !children.some((child) => child.field === field)) {
             inner.push(varintRecord(field, value));
           }
@@ -2781,6 +2788,7 @@
   }
 
   async function sabrFetch(template, playerTimeMs, options) {
+    const sentAt = Date.now();
     const response = await (OrigFetch || fetch)(template.url, {
       method: 'POST',
       body: buildSabrRequest(template, playerTimeMs, options),
@@ -2788,6 +2796,7 @@
       cache: 'no-store',
     });
     if (!response.ok) throw new Error(`SABR HTTP ${response.status}`);
+    const headersAt = Date.now();
     const bytes = new Uint8Array(await response.arrayBuffer());
     const parts = parseUmpParts(bytes);
     const failure = parts.find((part) => part.type === UMP_SABR_ERROR);
@@ -2796,7 +2805,24 @@
         .replace(/[^\x20-\x7e]/g, ' ').trim();
       throw new Error(`SABR отказал: ${text}`);
     }
-    return { bytes, parts };
+    // Where a request's time goes: waiting for the server (ttfb) or reading
+    // the body. The 5.4 h audio walk spent 1.56 s per 0.5 MB answer, and which
+    // of the two it was decides whether parallel requests can help.
+    return { bytes, parts, ttfbMs: headersAt - sentAt, bodyMs: Date.now() - headersAt };
+  }
+
+  // Varint fields of a small protobuf message, for logging what the server
+  // tells us (the next-request policy) without a schema.
+  function protobufVarints(bytes) {
+    const out = {};
+    try {
+      for (const record of splitProtobuf(bytes)) {
+        if (record.wire !== 0) continue;
+        const at = readVarint(record.raw, 0).used;
+        out[record.field] = readVarint(record.raw, at).value;
+      }
+    } catch (e) {}
+    return out;
   }
 
   // Walks a video from `fromMs` and hands back the tracks it saw. Segments carry
@@ -2808,15 +2834,53 @@
     if (!template) throw new Error('нет перехваченного SABR-запроса для этого видео');
     const emit = typeof options.onSegment === 'function' ? options.onSegment : null;
     const untilMs = Number(options.untilMs) || Infinity;
+    // With `onlyItag` every other track is walked past but never kept: an
+    // audio-only job must not hold (or pend) a video track nobody will read.
+    const onlyItag = Number(options.onlyItag) || 0;
+    const maxRequests = options.maxRequests || 400;
+    // Requests in flight at once. Only for a single kept track in streaming
+    // mode: out-of-order answers then cost at most a few held segments.
+    const parallel = emit && onlyItag ? Math.max(1, Math.min(8, Number(options.parallel) || 1)) : 1;
+    const endLimitMs = Math.min(untilMs, Number(options.durationMs) > 0 ? Number(options.durationMs) : Infinity);
     const tracks = new Map();
-    let playerTimeMs = Number(options.fromMs) || 0;
+    // The kept track's segments by start time, trimmed behind the frontier.
+    const keptSegments = new Map();
+    let keptSegmentMs = 0;
+    const fromMs = Number(options.fromMs) || 0;
+    let playerTimeMs = fromMs;
     let requests = 0;
+    let answers = 0;
     let wireBytes = 0;
+    let ttfbTotal = 0;
+    let bodyTotal = 0;
+    let policyLogged = false;
     const startedAt = Date.now();
-    while (playerTimeMs < untilMs && requests < (options.maxRequests || 400)) {
-      const { bytes, parts } = await sabrFetch(template, playerTimeMs, options);
+    const launchGuard = () => {
+      // The walk ends by itself when the server stops advancing; reaching the
+      // cap means it was still advancing, and stopping silently here handed
+      // over a track cut at the cap (400 requests ≈ 2.3 h of media).
+      if (requests >= maxRequests) {
+        throw new Error(`SABR: достигнут предел ${maxRequests} запросов на ${Math.round(playerTimeMs / 1000)} с`);
+      }
       requests += 1;
+    };
+    const timingSummary = () => (answers
+      ? `avgTtfbMs= ${Math.round(ttfbTotal / answers)} avgBodyMs= ${Math.round(bodyTotal / answers)}`
+      : '');
+
+    const absorb = ({ bytes, parts, ttfbMs, bodyMs }) => {
+      answers += 1;
       wireBytes += bytes.length;
+      ttfbTotal += Number(ttfbMs) || 0;
+      bodyTotal += Number(bodyMs) || 0;
+      if (!policyLogged) {
+        const policy = parts.find((part) => part.type === 35);
+        if (policy) {
+          policyLogged = true;
+          log('sabr', 'next-request policy varints=',
+            JSON.stringify(protobufVarints(bytes.subarray(policy.at, policy.at + policy.size))));
+        }
+      }
       // One segment arrives as MANY media parts sharing a header id, so the
       // write cursor walks with them; deduplication is per segment, not per
       // part, or everything after a segment's first part is dropped.
@@ -2831,6 +2895,11 @@
         tracks.set(header.itag, track);
         track.endMs = Math.max(track.endMs, header.startMs + header.durationMs);
         track.firstByte = Math.min(track.firstByte, header.startByte);
+        if (onlyItag && header.itag === onlyItag && header.durationMs > 0) {
+          const end = header.startMs + header.durationMs;
+          keptSegments.set(header.startMs, Math.max(keptSegments.get(header.startMs) || 0, end));
+          keptSegmentMs = keptSegmentMs ? Math.min(keptSegmentMs, header.durationMs) : header.durationMs;
+        }
         const held = track.seen.has(header.startByte);
         if (!held) track.seen.add(header.startByte);
         openByHeader.set(header.headerId, { track, offset: header.startByte, skip: held });
@@ -2840,6 +2909,7 @@
         const id = readUmpVarint(bytes, part.at);
         const open = openByHeader.get(id.value);
         if (!open || open.skip) continue;
+        if (onlyItag && open.track.itag !== onlyItag) continue;
         const payload = bytes.slice(part.at + id.used, part.at + part.size);
         open.track.bytes += payload.length;
         if (emit) emitTrackBytes(open.track, open.offset, payload, emit);
@@ -2854,12 +2924,13 @@
       if (emit) {
         for (const track of tracks.values()) {
           if (track.cursor || !track.firstByte) continue;
+          if (onlyItag && track.itag !== onlyItag) continue;
           const init = observedInitFor(track);
           if (init) {
             track.bytes += init.length;
             emitTrackBytes(track, 0, init, emit);
             log('sabr', 'adopted the player init for itag', track.itag, 'bytes=', init.length);
-          } else if (requests > 1) {
+          } else if (answers > 1) {
             throw new Error(`SABR: дорожка ${track.itag} пришла без init-сегмента`);
           }
         }
@@ -2867,13 +2938,110 @@
       // Which representations the height cap actually resolved to is only known
       // once the server has answered, and the offscreen job needs their exact
       // sizes before the first chunk can be sent.
-      if (requests === 1 && typeof options.onTracks === 'function') options.onTracks(tracks);
+      if (answers === 1 && typeof options.onTracks === 'function') options.onTracks(tracks);
+    };
+    const afterAnswer = async (reached) => {
+      // A multi-hour walk is hundreds of requests; without a trace a failure at
+      // request 600 reads the same as one at request 2.
+      if (answers % 100 === 0) {
+        log('sabr', 'walk; requests=', requests, 'reachedMs=', reached,
+          'MB=', (wireBytes / 1048576).toFixed(1), 'seconds=', ((Date.now() - startedAt) / 1000).toFixed(1),
+          timingSummary());
+      }
+      if (typeof options.onProgress === 'function') options.onProgress({ reachedMs: reached, wireBytes });
+      if (typeof options.backpressure === 'function') await options.backpressure();
+    };
+
+    let pipeline = false;
+    while (playerTimeMs < untilMs) {
+      launchGuard();
+      absorb(await sabrFetch(template, playerTimeMs, options));
       const reached = Math.min(...[...tracks.values()].map((track) => track.endMs));
       if (!(reached > playerTimeMs)) break;
       playerTimeMs = reached;
-      if (typeof options.onProgress === 'function') options.onProgress({ reachedMs: reached, wireBytes });
-      if (typeof options.backpressure === 'function') await options.backpressure();
+      await afterAnswer(reached);
+      // The first answer has named the tracks, delivered the init and shown how
+      // far one answer reaches; from here several requests can be in flight.
+      if (parallel > 1 && keptSegments.size) { pipeline = true; break; }
     }
+    if (pipeline) playerTimeMs = await sabrWalkPipelined();
+
+    // Pipelined walk: the answer to a request at T covers roughly [T, T+span),
+    // span being the server's own readahead (~30 s of audio, constant over the
+    // 655 answers of the 5.4 h run). Requests go out at the frontier and at
+    // frontier + k·span; the frontier is the kept track's contiguous time
+    // coverage, so a hole between two speculative answers is simply the next
+    // frontier and gets its own request. Correctness never depends on the
+    // guess — only the number of round trips does.
+    async function sabrWalkPipelined() {
+      const frontierFrom = (edge) => {
+        for (;;) {
+          let next = edge;
+          for (const [start, end] of keptSegments) {
+            if (start <= edge + 1 && end > next) next = end;
+          }
+          if (next === edge) break;
+          edge = next;
+        }
+        for (const [start, end] of keptSegments) if (end <= edge) keptSegments.delete(start);
+        return edge;
+      };
+      let frontier = frontierFrom(fromMs);
+      const span = Math.max(1_000, frontier - fromMs);
+      const near = (a, b, tolerance) => Math.abs(a - b) < tolerance;
+      const inflight = new Map();
+      let degraded = false;
+      const launch = (at) => {
+        launchGuard();
+        const alone = degraded;
+        inflight.set(at, sabrFetch(template, at, options)
+          .then((result) => ({ at, alone, result }), (error) => ({ at, alone, error })));
+      };
+      const covered = (at) => [...keptSegments].some(([start, end]) => start <= at && at < end);
+      log('sabr', 'pipelined walk; parallel=', parallel, 'spanMs=', span, 'segmentMs=', keptSegmentMs);
+      for (;;) {
+        // Always one request at the frontier itself: it is the one that proves
+        // progress, and at the declared end the one that proves there is none.
+        // Once degraded, strictly one at a time: a request sent while older
+        // ones are still out would be concurrent again.
+        const tolerance = Math.max(1, keptSegmentMs / 2);
+        if ((!degraded || !inflight.size)
+          && ![...inflight.keys()].some((at) => near(at, frontier, tolerance))) launch(frontier);
+        if (!degraded) {
+          for (let k = 1; inflight.size < parallel; k += 1) {
+            const at = Math.round(frontier + k * span);
+            if (at >= endLimitMs || k > parallel * 2) break;
+            if ([...inflight.keys()].some((other) => near(other, at, span / 2)) || covered(at)) continue;
+            launch(at);
+          }
+        }
+        const settled = await Promise.race(inflight.values());
+        inflight.delete(settled.at);
+        const aimedAtFrontier = near(settled.at, frontier, tolerance);
+        if (settled.error) {
+          // A request sent alongside others proves nothing on its own — a server
+          // that refuses concurrency fails all of them, the frontier one
+          // included. Whatever the objection, the walk goes on one request at a
+          // time, exactly as before this mode; only a failure there is final.
+          if (settled.alone) throw settled.error;
+          if (!degraded) {
+            degraded = true;
+            log('sabr', 'pipelined request failed; continuing one at a time:',
+              settled.error?.message || settled.error);
+          }
+          continue;
+        }
+        absorb(settled.result);
+        const before = frontier;
+        frontier = frontierFrom(frontier);
+        playerTimeMs = frontier;
+        if (aimedAtFrontier && frontier === before) break;          // the end: no advance
+        if (frontier >= untilMs) break;
+        await afterAnswer(frontier);
+      }
+      return frontier;
+    }
+
     if (!emit) {
       for (const track of tracks.values()) {
         const init = observedInitFor(track);
@@ -2885,9 +3053,9 @@
       }
     }
     const seconds = (Date.now() - startedAt) / 1000;
-    log('sabr', 'collected; requests=', requests, 'MB=', (wireBytes / 1048576).toFixed(1),
+    log('sabr', 'collected; requests=', requests, 'answers=', answers, 'MB=', (wireBytes / 1048576).toFixed(1),
       'seconds=', seconds.toFixed(1), 'MBps=', (wireBytes / 1048576 / Math.max(seconds, 0.001)).toFixed(1),
-      'reachedMs=', playerTimeMs,
+      'reachedMs=', playerTimeMs, timingSummary(),
       'tracks=', [...tracks.values()].map((track) => `${track.itag}:${(track.bytes / 1048576).toFixed(1)}MB`
         + (emit ? `(emitted ${(track.emitted / 1048576).toFixed(1)}MB, held ${track.pendingBytes})` : '')
         + (track.firstByte ? `(no init, starts at ${track.firstByte})` : '')).join(' '));
@@ -2974,6 +3142,11 @@
   // holding the whole file again, which is the point of streaming.
   const SABR_OUTBOX_LIMIT = 24 * 1024 * 1024;
   const SABR_DRAIN_WAIT_MS = 30_000;
+  // 3 in flight ran at 2.6 requests/s with no refusal and no rise in the
+  // server's wait (avgTtfbMs 847 → 752 over two owner runs); the walk is that
+  // wait, so 5 should cut the 5.4 h audio walk from ~205 s to ~125 s. A refusal
+  // still drops the walk to one request at a time.
+  const SABR_AUDIO_PARALLEL = 5;
   let sabrJob = null;
 
   function webClientVersion() {
@@ -3053,6 +3226,9 @@
       size: Number(exact?.contentLength) || 0,
       height: formatQualityHeight(exact) || 0,
       mime: String(exact?.mimeType || '').split(';')[0] || '',
+      // With codecs: offscreen picks the AAC passthrough ("Оригинал" → .m4a)
+      // by /mp4a|aac/ in the mime, which the bare "audio/mp4" never matches.
+      fullMime: String(exact?.mimeType || ''),
     };
   }
 
@@ -3075,24 +3251,55 @@
       ? pageFormats(videoId)
       : await fetchWebFormats(videoId);
     const audio = pickSabrAudio(formats);
-    const height = Number(payload?.height) || 0;
+    // Audio-only (MP3 and friends): ask for the audio track alone and cap any
+    // video the server sends anyway at the lowest rung — it is walked past and
+    // dropped, never queued. This is the route for long audio: the capture took
+    // ~14 min over a 5.4 h video and still came back without its first 10 s.
+    const audioOnly = Boolean(payload?.audioOnly);
+    const lowestHeight = availableHeights().filter((value) => value > 0).sort((a, b) => a - b)[0] || 144;
+    const height = audioOnly ? lowestHeight : (Number(payload?.height) || 0);
+    // ~21 s of media per request was measured; 2 s is the floor this cap
+    // assumes, so it only ever stops a walk that is not converging.
+    // The UI's duration too: a pre-roll plays in the same <video> element and
+    // reports its own 15-30 s, which would cap a 5 h walk at 400 requests.
+    const durationSeconds = Math.max(
+      Number(video()?.duration) || Number(player()?.getDuration?.()) || 0,
+      Number(payload?.duration) || 0,
+    );
+    const maxRequests = Math.max(400, Math.ceil(durationSeconds / 2) + 100);
     sabrJob = { videoId, chunks: [], bytes: 0, done: false, error: null, waiter: null, space: null, cancelled: false };
     const job = sabrJob;
+    log('sabr', 'start; audioOnly=', audioOnly, 'height=', height, 'audioItag=', audio.itag,
+      'duration=', Math.round(durationSeconds), 'maxRequests=', maxRequests);
 
     let announce;
     const described = new Promise((resolve, reject) => { announce = { resolve, reject }; });
-    sabrCollect(videoId, {
+    let announced = false;
+    const collectOptions = (trackTypes) => ({
       height,
       audio,
+      maxRequests,
+      trackTypes,
+      onlyItag: audioOnly ? audio.itag : 0,
+      // Audio-only answers are ~0.5 MB for ~30 s: the walk is bound by round
+      // trips (655 × 1.56 s for 5.4 h), not bandwidth — see SABR_AUDIO_PARALLEL.
+      parallel: audioOnly ? SABR_AUDIO_PARALLEL : 1,
+      durationMs: durationSeconds * 1000,
       onTracks: (tracks) => {
+        announced = true;
         const seen = [...tracks.values()].map((track) => ({
           itag: track.itag,
           kind: track.itag === audio.itag ? 'audio' : 'video',
           ...describeFormat(formats, track.itag, track.lastModified),
         }));
         job.kinds = new Map(seen.map((track) => [track.itag, track.kind]));
+        if (audioOnly) {
+          const extra = seen.filter((track) => track.kind !== 'audio').map((track) => track.itag);
+          log('sabr', 'audio-only first answer; tracks=', seen.map((track) => track.itag).join(','),
+            'ignoredVideo=', extra.join(',') || 'none');
+        }
         announce.resolve({
-          video: seen.find((track) => track.kind === 'video') || null,
+          video: audioOnly ? null : (seen.find((track) => track.kind === 'video') || null),
           audio: seen.find((track) => track.kind === 'audio') || null,
         });
       },
@@ -3111,6 +3318,17 @@
         }
         if (job.cancelled) throw new Error('загрузка отменена');
       },
+    });
+    sabrCollect(videoId, collectOptions(audioOnly ? 1 : 0)).catch((error) => {
+      // A server that rejects the audio-only flag says so on the first answer,
+      // before anything is announced; the same walk without it still works,
+      // only with the video walked past. Anything later is a real failure.
+      if (!audioOnly || announced || job.cancelled) throw error;
+      log('sabr', 'audio-only request refused; retrying without the track-type flag:',
+        error?.message || error);
+      job.chunks = [];
+      job.bytes = 0;
+      return sabrCollect(videoId, collectOptions(0));
     }).then(() => {
       job.done = true;
       sabrWake();
@@ -7415,7 +7633,7 @@
       // has arrived since. Buffers are transferred, so nothing is copied on the
       // way out of this world.
       if (cmd === 'sabr-start') {
-        sabrStart({ height })
+        sabrStart({ height, audioOnly: ev.data.audioOnly === true, duration: Number(ev.data.duration) || 0 })
           .then((tracks) => reply({ ok: true, tracks }))
           .catch((error) => reply({ ok: false, error: String(error?.message || error) }));
         return;

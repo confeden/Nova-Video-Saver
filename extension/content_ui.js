@@ -73,6 +73,13 @@
     } else pending.resolve(data);
   });
 
+  // Hidden tabs align timers to 1 s; anything past this is a suspended page.
+  // The grace count is bounded so a chained, minute-aligned timer in a long
+  // hidden tab cannot keep a genuinely dead hook alive forever.
+  const HOOK_SUSPEND_SLACK_MS = 10_000;
+  const HOOK_RESUME_GRACE_MS = 20_000;
+  const HOOK_MAX_RESUME_GRACES = 3;
+
   function callHook(cmd, payload = {}, onProgress) {
     return new Promise((resolve, reject) => {
       const reqId = requestSequence++;
@@ -84,16 +91,41 @@
       };
       const timeoutMs = HOOK_TIMEOUTS[cmd] || 15_000;
       let timeout;
-      const touch = () => {
+      // The hook runs on this renderer's main thread. A frozen background tab
+      // or a long synchronous step in the page stops both, and on resume this
+      // timer fires at once, counting the pause as the hook's silence. A
+      // 5.4-hour MP3 died that way as its prefix repair began (report of
+      // 2026-09-18): the hook's next line arrived 3 ms before the timeout, which
+      // itself came 3.6 min past due. A timer that late measured the pause, so
+      // it gets a short stretch of running time for the queued replies instead.
+      let gracesLeft = HOOK_MAX_RESUME_GRACES;
+      const arm = (delayMs) => {
         clearTimeout(timeout);
+        const dueAt = Date.now() + delayMs;
         timeout = setTimeout(() => {
+          if (!pendingRequests.has(reqId)) return;
+          const lateMs = Date.now() - dueAt;
+          if (lateMs > HOOK_SUSPEND_SLACK_MS && gracesLeft > 0) {
+            gracesLeft -= 1;
+            void sendRuntimeMessage({
+              t: 'nova-log', tag: 'hook',
+              text: `${cmd}: timeout fired ${Math.round(lateMs / 1000)} s late (tab was suspended);`
+                + ` waiting ${HOOK_RESUME_GRACE_MS / 1000} s more; gracesLeft= ${gracesLeft}`,
+            }).catch(() => {});
+            arm(HOOK_RESUME_GRACE_MS);
+            return;
+          }
           pendingRequests.delete(reqId);
           reject(new Error(cmd === 'download'
             ? 'захват медиаданных не отвечает более 70 секунд'
             : `page hook timed out (${cmd})`));
-        }, timeoutMs);
+        }, delayMs);
         const pending = pendingRequests.get(reqId);
         if (pending) pending.timeout = timeout;
+      };
+      const touch = () => {
+        gracesLeft = HOOK_MAX_RESUME_GRACES;
+        arm(timeoutMs);
       };
       pendingRequests.set(reqId, { resolve, reject, onProgress, timeout, touch });
       touch();
@@ -322,6 +354,11 @@
   // The list is built per-video: passthrough of the real source codec first,
   // then re-encodes ordered by descending quality. YouTube sources are always
   // lossy (Opus/AAC), so lossless containers (FLAC/WAV) are never offered.
+  // Where YouTube audio comes over SABR (AAC 140) rather than the capture.
+  function sabrCarriesAudio(info) {
+    return !IS_MUSIC && !IS_SHORTS() && !info?.isLive;
+  }
+
   function audioFormatsFor(info) {
     const codec = info?.audioSource?.codec || '';
     const bitrate = Number(info?.audioSource?.bitrateKbps) || 0;
@@ -335,8 +372,17 @@
     }];
     // Re-encoding AAC back into AAC would only lose quality: when the source
     // is AAC the passthrough above already produces the best possible .m4a.
+    // On a watch page the file comes over SABR as AAC, so M4A is that stream
+    // re-wrapped, in seconds; elsewhere (Music, Shorts, live) the capture
+    // still records Opus and M4A is an encode.
     if (codec !== 'aac') {
-      formats.push({ id: 'm4a', title: 'M4A (AAC)', note: '256 кбит/с · с обложкой', extension: '.m4a' });
+      const rewrapped = sabrCarriesAudio(info);
+      formats.push({
+        id: 'm4a',
+        title: 'M4A (AAC)',
+        note: rewrapped ? 'AAC ~128 кбит/с · без перекодирования · с обложкой' : '256 кбит/с · с обложкой',
+        extension: '.m4a',
+      });
     }
     formats.push({ id: 'mp3', title: 'MP3', note: 'VBR V0, ~245 кбит/с · с обложкой', extension: '.mp3' });
     return formats;
@@ -756,7 +802,10 @@
     });
 
     const onFfmpegProgress = (message) => {
-      if (message?.t !== 'nova-progress' || message.jobId !== jobId) return;
+      // The SABR attempt runs under its own id; its encode progress is this
+      // download's progress too (a 5 h MP3 encodes for minutes).
+      if (message?.t !== 'nova-progress'
+        || (message.jobId !== jobId && message.jobId !== `${jobId}-sabr`)) return;
       const value = Math.max(0, Math.min(1, message.value || 0));
       const fallback = isMp3
         ? 'Кодирование аудио'
@@ -769,16 +818,27 @@
       // SABR first: it is the only route that can hand over a whole track, and
       // it costs seconds instead of the video's own length. Its own job id
       // keeps a refusal from disturbing the capture job that may follow.
-      if (!isMp3 && !IS_MUSIC && !IS_SHORTS() && !info.isLive && format === 'mp4') {
+      // Audio too, since 1.9. SABR serves AAC 140 (~128 kbit/s) where the
+      // capture recorded the player's Opus 251 (~130-160): a slightly weaker
+      // source for MP3/M4A, traded for a whole file in minutes instead of a
+      // capture as long as the video that loses its first seconds (B19). Opus
+      // over SABR is not an option: its init never comes (G16). "Оригинал"
+      // promises the source codec untouched, so it takes this route only when
+      // that codec is AAC; Opus stays on the capture.
+      const sabrAudio = isMp3 && sabrCarriesAudio(info)
+        && (audioFormat !== 'original' || info.audioSource?.codec === 'aac');
+      if (!IS_MUSIC && !IS_SHORTS() && !info.isLive && (format === 'mp4' || sabrAudio)) {
         const viaSabr = await tryDownloadViaSabr({
-          jobId: `${jobId}-sabr`, info, height, notification,
+          jobId: `${jobId}-sabr`, info, height,
+          audioFormat: sabrAudio ? audioFormat : null,
+          notification,
           isCancelled: () => cancelRequested,
         });
         if (viaSabr) {
           restorePrimedMedia();
           notification.setCancel(null);
           notification.stage('engine', 1, 'done');
-          notification.stage('process', 1, 'done', 'Склейка дорожек');
+          notification.stage('process', 1, 'done', isMp3 ? 'Кодирование аудио' : 'Склейка дорожек');
           await clearReloadGuard();
           notification.set(`Готово: ${viaSabr.filename}`, 1);
           notification.hide(4000);
@@ -1245,33 +1305,38 @@
       }
 
       onStage?.('capture', 0, 'active', 'Прямая загрузка (SABR)');
-      const started = await callHook('sabr-start', { height: job.height });
+      const audioOnly = job.format === 'mp3';
+      const started = await callHook('sabr-start', { height: job.height, audioOnly, duration: job.duration });
       const tracks = started?.tracks || {};
-      if (!tracks.video?.size || !tracks.audio?.size) {
+      if ((!audioOnly && !tracks.video?.size) || !tracks.audio?.size) {
         throw new Error('SABR не сообщил размеры дорожек');
       }
-      const totalBytes = tracks.video.size + tracks.audio.size;
+      const videoSize = audioOnly ? 0 : tracks.video.size;
+      const totalBytes = videoSize + tracks.audio.size;
 
       const begin = await sendRuntimeMessage({
         t: 'nova-begin', jobId, tabId: registration.tabId,
         filename: job.filename(tracks), format: job.format,
         audioFormat: job.audioFormat, audioQuality: job.audioQuality,
         videoId: job.videoId || '',
-        videoSize: tracks.video.size,
+        videoSize,
         audioSize: tracks.audio.size,
-        videoMime: tracks.video.mime || 'video/mp4',
-        audioMime: tracks.audio.mime || 'audio/mp4',
+        videoMime: audioOnly ? '' : (tracks.video.mime || 'video/mp4'),
+        audioMime: (audioOnly && tracks.audio.fullMime) || tracks.audio.mime || 'audio/mp4',
+        transcode: audioOnly,
         duration: job.duration,
       }, 30_000);
       if (!begin?.ok) throw new Error(begin?.error || 'не удалось начать обработку');
       begun = true;
 
       let transferred = 0;
+      const transferredByTrack = { audio: 0, video: 0 };
       for (;;) {
         stopIfCancelled();
         const drained = await callHook('sabr-drain');
         if (drained?.error) throw new Error(drained.error);
         for (const chunk of drained?.chunks || []) {
+          if (audioOnly && chunk.track !== 'audio') continue;
           const bytes = new Uint8Array(chunk.bytes);
           // The offscreen side takes 4 MiB at a time; a SABR segment can be
           // bigger than that.
@@ -1282,14 +1347,25 @@
             }, 60_000);
             if (!response?.ok) throw new Error(response?.error || `передача данных прервалась (${chunk.track})`);
             transferred += slice.length;
+            if (chunk.track in transferredByTrack) transferredByTrack[chunk.track] += slice.length;
           }
           onStage?.('capture', totalBytes ? transferred / totalBytes : 0, 'active', 'Прямая загрузка (SABR)');
         }
         if (drained?.done) break;
       }
+      // I9 for the audio-only job: nothing downstream knows the declared size
+      // (the video job's muxer does), and an MP3 made from a short track is
+      // simply a shorter MP3.
+      if (audioOnly && transferredByTrack.audio !== tracks.audio.size) {
+        throw new Error(`SABR: аудиодорожка ${transferredByTrack.audio} байт из ${tracks.audio.size}`);
+      }
       onStage?.('capture', 1, 'done');
       onStage?.('transfer', 1, 'done');
       onStage?.('process', 0, 'active');
+      // As on the capture route: a running ffmpeg cannot be cancelled, and the
+      // toast's abort names the base job id, not this one — a press here used
+      // to be ignored and followed by "Готово". Minutes long for a 5 h MP3.
+      job.onProcessing?.();
       return await sendRuntimeMessage({ t: 'nova-finalize', jobId }, 2 * 60 * 60_000);
     } catch (error) {
       void callHook('sabr-cancel').catch(() => {});
@@ -1302,21 +1378,25 @@
   // is the only path not capped at 60 s of media. Anything it cannot do — no
   // intercepted template yet, an odd container, a refusal mid-way — returns
   // `null` and the old route runs as before, so this can only add outcomes.
-  async function tryDownloadViaSabr({ jobId, info, height, notification, isCancelled }) {
+  async function tryDownloadViaSabr({ jobId, info, height, audioFormat, notification, isCancelled }) {
     const started = Date.now();
+    const isAudio = Boolean(audioFormat);
     try {
       const result = await downloadViaSabr({
         jobId,
         height,
-        format: 'mp4',
-        audioFormat: null,
+        format: isAudio ? 'mp3' : 'mp4',
+        audioFormat: isAudio ? audioFormat : null,
         audioQuality: 'best',
         videoId: info.videoId || '',
         duration: Number(info.duration) || 0,
         // The rung the server picks is only known after its first answer, so the
         // name is built from what actually arrived, not from what was asked.
-        filename: (tracks) => `${safeFilename(info.title)}`
-          + ` [${tracks.video?.height || height}p].mp4`,
+        // Audio: offscreen swaps the extension for the one it actually wrote.
+        filename: (tracks) => (isAudio
+          ? `${safeFilename(info.title)}${audioFormatMeta(audioFormat, info).extension}`
+          : `${safeFilename(info.title)} [${tracks.video?.height || height}p].mp4`),
+        onProcessing: () => notification.setCancel(null),
       }, (stage, fraction, state, label) => {
         notification.stage(stage, fraction, state, label);
       }, isCancelled);

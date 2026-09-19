@@ -1109,7 +1109,12 @@ function buildRuns(job, videoName, audioName, videoPrefixName, coverName) {
       runs.push(encodeRun(out, type, extension, codecArgs, extraArgs));
     };
     const runs = [];
-    if (job.audioFormat === 'original' && (job.audioCaptureRate || 1) <= 1.0001) {
+    // M4A from an AAC source is a container change, not an encode: YouTube's
+    // SABR route hands over AAC (itag 140), and re-encoding it to AAC 256k only
+    // spent minutes and lost quality. Measured on this core: 5 min copied in
+    // 31 ms, where the encode takes seconds per minute of audio.
+    const m4aFromAac = job.audioFormat === 'm4a' && /mp4a|aac/i.test(job.audioMime || '');
+    if ((job.audioFormat === 'original' || m4aFromAac) && (job.audioCaptureRate || 1) <= 1.0001) {
       // Passthrough of the source stream: AAC stays in .m4a, Opus/Vorbis go to
       // their native Ogg containers. Encoded fallback below covers copy errors.
       const sourceIsAac = /mp4a|aac/i.test(job.audioMime || '');
@@ -1146,6 +1151,10 @@ function buildRuns(job, videoName, audioName, videoPrefixName, coverName) {
     } else if (job.audioFormat === 'wav') {
       runs.push(encodeRun('out.wav', 'audio/wav', '.wav', ['-c:a', 'pcm_s16le']));
     } else {
+      // V0 is already LAME at its best here: on this wasm core -compression_level
+      // 0, 2 and the default gave byte-identical V0 files in the same time, and
+      // the faster levels (5, 7) only save time by spending fewer bits. The
+      // owner ruled that out — MP3 speed is not bought with quality.
       pushEncoded('out.mp3', 'audio/mpeg', '.mp3',
         ['-c:a', 'libmp3lame', ...(best ? ['-q:a', '0'] : ['-b:a', '192k'])],
         ['-id3v2_version', '3']);

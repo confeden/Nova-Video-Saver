@@ -151,21 +151,34 @@ function repairFilename(value) {
   base = base
     // Lone surrogates first: everything after this can assume valid text.
     .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '')
-    .replace(/[\u0000-\u001F\u007F]+/g, ' ')
+    // Chromium's IsFilenameLegal (base/i18n/file_util_icu.cc) refuses every
+    // format (Cf) and control (Cc) character and every non-character anywhere
+    // in the name, and chrome.downloads then refuses the download itself
+    // ("Invalid filename"). Cf is invisible and common in titles: the ZWJ that
+    // glues emoji sequences (U+1F636 U+200D U+1F32B U+FE0F, a field report),
+    // bidi marks around RTL words, soft hyphens, flag tag characters. Dropped
+    // rather than replaced, so a sequence falls apart into its visible emoji
+    // instead of taking the file with it.
+    .replace(/[\p{Cf}\p{Noncharacter_Code_Point}]+/gu, '')
+    .replace(/\p{Cc}+/gu, ' ')
     .replace(/[\\/:*?"<>|]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
-    // A leading dot makes the whole thing read as an extension; a trailing dot
-    // or space is rejected outright on Windows.
-    .replace(/^\.+/, '')
-    .replace(/[. ]+$/, '');
+    // Chromium also refuses whitespace, "." and "~" as the first or last
+    // character; a leading dot would also make the name read as an extension,
+    // and Windows rejects a trailing dot or space outright.
+    .replace(/^[.~\s]+/, '')
+    .replace(/[.~\s]+$/, '');
   // By code points, so the truncation itself cannot recreate the lone surrogate
   // this function exists to remove.
   const points = [...base];
   // Trailing dots and spaces are stripped again after the cut, not only before
   // it: truncating «…AAA. more text» at 120 leaves «…AAA.», which Windows
   // rejects just as it rejects the original.
-  if (points.length > 120) base = points.slice(0, 120).join('').replace(/[. ]+$/, '').trim();
+  if (points.length > 120) base = points.slice(0, 120).join('').replace(/[.~\s]+$/, '').trim();
+  // On Windows a name of up to 12 characters with a tilde can pass for an 8.3
+  // short name (`ABCDEF~1.MP3`), which Chromium refuses as well.
+  if (base.includes('~') && [...`${base}${extension}`].length <= 12) base = base.replace(/~/g, '-');
   if (RESERVED_DEVICE_NAMES.test(base)) base = `_${base}`;
   if (!base) base = 'nova-download';
   return `${base}${extension}`;
