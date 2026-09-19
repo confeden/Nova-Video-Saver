@@ -9,8 +9,8 @@ const ERROR_LOG_FILENAME = 'NVS-debug.txt';
 const RELOAD_DOWNLOAD_PREFIX = 'nova_reload_download:';
 const RELOAD_GUARD_PREFIX = 'nova_reload_guard:';
 const RELOAD_GUARD_TTL_MS = 5 * 60_000;
+const UPDATE_RELEASES_API = 'https://api.github.com/repos/confeden/Nova-Video-Saver/releases/latest';
 const UPDATE_MANIFEST_URL = 'https://raw.githubusercontent.com/confeden/nova_updates/main/nvs.json';
-const UPDATE_FALLBACK_API = 'https://api.github.com/repos/confeden/Nova-Video-Saver/releases/latest';
 const UPDATE_RELEASES_PAGE = 'https://github.com/confeden/Nova-Video-Saver/releases';
 const UPDATE_STATE_KEY = 'nova_update';
 const UPDATE_ALARM = 'nvs-update-check';
@@ -261,22 +261,13 @@ function compareVersions(a, b) {
 // hang for minutes and keep this worker busy; bound them.
 const UPDATE_FETCH_TIMEOUT_MS = 15_000;
 
+// The release itself is the source of truth since 1.9: it is what the owner
+// publishes, and it cannot fall behind. nvs.json (kept current by
+// publish_update.yml) answers only when the API does not — the unauthenticated
+// API allows 60 requests an hour per IP, and a shared IP can run out.
 async function fetchLatestVersionInfo() {
   try {
-    const response = await fetch(UPDATE_MANIFEST_URL, {
-      cache: 'no-store', signal: AbortSignal.timeout(UPDATE_FETCH_TIMEOUT_MS),
-    });
-    if (!response.ok) throw new Error(`nvs.json HTTP ${response.status}`);
-    const data = await response.json();
-    if (!/^\d+(\.\d+)*$/.test(String(data.version || ''))) throw new Error('nvs.json version is malformed');
-    return {
-      version: String(data.version),
-      downloadUrl: typeof data.url === 'string' ? data.url : '',
-      releaseUrl: typeof data.release_url === 'string' ? data.release_url : UPDATE_RELEASES_PAGE,
-      source: 'nvs.json',
-    };
-  } catch (manifestError) {
-    const response = await fetch(UPDATE_FALLBACK_API, {
+    const response = await fetch(UPDATE_RELEASES_API, {
       cache: 'no-store',
       headers: { Accept: 'application/vnd.github+json' },
       signal: AbortSignal.timeout(UPDATE_FETCH_TIMEOUT_MS),
@@ -291,6 +282,19 @@ async function fetchLatestVersionInfo() {
       downloadUrl: zip?.browser_download_url || '',
       releaseUrl: release.html_url || UPDATE_RELEASES_PAGE,
       source: 'releases-api',
+    };
+  } catch (apiError) {
+    const response = await fetch(UPDATE_MANIFEST_URL, {
+      cache: 'no-store', signal: AbortSignal.timeout(UPDATE_FETCH_TIMEOUT_MS),
+    });
+    if (!response.ok) throw new Error(`nvs.json HTTP ${response.status}`);
+    const data = await response.json();
+    if (!/^\d+(\.\d+)*$/.test(String(data.version || ''))) throw new Error('nvs.json version is malformed');
+    return {
+      version: String(data.version),
+      downloadUrl: typeof data.url === 'string' ? data.url : '',
+      releaseUrl: typeof data.release_url === 'string' ? data.release_url : UPDATE_RELEASES_PAGE,
+      source: 'nvs.json',
     };
   }
 }

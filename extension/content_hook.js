@@ -2811,6 +2811,27 @@
     return { bytes, parts, ttfbMs: headersAt - sentAt, bodyMs: Date.now() - headersAt };
   }
 
+  // Network-level failures and the server's "later" answers are worth another
+  // try; a SABR refusal or a 403 is about the request itself (N12) and is not.
+  function sabrRetryable(error) {
+    const text = String(error?.message || error);
+    return error instanceof TypeError || /Failed to fetch|network|HTTP (429|5\d\d)/i.test(text);
+  }
+
+  async function sabrFetchRetrying(template, playerTimeMs, options) {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await sabrFetch(template, playerTimeMs, options);
+      } catch (error) {
+        if (!sabrRetryable(error) || attempt >= SABR_RETRY_DELAYS_MS.length) throw error;
+        const delay = SABR_RETRY_DELAYS_MS[attempt];
+        log('sabr', 'request failed at', playerTimeMs, 'ms; retry', attempt + 1, 'in', delay, 'ms:',
+          error?.message || error);
+        await sleep(delay);
+      }
+    }
+  }
+
   // Varint fields of a small protobuf message, for logging what the server
   // tells us (the next-request policy) without a schema.
   function protobufVarints(bytes) {
@@ -2955,7 +2976,10 @@
     let pipeline = false;
     while (playerTimeMs < untilMs) {
       launchGuard();
-      absorb(await sabrFetch(template, playerTimeMs, options));
+      // Retries only once the walk is under way: before the first answer the
+      // UI waits on `sabr-start` for 60 s, and a failing start should fall back
+      // fast, as it always did.
+      absorb(await (answers ? sabrFetchRetrying : sabrFetch)(template, playerTimeMs, options));
       const reached = Math.min(...[...tracks.values()].map((track) => track.endMs));
       if (!(reached > playerTimeMs)) break;
       playerTimeMs = reached;
@@ -2994,7 +3018,7 @@
       const launch = (at) => {
         launchGuard();
         const alone = degraded;
-        inflight.set(at, sabrFetch(template, at, options)
+        inflight.set(at, (alone ? sabrFetchRetrying : sabrFetch)(template, at, options)
           .then((result) => ({ at, alone, result }), (error) => ({ at, alone, error })));
       };
       const covered = (at) => [...keptSegments].some(([start, end]) => start <= at && at < end);
@@ -3022,7 +3046,8 @@
           // A request sent alongside others proves nothing on its own — a server
           // that refuses concurrency fails all of them, the frontier one
           // included. Whatever the objection, the walk goes on one request at a
-          // time, exactly as before this mode; only a failure there is final.
+          // time, exactly as before this mode; only a failure there — after its
+          // own retries — is final.
           if (settled.alone) throw settled.error;
           if (!degraded) {
             degraded = true;
@@ -3142,11 +3167,17 @@
   // holding the whole file again, which is the point of streaming.
   const SABR_OUTBOX_LIMIT = 24 * 1024 * 1024;
   const SABR_DRAIN_WAIT_MS = 30_000;
-  // 3 in flight ran at 2.6 requests/s with no refusal and no rise in the
-  // server's wait (avgTtfbMs 847 → 752 over two owner runs); the walk is that
-  // wait, so 5 should cut the 5.4 h audio walk from ~205 s to ~125 s. A refusal
-  // still drops the walk to one request at a time.
-  const SABR_AUDIO_PARALLEL = 5;
+  // 3 in flight: two owner runs, 2.6 requests/s, no failure, avgTtfbMs 847 and
+  // 752. 5 was tried once and is not to be repeated blindly: the server's wait
+  // rose to ~1 s, its readahead fell from 30 to 20 s, a request died with
+  // `Failed to fetch` after 24 s and a lone one 90 s later (googlevideo limits
+  // cumulatively, G17 — four long runs had preceded it, so 5 is suspect, not
+  // proven guilty).
+  const SABR_AUDIO_PARALLEL = 3;
+  // A lone request that fails is retried after these pauses before the walk
+  // gives up: dropping a 5 h walk at 20 % over one `Failed to fetch` sent the
+  // download through the capture and a page reload, and the walk started over.
+  const SABR_RETRY_DELAYS_MS = [1_000, 3_000, 8_000, 15_000];
   let sabrJob = null;
 
   function webClientVersion() {
