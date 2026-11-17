@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Nova Video Saver",
-  "version": "1.11",
+  "version": "1.10",
   "description": "Скачивание видео/аудио/субтитров YouTube, Rutube, Twitch, Coub, VK, Zvuk, TikTok, а также видео из отзывов Ozon и Wildberries, запись трансляций — без внешних сервисов",
   "permissions": [
     "downloads",
