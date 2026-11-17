@@ -132,6 +132,31 @@ function progressFromLog(message) {
   emitProcessingProgress(seconds / activeJob.duration);
 }
 
+// Every call that crosses into the ffmpeg worker comes back, on a throw, as
+// `e.toString()` — a bare string. That string then walks up through
+// `finalizeJob`'s catch, where `error.details = {…}` silently does nothing
+// (this document is a classic script, so assigning to a primitive's property is
+// not an error), and the report arrives with no stage, no ffmpeg logs and no
+// stack. That is how a `RangeError: Array buffer allocation failed` raised by
+// `FS.writeFile` inside the worker came back indistinguishable from a failure
+// in this document (G38). Give it a real Error, and name the call.
+const FFMPEG_WORKER_CALLS = ['load', 'exec', 'writeFile', 'readFile', 'deleteFile',
+  'rename', 'createDir', 'listDir', 'deleteDir', 'mount', 'unmount'];
+
+function wrapWorkerRejections(instance) {
+  for (const name of FFMPEG_WORKER_CALLS) {
+    const call = instance[name];
+    if (typeof call !== 'function') continue;
+    instance[name] = (...args) => Promise.resolve(call(...args)).catch((reason) => {
+      if (reason instanceof Error) throw reason;
+      const error = new Error(`ffmpeg ${name}: ${String(reason)}`);
+      error.ffmpegCall = name;
+      throw error;
+    });
+  }
+  return instance;
+}
+
 function createFFmpegInstance() {
   const instance = new FFmpeg();
   instance.on('progress', ({ progress }) => emitProcessingProgress(progress));
@@ -142,7 +167,7 @@ function createFFmpegInstance() {
     if (activeJob && integrityError && !activeJob.integrityError) activeJob.integrityError = integrityError;
     progressFromLog(message);
   });
-  return instance;
+  return wrapWorkerRejections(instance);
 }
 
 // ---- WebCodecs / Mediabunny hardware transcode ---------------------------
@@ -567,6 +592,31 @@ function completeTrackStream(stream) {
 function failTrackStream(stream, error) {
   if (!stream) return;
   stream.failure = error instanceof Error ? error : new Error(String(error));
+}
+
+// At or above this an input goes to ffmpeg as a WORKERFS mount instead of a
+// copy into MEMFS; below it the copy costs less than the mount's bookkeeping.
+const MOUNTED_INPUT_MIN = 64 * 1024 * 1024;
+const FFMPEG_MOUNT_POINT = '/nvs-in';
+// ftyp/moov (or the EBML magic) sit at the very front of everything handed
+// over here, and an init segment is kilobytes: 8 MiB is a wide margin.
+const HEADER_PROBE_BYTES = 8 * 1024 * 1024;
+
+function partsLength(parts) {
+  return parts.reduce((total, part) => total + part.length, 0);
+}
+
+// Enough of the front of a track to check its container header, so a track
+// about to be mounted never has to exist as one buffer just to be validated.
+function headParts(parts, limit) {
+  const head = [];
+  let total = 0;
+  for (const part of parts) {
+    head.push(part);
+    total += part.length;
+    if (total >= limit) break;
+  }
+  return concatParts(head);
 }
 
 function concatParts(parts) {
@@ -1564,6 +1614,7 @@ async function finalizeJob(message) {
   job.stage = 'engine';
   const files = new Set();
   let instance;
+  let mountPoint = '';
 
   try {
     // A spooled stream never touches the wasm filesystem, and loading ffmpeg
@@ -1687,6 +1738,7 @@ async function finalizeJob(message) {
     const inputs = [];
     let audioName = null;
     let audioBytes = null;
+    let mountedAudio = null;
     let videoName;
     let videoPrefixName;
     let videoBytes = null;
@@ -1695,12 +1747,25 @@ async function finalizeJob(message) {
       // A muxed job carries everything on the video track; there is no separate
       // audio buffer to validate or hand to ffmpeg.
       audioName = job.muxed ? null : `audio.${extensionFor(job.audioMime)}`;
-      audioBytes = job.muxed ? null : concatParts(job.audio);
       if (!job.muxed) {
-        if (!audioBytes.length) throw new Error('пустые данные аудио');
-        assertContainerHeader(audioBytes, job.audioMime, 'audio');
-        inputs.push({ name: audioName, bytes: audioBytes });
-        files.add(audioName);
+        const audioLength = partsLength(job.audio);
+        if (!audioLength) throw new Error('пустые данные аудио');
+        assertContainerHeader(headParts(job.audio, HEADER_PROBE_BYTES), job.audioMime, 'audio');
+        // An audio job has no reader but ffmpeg — the webcodecs and mediabunny
+        // paths below are video-only — so the track never has to be one buffer.
+        // A Blob costs no contiguous allocation (Chrome's blob storage takes it
+        // and spills to disk) and WORKERFS reads it in slices: concat, the
+        // disposable slice and the MEMFS copy all disappear, and it was the
+        // MEMFS one that threw on a 5.4 h book (G38,
+        // `kb/mux-transport.md#memfs-ceiling`).
+        if (job.format === 'mp3' && audioLength >= MOUNTED_INPUT_MIN) {
+          mountedAudio = new Blob(job.audio, { type: job.audioMime || 'application/octet-stream' });
+          job.audio.length = 0;
+        } else {
+          audioBytes = concatParts(job.audio);
+          inputs.push({ name: audioName, bytes: audioBytes });
+          files.add(audioName);
+        }
       }
 
       if (job.muxed) {
@@ -1762,6 +1827,34 @@ async function finalizeJob(message) {
         }
       }
     }
+    // Mounted rather than written: this is what the live recordings already do
+    // with their OPFS track files (`muxLiveTracks`). A core without WORKERFS
+    // still takes the old path — one copy instead of three.
+    if (mountedAudio) {
+      job.stage = 'ffmpeg-mount';
+      try {
+        // A job that died between the mount and the `finally` leaves both the
+        // mount and the directory behind, and mounting over either of them
+        // fails — which would send this track down the copying path that the
+        // mount exists to avoid. Both cleanups are best effort.
+        try { await instance.unmount(FFMPEG_MOUNT_POINT); } catch (error) {}
+        try { await instance.createDir(FFMPEG_MOUNT_POINT); } catch (error) {}
+        await instance.mount('WORKERFS',
+          { blobs: [{ name: audioName, data: mountedAudio }] }, FFMPEG_MOUNT_POINT);
+        mountPoint = FFMPEG_MOUNT_POINT;
+        audioName = `${FFMPEG_MOUNT_POINT}/${audioName}`;
+        logToWorker('mux', `audio input mounted; bytes=${mountedAudio.size} path=${audioName}`);
+      } catch (mountError) {
+        logToWorker('mux', 'WORKERFS unavailable, copying the input into MEMFS instead:'
+          + ` ${String(mountError?.message || mountError)}`);
+        audioBytes = new Uint8Array(await mountedAudio.arrayBuffer());
+        inputs.push({ name: audioName, bytes: audioBytes });
+        files.add(audioName);
+      } finally {
+        mountedAudio = null;
+      }
+    }
+
     // Hardware path first: only for plain transcode jobs (no prefix concat,
     // no downscale — those still need ffmpeg's filter graph).
     if (job.format !== 'mp3' && job.transcode && !videoPrefixName && !job.scaleHeight && videoBytes) {
@@ -1850,9 +1943,13 @@ async function finalizeJob(message) {
     job.stage = 'saved';
     sendProgress(1, 'Файл передан браузеру…', 100);
     return { ok: true, filename };
-  } catch (error) {
+  } catch (raw) {
+    // `wrapWorkerRejections` already guarantees an Error; this keeps the
+    // guarantee local, because a string here loses the whole details block.
+    const error = raw instanceof Error ? raw : new Error(String(raw));
     error.details = {
       stage: job.stage,
+      ffmpegCall: error.ffmpegCall || '',
       format: job.format,
       transcode: job.transcode,
       scaleHeight: job.scaleHeight,
@@ -1870,6 +1967,10 @@ async function finalizeJob(message) {
     if (instance) {
       for (const name of files) {
         try { await instance.deleteFile(name); } catch (e) {}
+      }
+      if (mountPoint) {
+        try { await instance.unmount(mountPoint); } catch (e) {}
+        try { await instance.deleteDir(mountPoint); } catch (e) {}
       }
     }
     // A worker still parsing (or waiting for bytes that will never come) would
@@ -2240,13 +2341,15 @@ async function finalizeLiveJob(message) {
     // files immediately could break the pending downloads, so cleanup happens
     // on the next live recording / offscreen start instead.
     return { ok: true, split: true, filename: videoName };
-  } catch (error) {
+  } catch (raw) {
+    const error = raw instanceof Error ? raw : new Error(String(raw));
     // A parked recording still lives in OPFS; wiping the source files here
     // would be harmless, but the user is told the file survived, so keep the
     // storage footprint honest and only clear what is no longer referenced.
     if (!error?.recovered) await removeLiveFiles(job).catch(() => {});
     error.details = {
       live: true,
+      ffmpegCall: error.ffmpegCall || '',
       bytes: job.bytes,
       mimes: job.mimes,
       ffmpegLogs: ffmpegLogs.slice(-10),

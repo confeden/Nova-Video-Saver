@@ -1,0 +1,36 @@
+/* Ozon adapter UI: only the progress toast lives in the page's own DOM; the
+   button is inside the player's shadow root and carries its own style. */
+
+[hidden] { display: none !important; }
+
+.nova-oz-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 28px;
+  transform: translateX(-50%);
+  z-index: 2147483000;
+  min-width: 280px;
+  max-width: 70vw;
+  padding: 11px 14px 13px;
+  border: 1px solid #3c4043;
+  border-radius: 10px;
+  background: #181a1c;
+  color: #f1f1f1;
+  font: 13px/1.4 "Segoe UI", Roboto, Arial, sans-serif;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
+}
+
+.nova-oz-toast::after {
+  content: "";
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  bottom: 6px;
+  height: 3px;
+  border-radius: 2px;
+  background: linear-gradient(
+    to right,
+    #35d477 var(--nova-oz-progress, 0%),
+    rgba(255, 255, 255, 0.14) var(--nova-oz-progress, 0%)
+  );
+}

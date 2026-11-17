@@ -1400,16 +1400,42 @@
       }, (stage, fraction, state, label) => {
         notification.stage(stage, fraction, state, label);
       }, isCancelled);
-      if (!result?.ok) throw new Error(result?.error || 'не удалось собрать файл');
+      if (!result?.ok) {
+        // The only way here is a failure inside `nova-finalize`: every byte had
+        // been delivered and checked against the declared size before it was
+        // called. That is downstream of the route, so the fallback ladder
+        // (direct URL → capture → page reload → a second full walk) can only
+        // spend the time again and arrive at the identical error — one owner
+        // report burned 1 h 35 min that way (G39). A parked file is a finished
+        // download waiting to be saved, and the offscreen document has already
+        // written its own report.
+        const failure = new Error(result?.error || 'не удалось собрать файл');
+        failure.details = { final: true };
+        failure.logged = Boolean(result?.logged);
+        failure.recovered = Boolean(result?.recovered);
+        throw failure;
+      }
       return result;
     } catch (error) {
       if (error?.details?.cancelled) throw error;
-      const reason = `sabr path declined after ${((Date.now() - started) / 1000).toFixed(1)}s:`
-        + ` ${String(error?.message || error)}`;
+      const message = String(error?.message || error);
+      // Nor is an allocation failure a verdict on the route: whatever ran out of
+      // memory, the capture that would follow needs more of it than SABR, not
+      // less, and it needs the video's own length to get there.
+      const final = Boolean(error?.details?.final)
+        || /allocation failed|out of memory/i.test(message);
+      const seconds = ((Date.now() - started) / 1000).toFixed(1);
+      // A final failure still leaves its line: the offscreen document writes a
+      // report, not a journal entry, so without this the route would simply
+      // stop mid-journal.
+      const reason = final
+        ? `sabr path failed after ${seconds}s, no fallback (bytes delivered / out of memory): ${message}`
+        : `sabr path declined after ${seconds}s: ${message}`;
       // Also to the console: a silent fall-through to the capture looks like the
       // SABR path was never tried, and the journal is not visible while testing.
       console.warn('[Nova Video Saver]', reason);
       void sendRuntimeMessage({ t: 'nova-log', tag: 'sabr', text: reason }).catch(() => {});
+      if (final) throw error;
       return null;
     }
   }

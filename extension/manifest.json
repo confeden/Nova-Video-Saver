@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Nova Video Saver",
-  "version": "1.9",
-  "description": "Скачивание видео/аудио/субтитров YouTube, Rutube, Twitch, Coub, VK, Zvuk и TikTok, запись трансляций — без внешних сервисов",
+  "version": "1.11",
+  "description": "Скачивание видео/аудио/субтитров YouTube, Rutube, Twitch, Coub, VK, Zvuk, TikTok, а также видео из отзывов Ozon и Wildberries, запись трансляций — без внешних сервисов",
   "permissions": [
     "downloads",
     "offscreen",
@@ -162,6 +162,34 @@
         "tiktok.css"
       ],
       "run_at": "document_idle",
+      "world": "ISOLATED",
+      "all_frames": false
+    },
+    {
+      "matches": [
+        "https://www.ozon.ru/*"
+      ],
+      "js": [
+        "ozon.js"
+      ],
+      "css": [
+        "ozon.css"
+      ],
+      "run_at": "document_start",
+      "world": "ISOLATED",
+      "all_frames": false
+    },
+    {
+      "matches": [
+        "https://www.wildberries.ru/*"
+      ],
+      "js": [
+        "wildberries.js"
+      ],
+      "css": [
+        "wildberries.css"
+      ],
+      "run_at": "document_start",
       "world": "ISOLATED",
       "all_frames": false
     }
